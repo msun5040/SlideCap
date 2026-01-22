@@ -83,7 +83,7 @@ slide-organizer/
 │   │       ├── filename_parser.py
 │   │       └── indexer.py       # Slide indexing
 │   └── requirements.txt
-├── frontend/                    # (Coming soon) Electron + React
+├── frontend/                    # Electron + React
 ├── scripts/
 │   └── setup_test_dir.py        # Create test data
 └── README.md
@@ -97,9 +97,9 @@ Slides should follow this naming pattern:
 ```
 
 Examples:
-- `S24-12345_A1_HE_7f3a2b.svs`
-- `S24-12345_A1_IHC-CD3_8c4d1e.svs`
-- `S23-00042_B2_PAS_9e5f2a.svs`
+- `S24-12345_A1_HE_153452.svs`
+- `S24-12345_A1_IHC-CD3_123545.svs`
+- `S23-00042_B2_PAS_123554.svs`
 
 ## Directory Structure
 
@@ -107,7 +107,7 @@ Organize slides by year:
 ```
 /network/slides/
 ├── 2024/
-│   ├── S24-00001_A1_HE_abc123.svs
+│   ├── S24-00001_A1_HE_865123.svs
 │   └── ...
 ├── 2023/
 │   └── ...
@@ -138,11 +138,3 @@ Organize slides by year:
 | GET | `/projects` | List projects |
 | POST | `/projects` | Create project |
 | POST | `/projects/{id}/cases/{hash}` | Add case to project |
-
-## Next Steps
-
-1. ✅ Backend core (hashing, indexing, search)
-2. ⬜ Frontend (Electron + React)
-3. ⬜ SVS thumbnail generation
-4. ⬜ Full slide viewer (OpenSeadragon)
-5. ⬜ SSH job submission for AI models
