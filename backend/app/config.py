@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     NETWORK_ROOT: str = '/Volumes/DFCI-LIGONLAB/Ligon Lab/test_directory'
     
     # App data directory (will be created inside NETWORK_ROOT)
-    APP_DATA_DIR: str = ".slide-organizer"
+    APP_DATA_DIR: str = ".slidecap"
     
     # Database and salt paths (derived from above)
     @property

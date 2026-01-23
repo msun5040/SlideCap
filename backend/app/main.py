@@ -1,12 +1,19 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional
+from pydantic import BaseModel
+from typing import Optional, List
 import os
 
 from .config import settings
 from .db import init_db, Case, Slide, Tag, Project
 from .services import SlideHasher, SlideIndexer
+
+
+# Request models for bulk operations
+class BulkTagRequest(BaseModel):
+    slide_hashes: List[str]
+    tags: List[str]
 
 
 # Global instances (initialized on startup)
@@ -137,12 +144,28 @@ def run_full_index():
     return stats
 
 
+@app.post("/index/incremental")
+def run_incremental_index():
+    """
+    Index only new slides that aren't already in the database.
+
+    Much faster than full index - use this to catch newly added files.
+    """
+    if not indexer:
+        raise HTTPException(status_code=503, detail="Indexer not initialized")
+
+    print("Starting incremental index...")
+    stats = indexer.build_incremental_index()
+    print(f"Incremental index complete: {stats['new_slides_indexed']} new slides")
+    return stats
+
+
 @app.post("/index/refresh-cache")
 def refresh_cache():
     """Refresh the in-memory path cache without re-indexing database."""
     if not indexer:
         raise HTTPException(status_code=503, detail="Indexer not initialized")
-    
+
     count = indexer.build_path_cache()
     return {"cached_slides": count}
 
@@ -235,12 +258,38 @@ def create_tag(name: str, category: Optional[str] = None):
     existing = db_session.query(Tag).filter_by(name=name).first()
     if existing:
         raise HTTPException(status_code=400, detail="Tag already exists")
-    
+
     tag = Tag(name=name, category=category)
     db_session.add(tag)
     db_session.commit()
-    
+
     return {"id": tag.id, "name": tag.name, "category": tag.category}
+
+
+@app.get("/tags/{tag_name}/slides")
+def get_slides_by_tag(tag_name: str, limit: int = Query(100, le=500)):
+    """Get all slides with a given tag."""
+    tag = db_session.query(Tag).filter_by(name=tag_name).first()
+    if not tag:
+        raise HTTPException(status_code=404, detail="Tag not found")
+
+    slides = tag.slides[:limit]
+
+    return {
+        "tag": tag_name,
+        "count": len(slides),
+        "slides": [
+            {
+                "slide_hash": s.slide_hash,
+                "case_hash": s.case.accession_hash,
+                "year": s.case.year,
+                "block_id": s.block_id,
+                "stain_type": s.stain_type,
+                "file_exists": bool(s.file_exists),
+            }
+            for s in slides
+        ]
+    }
 
 
 @app.post("/slides/{slide_hash}/tags/{tag_name}")
@@ -276,6 +325,102 @@ def remove_tag_from_slide(slide_hash: str, tag_name: str):
         db_session.commit()
     
     return {"status": "ok"}
+
+
+# ============================================================
+# Bulk Tag Endpoints
+# ============================================================
+
+@app.post("/slides/bulk/tags/add")
+def bulk_add_tags(request: BulkTagRequest):
+    """Add tags to multiple slides at once."""
+    updated = []
+    not_found = []
+
+    for slide_hash in request.slide_hashes:
+        slide = db_session.query(Slide).filter_by(slide_hash=slide_hash).first()
+        if not slide:
+            not_found.append(slide_hash)
+            continue
+
+        for tag_name in request.tags:
+            tag = db_session.query(Tag).filter_by(name=tag_name).first()
+            if not tag:
+                tag = Tag(name=tag_name)
+                db_session.add(tag)
+
+            if tag not in slide.tags:
+                slide.tags.append(tag)
+
+        updated.append(slide_hash)
+
+    db_session.commit()
+
+    return {
+        "status": "ok",
+        "updated": len(updated),
+        "not_found": not_found
+    }
+
+
+@app.post("/slides/bulk/tags/remove")
+def bulk_remove_tags(request: BulkTagRequest):
+    """Remove tags from multiple slides at once."""
+    updated = []
+    not_found = []
+
+    for slide_hash in request.slide_hashes:
+        slide = db_session.query(Slide).filter_by(slide_hash=slide_hash).first()
+        if not slide:
+            not_found.append(slide_hash)
+            continue
+
+        for tag_name in request.tags:
+            tag = db_session.query(Tag).filter_by(name=tag_name).first()
+            if tag and tag in slide.tags:
+                slide.tags.remove(tag)
+
+        updated.append(slide_hash)
+
+    db_session.commit()
+
+    return {
+        "status": "ok",
+        "updated": len(updated),
+        "not_found": not_found
+    }
+
+
+@app.put("/slides/bulk/tags")
+def bulk_set_tags(request: BulkTagRequest):
+    """Replace all tags on multiple slides (removes existing tags first)."""
+    updated = []
+    not_found = []
+
+    tags_to_set = []
+    for tag_name in request.tags:
+        tag = db_session.query(Tag).filter_by(name=tag_name).first()
+        if not tag:
+            tag = Tag(name=tag_name)
+            db_session.add(tag)
+        tags_to_set.append(tag)
+
+    for slide_hash in request.slide_hashes:
+        slide = db_session.query(Slide).filter_by(slide_hash=slide_hash).first()
+        if not slide:
+            not_found.append(slide_hash)
+            continue
+
+        slide.tags = tags_to_set.copy()
+        updated.append(slide_hash)
+
+    db_session.commit()
+
+    return {
+        "status": "ok",
+        "updated": len(updated),
+        "not_found": not_found
+    }
 
 
 # ============================================================

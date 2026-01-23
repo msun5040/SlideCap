@@ -4,13 +4,12 @@ Slide indexer service.
 Builds and maintains the index of slides from the network drive.
 Handles both full reindexing and incremental updates.
 """
-import os
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Callable
 from sqlalchemy.orm import Session
 
-from .filename_parser import FilenameParser, ParsedFilename
+from .filename_parser import FilenameParser
 from .hasher import SlideHasher
 from ..db.models import Case, Slide
 
@@ -67,7 +66,7 @@ class SlideIndexer:
             case = Case(
                 accession_hash=accession_hash,
                 year=parsed.year,
-                indexed_at=datetime.utcnow()
+                indexed_at=datetime.now(timezone.utc)
             )
             self.db.add(case)
             self.db.flush()  # Get the ID
@@ -92,7 +91,7 @@ class SlideIndexer:
             stain_type=parsed.stain_type,
             random_id=parsed.random_id,
             file_size_bytes=file_size,
-            indexed_at=datetime.utcnow()
+            indexed_at=datetime.now(timezone.utc)
         )
         self.db.add(slide)
         
@@ -179,12 +178,96 @@ class SlideIndexer:
         
         return stats
     
+    def build_incremental_index(
+        self,
+        progress_callback: Optional[Callable[[dict], None]] = None
+    ) -> dict:
+        """
+        Index only new slides that aren't already in the database.
+
+        Much faster than full index for catching newly added files.
+
+        Args:
+            progress_callback: Optional function called with progress info
+
+        Returns:
+            Summary statistics dict
+        """
+        stats = {
+            'years_processed': [],
+            'new_slides_indexed': 0,
+            'files_already_indexed': 0,
+            'files_skipped': 0,
+            'errors': []
+        }
+
+        # Get set of existing slide hashes for fast lookup
+        existing_hashes = set(self.slide_hash_to_path.keys())
+
+        # Find year directories
+        year_dirs = sorted([
+            d for d in self.root.iterdir()
+            if d.is_dir() and d.name.isdigit()
+        ])
+
+        for year_dir in year_dirs:
+            year = int(year_dir.name)
+            svs_files = list(year_dir.glob('*.svs'))
+            new_in_year = 0
+
+            for filepath in svs_files:
+                # Parse filename to get hash
+                parsed = self.parser.parse(filepath.name)
+                if not parsed:
+                    stats['files_skipped'] += 1
+                    continue
+
+                slide_hash = self.hasher.hash_slide_stem(parsed.full_stem)
+
+                # Skip if already indexed
+                if slide_hash in existing_hashes:
+                    stats['files_already_indexed'] += 1
+                    continue
+
+                # Index new file
+                try:
+                    result = self.index_file(filepath)
+                    if result:
+                        new_in_year += 1
+                        stats['new_slides_indexed'] += 1
+                        # Add to cache immediately
+                        self.slide_hash_to_path[slide_hash] = filepath
+                        accession_hash = self.hasher.hash_accession(parsed.accession)
+                        if accession_hash not in self.accession_hash_to_paths:
+                            self.accession_hash_to_paths[accession_hash] = []
+                        self.accession_hash_to_paths[accession_hash].append(filepath)
+                except Exception as e:
+                    stats['errors'].append({
+                        'file': str(filepath),
+                        'error': str(e)
+                    })
+
+            # Commit after each year
+            self.db.commit()
+            stats['years_processed'].append(year)
+
+            if progress_callback:
+                progress_callback({
+                    'year': year,
+                    'new_slides': new_in_year,
+                    'total_new': stats['new_slides_indexed']
+                })
+            elif new_in_year > 0:
+                print(f"  Year {year}: {new_in_year} new slides indexed")
+
+        return stats
+
     def build_path_cache(self) -> int:
         """
         Build in-memory hash -> filepath mappings for instant lookup.
-        
+
         Call this on application startup after database is ready.
-        
+
         Returns:
             Number of slides cached
         """

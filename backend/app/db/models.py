@@ -249,6 +249,7 @@ def get_engine(db_path: Path):
 
 def init_db(db_path: Path) -> Session:
     """Initialize database and return a session."""
+    db_path.parent.mkdir(parents=True, exist_ok=True)
     engine = get_engine(db_path)
     Base.metadata.create_all(engine)
     
