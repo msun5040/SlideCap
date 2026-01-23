@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SlideCap</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>SlideCap</h1>
+            <p class="subtitle">Slide Search</p>
+        </header>
+
+        <div class="search-section">
+            <div class="search-box">
+                <input
+                    type="text"
+                    id="searchInput"
+                    placeholder="Search slides (e.g., BS25-12345)"
+                    autocomplete="off"
+                >
+                <button id="searchBtn">Search</button>
+            </div>
+
+            <div class="filters">
+                <select id="yearFilter">
+                    <option value="">All Years</option>
+                    <option value="2025">2025</option>
+                    <option value="2024">2024</option>
+                    <option value="2023">2023</option>
+                </select>
+                <select id="stainFilter">
+                    <option value="">All Stains</option>
+                    <option value="HE">HE</option>
+                    <option value="IHC-CD3">IHC-CD3</option>
+                    <option value="IHC-CD20">IHC-CD20</option>
+                    <option value="PAS">PAS</option>
+                    <option value="Trichrome">Trichrome</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="results-section">
+            <div id="status" class="status"></div>
+            <div id="results" class="results"></div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
