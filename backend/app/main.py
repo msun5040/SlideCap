@@ -55,7 +55,15 @@ async def lifespan(app: FastAPI):
     print("Building path cache...")
     cache_count = indexer.build_path_cache()
     print(f"Cached {cache_count} slide paths")
-    
+
+    # Auto-run incremental indexing to catch new files
+    print("Running incremental index...")
+    index_stats = indexer.build_incremental_index()
+    if index_stats['new_slides_indexed'] > 0:
+        print(f"Indexed {index_stats['new_slides_indexed']} new slides")
+    else:
+        print("No new slides found")
+
     print("=" * 60)
     print(f"API ready at http://{settings.HOST}:{settings.PORT}")
     print("=" * 60)
