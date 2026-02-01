@@ -1,4 +1,4 @@
-# SlideCap
+# slidecap
 
 A desktop application for organizing and searching pathology slides with AI analysis capabilities.
 
@@ -70,7 +70,7 @@ curl http://localhost:8000/stats
 ## Project Structure
 
 ```
-slide-organizer/
+slidecap/
 ├── backend/
 │   ├── app/
 │   │   ├── main.py              # FastAPI application
@@ -111,7 +111,7 @@ Organize slides by year:
 │   └── ...
 ├── 2023/
 │   └── ...
-└── .slide-organizer/
+└── .slidecap/
     ├── .salt                    # Hashing salt (auto-generated)
     ├── database.sqlite          # Metadata database
     └── thumbnails/              # Cached thumbnails

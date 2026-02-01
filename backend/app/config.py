@@ -14,7 +14,9 @@ class Settings(BaseSettings):
     # Windows example: "Z:/slides" or "//server/share/slides"
     # macOS example: "/Volumes/SharedDrive/slides"
     # Linux example: "/mnt/network/slides"
-    NETWORK_ROOT: str = '/Volumes/DFCI-LIGONLAB/Ligon Lab/test_directory'
+    
+    # NETWORK_ROOT: str = '/Volumes/DFCI-LIGONLAB/Ligon Lab/test_directory'
+    NETWORK_ROOT: str = '/Volumes/DFCI-LIGONLAB/Ligon Lab/test_directory_pt_slides'
     
     # App data directory (will be created inside NETWORK_ROOT)
     APP_DATA_DIR: str = ".slidecap"

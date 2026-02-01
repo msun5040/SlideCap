@@ -218,32 +218,40 @@ Index('idx_jobs_model_status', AnalysisJob.model_name, AnalysisJob.status)
 
 
 # ============================================================
-# Database Connection
+# Database Connection (Hardened for Network Drives)
 # ============================================================
 
 def get_engine(db_path: Path):
-    """Create SQLite engine with network drive optimizations."""
+    """Create SQLite engine hardened for network drive usage."""
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     engine = create_engine(
         f"sqlite:///{db_path}",
         echo=False,  # Set to True for SQL debugging
         connect_args={
-            "timeout": 30.0,  # Wait for locks
-        }
+            "timeout": 60.0,  # Wait up to 60s for locks
+            "check_same_thread": False,  # Allow multi-threaded access
+        },
+        pool_pre_ping=True,  # Verify connections before use
     )
-    
-    # Configure SQLite for better concurrency on network drives
+
+    # Configure SQLite for network drive compatibility
     @event.listens_for(engine, "connect")
     def set_sqlite_pragma(dbapi_connection, connection_record):
         cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA journal_mode=WAL")      # Better concurrency
-        cursor.execute("PRAGMA busy_timeout=30000")    # 30s timeout
-        cursor.execute("PRAGMA synchronous=NORMAL")    # Balance speed/safety
-        cursor.execute("PRAGMA cache_size=-64000")     # 64MB cache
+        # Use DELETE journal mode (not WAL) - more compatible with network drives
+        cursor.execute("PRAGMA journal_mode=DELETE")
+        # Long timeout for busy database (60 seconds)
+        cursor.execute("PRAGMA busy_timeout=60000")
+        # FULL synchronous for data safety on network drives
+        cursor.execute("PRAGMA synchronous=FULL")
+        # Smaller cache for network drives
+        cursor.execute("PRAGMA cache_size=-16000")  # 16MB cache
+        # Use NORMAL locking (not EXCLUSIVE) to allow multiple readers
+        cursor.execute("PRAGMA locking_mode=NORMAL")
         cursor.close()
-    
+
     return engine
 
 

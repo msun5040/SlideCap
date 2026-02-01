@@ -453,8 +453,22 @@ class SlideIndexer:
             if year and parsed.year != year:
                 continue
 
-            if stain_type and parsed.stain_type.lower() != stain_type.lower():
-                continue
+            if stain_type:
+                stain_lower = parsed.stain_type.lower()
+                filter_lower = stain_type.lower()
+                if filter_lower == 'he':
+                    if stain_lower != 'he':
+                        continue
+                elif filter_lower == 'ihc':
+                    if not stain_lower.startswith('ihc'):
+                        continue
+                elif filter_lower == 'special':
+                    if stain_lower == 'he' or stain_lower.startswith('ihc'):
+                        continue
+                else:
+                    # Exact match for any other filter value
+                    if stain_lower != filter_lower:
+                        continue
 
             matching.append((slide_hash, filepath, parsed))
 
@@ -497,8 +511,10 @@ class SlideIndexer:
 
             result = {
                 'slide_hash': slide_hash,
-                'year': parsed.year,
+                'accession_number': parsed.accession,
                 'block_id': parsed.block_id,
+                'slide_number': parsed.slide_number,
+                'year': parsed.year,
                 'stain_type': parsed.stain_type,
                 'random_id': parsed.random_id,
             }

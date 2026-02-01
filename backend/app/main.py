@@ -6,7 +6,7 @@ from typing import Optional, List
 import os
 
 from .config import settings
-from .db import init_db, Case, Slide, Tag, Project
+from .db import init_db, Case, Slide, Tag, Project, init_lock, get_lock
 from .services import SlideHasher, SlideIndexer
 
 
@@ -20,25 +20,30 @@ class BulkTagRequest(BaseModel):
 db_session = None
 hasher = None
 indexer = None
+db_lock = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global db_session, hasher, indexer
-    
+    global db_session, hasher, indexer, db_lock
+
     print("=" * 60)
     print("Starting Slide Organizer API")
     print("=" * 60)
-    
+
     # Validate configuration
     if not os.path.exists(settings.NETWORK_ROOT):
         print(f"ERROR: Network root does not exist: {settings.NETWORK_ROOT}")
         print("Please update NETWORK_ROOT in config.py or set via environment variable")
         raise RuntimeError(f"Network root not found: {settings.NETWORK_ROOT}")
-    
+
     print(f"Network root: {settings.NETWORK_ROOT}")
     print(f"Database: {settings.db_path}")
-    
+
+    # Initialize database lock for multi-user safety
+    print("Initializing database lock...")
+    db_lock = init_lock(settings.app_data_path)
+
     # Initialize database
     print("Initializing database...")
     db_session = init_db(settings.db_path)
@@ -186,7 +191,7 @@ def refresh_cache():
 def search_slides(
     q: str = Query(..., description="Search query (matches against filename)"),
     year: Optional[int] = Query(None, description="Filter by year"),
-    stain: Optional[str] = Query(None, description="Filter by stain type (e.g., HE)"),
+    stain: Optional[str] = Query(None, description="Filter by stain type: HE (exact), IHC (prefix match), Special (not HE or IHC)"),
     limit: int = Query(100, le=500, description="Maximum results")
 ):
     """
@@ -306,17 +311,18 @@ def add_tag_to_slide(slide_hash: str, tag_name: str):
     slide = db_session.query(Slide).filter_by(slide_hash=slide_hash).first()
     if not slide:
         raise HTTPException(status_code=404, detail="Slide not found")
-    
-    tag = db_session.query(Tag).filter_by(name=tag_name).first()
-    if not tag:
-        # Auto-create the tag
-        tag = Tag(name=tag_name)
-        db_session.add(tag)
-    
-    if tag not in slide.tags:
-        slide.tags.append(tag)
-        db_session.commit()
-    
+
+    with get_lock().write_lock():
+        tag = db_session.query(Tag).filter_by(name=tag_name).first()
+        if not tag:
+            # Auto-create the tag
+            tag = Tag(name=tag_name)
+            db_session.add(tag)
+
+        if tag not in slide.tags:
+            slide.tags.append(tag)
+            db_session.commit()
+
     return {"status": "ok", "slide_hash": slide_hash, "tag": tag_name}
 
 
@@ -326,12 +332,13 @@ def remove_tag_from_slide(slide_hash: str, tag_name: str):
     slide = db_session.query(Slide).filter_by(slide_hash=slide_hash).first()
     if not slide:
         raise HTTPException(status_code=404, detail="Slide not found")
-    
-    tag = db_session.query(Tag).filter_by(name=tag_name).first()
-    if tag and tag in slide.tags:
-        slide.tags.remove(tag)
-        db_session.commit()
-    
+
+    with get_lock().write_lock():
+        tag = db_session.query(Tag).filter_by(name=tag_name).first()
+        if tag and tag in slide.tags:
+            slide.tags.remove(tag)
+            db_session.commit()
+
     return {"status": "ok"}
 
 
@@ -345,24 +352,25 @@ def bulk_add_tags(request: BulkTagRequest):
     updated = []
     not_found = []
 
-    for slide_hash in request.slide_hashes:
-        slide = db_session.query(Slide).filter_by(slide_hash=slide_hash).first()
-        if not slide:
-            not_found.append(slide_hash)
-            continue
+    with get_lock().write_lock():
+        for slide_hash in request.slide_hashes:
+            slide = db_session.query(Slide).filter_by(slide_hash=slide_hash).first()
+            if not slide:
+                not_found.append(slide_hash)
+                continue
 
-        for tag_name in request.tags:
-            tag = db_session.query(Tag).filter_by(name=tag_name).first()
-            if not tag:
-                tag = Tag(name=tag_name)
-                db_session.add(tag)
+            for tag_name in request.tags:
+                tag = db_session.query(Tag).filter_by(name=tag_name).first()
+                if not tag:
+                    tag = Tag(name=tag_name)
+                    db_session.add(tag)
 
-            if tag not in slide.tags:
-                slide.tags.append(tag)
+                if tag not in slide.tags:
+                    slide.tags.append(tag)
 
-        updated.append(slide_hash)
+            updated.append(slide_hash)
 
-    db_session.commit()
+        db_session.commit()
 
     return {
         "status": "ok",
@@ -377,20 +385,21 @@ def bulk_remove_tags(request: BulkTagRequest):
     updated = []
     not_found = []
 
-    for slide_hash in request.slide_hashes:
-        slide = db_session.query(Slide).filter_by(slide_hash=slide_hash).first()
-        if not slide:
-            not_found.append(slide_hash)
-            continue
+    with get_lock().write_lock():
+        for slide_hash in request.slide_hashes:
+            slide = db_session.query(Slide).filter_by(slide_hash=slide_hash).first()
+            if not slide:
+                not_found.append(slide_hash)
+                continue
 
-        for tag_name in request.tags:
-            tag = db_session.query(Tag).filter_by(name=tag_name).first()
-            if tag and tag in slide.tags:
-                slide.tags.remove(tag)
+            for tag_name in request.tags:
+                tag = db_session.query(Tag).filter_by(name=tag_name).first()
+                if tag and tag in slide.tags:
+                    slide.tags.remove(tag)
 
-        updated.append(slide_hash)
+            updated.append(slide_hash)
 
-    db_session.commit()
+        db_session.commit()
 
     return {
         "status": "ok",
@@ -405,24 +414,25 @@ def bulk_set_tags(request: BulkTagRequest):
     updated = []
     not_found = []
 
-    tags_to_set = []
-    for tag_name in request.tags:
-        tag = db_session.query(Tag).filter_by(name=tag_name).first()
-        if not tag:
-            tag = Tag(name=tag_name)
-            db_session.add(tag)
-        tags_to_set.append(tag)
+    with get_lock().write_lock():
+        tags_to_set = []
+        for tag_name in request.tags:
+            tag = db_session.query(Tag).filter_by(name=tag_name).first()
+            if not tag:
+                tag = Tag(name=tag_name)
+                db_session.add(tag)
+            tags_to_set.append(tag)
 
-    for slide_hash in request.slide_hashes:
-        slide = db_session.query(Slide).filter_by(slide_hash=slide_hash).first()
-        if not slide:
-            not_found.append(slide_hash)
-            continue
+        for slide_hash in request.slide_hashes:
+            slide = db_session.query(Slide).filter_by(slide_hash=slide_hash).first()
+            if not slide:
+                not_found.append(slide_hash)
+                continue
 
-        slide.tags = tags_to_set.copy()
-        updated.append(slide_hash)
+            slide.tags = tags_to_set.copy()
+            updated.append(slide_hash)
 
-    db_session.commit()
+        db_session.commit()
 
     return {
         "status": "ok",
@@ -455,10 +465,11 @@ def list_projects():
 @app.post("/projects")
 def create_project(name: str, description: Optional[str] = None, created_by: Optional[str] = None):
     """Create a new project."""
-    project = Project(name=name, description=description, created_by=created_by)
-    db_session.add(project)
-    db_session.commit()
-    
+    with get_lock().write_lock():
+        project = Project(name=name, description=description, created_by=created_by)
+        db_session.add(project)
+        db_session.commit()
+
     return {"id": project.id, "name": project.name}
 
 
@@ -495,15 +506,16 @@ def add_case_to_project(project_id: int, case_hash: str):
     project = db_session.query(Project).filter_by(id=project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-    
+
     case = db_session.query(Case).filter_by(accession_hash=case_hash).first()
     if not case:
         raise HTTPException(status_code=404, detail="Case not found")
-    
-    if case not in project.cases:
-        project.cases.append(case)
-        db_session.commit()
-    
+
+    with get_lock().write_lock():
+        if case not in project.cases:
+            project.cases.append(case)
+            db_session.commit()
+
     return {"status": "ok", "project_id": project_id, "case_hash": case_hash}
 
 
