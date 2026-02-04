@@ -59,6 +59,13 @@ project_cases = Table(
     Column('added_at', DateTime, default=datetime.utcnow)
 )
 
+cohort_slides = Table(
+    'cohort_slides', Base.metadata,
+    Column('cohort_id', Integer, ForeignKey('cohorts.id', ondelete='CASCADE'), primary_key=True),
+    Column('slide_id', Integer, ForeignKey('slides.id', ondelete='CASCADE'), primary_key=True),
+    Column('added_at', DateTime, default=datetime.utcnow)
+)
+
 
 # ============================================================
 # Core Models
@@ -173,6 +180,45 @@ class Project(Base):
         return f"<Project(name={self.name})>"
 
 
+class Cohort(Base):
+    """
+    A cohort is a collection of slides for analysis or export.
+
+    Cohorts can be created by:
+    - Uploading a list of accession numbers
+    - Filtering slides by criteria
+    - Selecting slides with specific tags
+    """
+    __tablename__ = 'cohorts'
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(200), nullable=False)
+    description = Column(String(1000))
+
+    # How the cohort was created
+    source_type = Column(String(50))  # 'upload', 'filter', 'tag', 'manual'
+    source_details = Column(String(2000))  # JSON with filter criteria, tag names, etc.
+
+    # Metadata
+    created_by = Column(String(100))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # Relationships
+    slides = relationship('Slide', secondary=cohort_slides, backref='cohorts')
+
+    @property
+    def slide_count(self) -> int:
+        return len(self.slides)
+
+    @property
+    def case_count(self) -> int:
+        return len(set(s.case_id for s in self.slides))
+
+    def __repr__(self):
+        return f"<Cohort(name={self.name}, slides={self.slide_count})>"
+
+
 class AnalysisJob(Base):
     """
     Track AI model runs on slides.
@@ -234,6 +280,7 @@ def get_engine(db_path: Path):
             "check_same_thread": False,  # Allow multi-threaded access
         },
         pool_pre_ping=True,  # Verify connections before use
+        pool_recycle=300,  # Recycle connections every 5 minutes (helps with network drives)
     )
 
     # Configure SQLite for network drive compatibility
@@ -255,14 +302,37 @@ def get_engine(db_path: Path):
     return engine
 
 
+_SessionLocal = None
+_engine = None
+
 def init_db(db_path: Path) -> Session:
-    """Initialize database and return a session."""
+    """Initialize database and return a session factory."""
+    global _SessionLocal, _engine
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    engine = get_engine(db_path)
-    Base.metadata.create_all(engine)
-    
-    SessionLocal = sessionmaker(bind=engine)
-    return SessionLocal()
+    _engine = get_engine(db_path)
+    Base.metadata.create_all(_engine)
+
+    _SessionLocal = sessionmaker(bind=_engine)
+    return _SessionLocal()
+
+
+def get_db():
+    """
+    Dependency that provides a database session per request.
+    Automatically handles rollback on errors and closes session after request.
+    """
+    if _SessionLocal is None:
+        raise RuntimeError("Database not initialized. Call init_db() first.")
+
+    db = _SessionLocal()
+    try:
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 # Quick test

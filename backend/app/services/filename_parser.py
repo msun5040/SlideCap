@@ -45,12 +45,12 @@ class FilenameParser:
 
     # Pattern breakdown:
     # (BS-?(\d{2})-[A-Z]?\d{5,6})  - Accession: BS + optional dash + 2-digit year + dash + optional letter + 5-6 digits
-    # ([A-Z]\d+)                   - Block ID: letter + number(s) like A1, B2
+    # ([A-Z]\d*)                   - Block ID: letter + optional number(s) like A, A1, B2
     # (?:-(\d+))?                  - Slide number: optional digits after the dash
     # ([A-Za-z0-9-]+)              - Stain type: alphanumeric with possible dashes
     # ([A-Za-z0-9]+)               - Random ID: alphanumeric string
     PATTERN = re.compile(
-        r'^(BS-?(\d{2})-[A-Z]?\d{5,6})_([A-Z]\d+)(?:-(\d+))?_([A-Za-z0-9-]+)_([A-Za-z0-9]+)\.svs$',
+        r'^(BS-?(\d{2})-[A-Z]?\d{5,6})_([A-Z]\d*)(?:-(\d+))?_([A-Za-z0-9-]+)_([A-Za-z0-9]+)\.svs$',
         re.IGNORECASE
     )
 

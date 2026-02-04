@@ -1,3 +1,10 @@
+export interface Tag {
+  id: number
+  name: string
+  color?: string  // Hex color like "#FF5733"
+  category?: string
+}
+
 export interface Slide {
   slide_hash: string
   accession_number: string
@@ -7,7 +14,7 @@ export interface Slide {
   stain_type: string
   random_id?: string
   case_hash?: string
-  slide_tags?: string[]
+  slide_tags?: string[]      // Tag names from search results
   case_tags?: string[]
   projects?: string[]
   file_size_bytes?: number
@@ -18,4 +25,17 @@ export interface Slide {
 export interface SearchFilters {
   year?: string
   stain?: string
+}
+
+export interface Cohort {
+  id: number
+  name: string
+  description?: string
+  source_type: 'manual' | 'upload' | 'filter' | 'tag'
+  source_details?: string
+  slide_count: number
+  case_count: number
+  created_by?: string
+  created_at?: string
+  updated_at?: string
 }

@@ -4,9 +4,11 @@ from .models import (
     Slide,
     Tag,
     Project,
+    Cohort,
     AnalysisJob,
     get_engine,
     init_db,
+    get_db,
 )
 from .lock import DatabaseLock, init_lock, get_lock
 
@@ -16,9 +18,11 @@ __all__ = [
     'Slide',
     'Tag',
     'Project',
+    'Cohort',
     'AnalysisJob',
     'get_engine',
     'init_db',
+    'get_db',
     'DatabaseLock',
     'init_lock',
     'get_lock',

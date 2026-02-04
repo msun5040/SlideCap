@@ -2,13 +2,15 @@ import { useState } from 'react'
 import {
   LayoutDashboard,
   Microscope,
+  Users,
   Menu,
   X,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { SlideLibrary } from '@/components/SlideLibrary'
+import { CohortDashboard } from '@/components/CohortDashboard'
 
-type View = 'dashboard' | 'slides'
+type View = 'dashboard' | 'slides' | 'cohorts'
 
 export default function App() {
   const [currentView, setCurrentView] = useState<View>('slides')
@@ -17,6 +19,7 @@ export default function App() {
   const navigationItems = [
     { id: 'dashboard' as View, label: 'Dashboard', icon: LayoutDashboard },
     { id: 'slides' as View, label: 'Slide Library', icon: Microscope },
+    { id: 'cohorts' as View, label: 'Cohorts', icon: Users },
   ]
 
   const renderContent = () => {
@@ -30,6 +33,8 @@ export default function App() {
         )
       case 'slides':
         return <SlideLibrary />
+      case 'cohorts':
+        return <CohortDashboard />
       default:
         return <SlideLibrary />
     }
