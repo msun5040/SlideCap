@@ -18,73 +18,74 @@ from ..db.models import Case, Slide
 class SlideIndexer:
     """
     Indexes slides from the network drive into the database.
-    
+
     Maintains two types of indexes:
     1. Database (persistent): Case and slide metadata, tags, projects
     2. In-memory cache (runtime): Hash -> filepath mappings for instant lookup
+
+    Note: Database sessions are passed to methods that need them (per-request pattern).
     """
-    
+
     def __init__(
         self,
-        db_session: Session,
         hasher: SlideHasher,
         network_root: str
     ):
-        self.db = db_session
         self.hasher = hasher
         self.root = Path(network_root)
         self.parser = FilenameParser()
-        
+
         # In-memory caches for fast lookup (built on startup)
         self.slide_hash_to_path: dict[str, Path] = {}
         self.accession_hash_to_paths: dict[str, list[Path]] = {}
     
-    def index_file(self, filepath: Path) -> tuple[Case, Slide] | None:
+    def index_file(self, db: Session, filepath: Path) -> tuple[Case, Slide] | None:
         """
         Index a single slide file.
-        
+
         Creates Case if it doesn't exist, then creates or updates Slide.
-        
+
         Args:
+            db: Database session
             filepath: Path to the SVS file
-            
+
         Returns:
             (case, slide) tuple, or None if file can't be parsed
         """
         parsed = self.parser.parse(filepath.name)
         if not parsed:
             return None
-        
+
         # Hash the accession for case-level lookup
         accession_hash = self.hasher.hash_accession(parsed.accession)
-        
+
         # Hash the full filename for slide-level lookup
         slide_hash = self.hasher.hash_slide_stem(parsed.full_stem)
-        
+
         # Get or create case
-        case = self.db.query(Case).filter_by(accession_hash=accession_hash).first()
+        case = db.query(Case).filter_by(accession_hash=accession_hash).first()
         if not case:
             case = Case(
                 accession_hash=accession_hash,
                 year=parsed.year,
                 indexed_at=datetime.now(timezone.utc)
             )
-            self.db.add(case)
-            self.db.flush()  # Get the ID
-        
+            db.add(case)
+            db.flush()  # Get the ID
+
         # Check if slide already exists
-        existing_slide = self.db.query(Slide).filter_by(slide_hash=slide_hash).first()
+        existing_slide = db.query(Slide).filter_by(slide_hash=slide_hash).first()
         if existing_slide:
             # Update file_exists flag if re-indexing
             existing_slide.file_exists = 1
             return case, existing_slide
-        
+
         # Create new slide
         try:
             file_size = filepath.stat().st_size
         except OSError:
             file_size = None
-            
+
         slide = Slide(
             case_id=case.id,
             slide_hash=slide_hash,
@@ -94,18 +95,20 @@ class SlideIndexer:
             file_size_bytes=file_size,
             indexed_at=datetime.now(timezone.utc)
         )
-        self.db.add(slide)
-        
+        db.add(slide)
+
         return case, slide
     
     def build_full_index(
         self,
+        db: Session,
         progress_callback: Optional[Callable[[dict], None]] = None
     ) -> dict:
         """
         Index all slides in the network drive (optimized batch version).
 
         Args:
+            db: Database session
             progress_callback: Optional function called after each year with progress info
 
         Returns:
@@ -134,14 +137,14 @@ class SlideIndexer:
         # Load all existing hashes upfront (ONE query each)
         existing_case_hashes = {
             c.accession_hash: c.id
-            for c in self.db.query(Case.accession_hash, Case.id).all()
+            for c in db.query(Case.accession_hash, Case.id).all()
         }
         existing_slide_hashes = set(
-            s.slide_hash for s in self.db.query(Slide.slide_hash).all()
+            s.slide_hash for s in db.query(Slide.slide_hash).all()
         )
 
         # Mark all existing slides as potentially missing
-        self.db.query(Slide).update({Slide.file_exists: 0})
+        db.query(Slide).update({Slide.file_exists: 0})
 
         cases_before = len(existing_case_hashes)
 
@@ -174,8 +177,8 @@ class SlideIndexer:
                             indexed_at=datetime.now(timezone.utc)
                         )
                         new_cases.append(case)
-                        self.db.add(case)
-                        self.db.flush()  # Get ID
+                        db.add(case)
+                        db.flush()  # Get ID
                         existing_case_hashes[accession_hash] = case.id
 
                     case_id = existing_case_hashes[accession_hash]
@@ -207,15 +210,15 @@ class SlideIndexer:
 
             # Batch insert new slides
             if new_slides:
-                self.db.add_all(new_slides)
+                db.add_all(new_slides)
 
             # Batch update existing slides
             if slides_to_update:
-                self.db.query(Slide).filter(
+                db.query(Slide).filter(
                     Slide.slide_hash.in_(slides_to_update)
                 ).update({Slide.file_exists: 1}, synchronize_session=False)
 
-            self.db.commit()
+            db.commit()
             stats['years_processed'].append(year)
 
             if progress_callback:
@@ -235,6 +238,7 @@ class SlideIndexer:
     
     def build_incremental_index(
         self,
+        db: Session,
         progress_callback: Optional[Callable[[dict], None]] = None
     ) -> dict:
         """
@@ -243,6 +247,7 @@ class SlideIndexer:
         Much faster than full index for catching newly added files.
 
         Args:
+            db: Database session
             progress_callback: Optional function called with progress info
 
         Returns:
@@ -265,7 +270,7 @@ class SlideIndexer:
         t0 = time.time()
         existing_case_hashes = {
             c.accession_hash: c.id
-            for c in self.db.query(Case.accession_hash, Case.id).all()
+            for c in db.query(Case.accession_hash, Case.id).all()
         }
         print(f"  [TIMING] Load case hashes from DB: {time.time()-t0:.3f}s")
 
@@ -309,8 +314,8 @@ class SlideIndexer:
                             year=parsed.year,
                             indexed_at=datetime.now(timezone.utc)
                         )
-                        self.db.add(case)
-                        self.db.flush()
+                        db.add(case)
+                        db.flush()
                         existing_case_hashes[accession_hash] = case.id
 
                     case_id = existing_case_hashes[accession_hash]
@@ -348,8 +353,8 @@ class SlideIndexer:
             # Batch insert new slides
             t0 = time.time()
             if new_slides:
-                self.db.add_all(new_slides)
-            self.db.commit()
+                db.add_all(new_slides)
+            db.commit()
             print(f"  [TIMING] DB commit for {year}: {time.time()-t0:.3f}s")
             stats['years_processed'].append(year)
 
@@ -412,6 +417,7 @@ class SlideIndexer:
     
     def search(
         self,
+        db: Session,
         query: str,
         year: Optional[int] = None,
         stain_type: Optional[str] = None,
@@ -425,6 +431,7 @@ class SlideIndexer:
         in-memory path cache which has the actual filenames.
 
         Args:
+            db: Database session
             query: Search string (matches against filename)
             year: Optional year filter
             stain_type: Optional stain type filter (e.g., "HE")
@@ -484,7 +491,7 @@ class SlideIndexer:
         # Step 2: Batch fetch all slides from DB with eager loading
         t0 = time.time()
         matching_hashes = [m[0] for m in matching]
-        slides_db = self.db.query(Slide).options(
+        slides_db = db.query(Slide).options(
             joinedload(Slide.tags),
             joinedload(Slide.case).joinedload(Case.tags),
             joinedload(Slide.case).joinedload(Case.projects)
@@ -536,14 +543,14 @@ class SlideIndexer:
 
         return results
     
-    def get_stats(self) -> dict:
+    def get_stats(self, db: Session) -> dict:
         """Get current index statistics."""
         return {
-            'total_cases': self.db.query(Case).count(),
-            'total_slides': self.db.query(Slide).count(),
+            'total_cases': db.query(Case).count(),
+            'total_slides': db.query(Slide).count(),
             'slides_in_cache': len(self.slide_hash_to_path),
             'years': sorted(set(
-                int(p.parent.name) 
+                int(p.parent.name)
                 for p in self.slide_hash_to_path.values()
             )),
             'stain_types': sorted(set(

@@ -305,26 +305,72 @@ def get_engine(db_path: Path):
 _SessionLocal = None
 _engine = None
 
-def init_db(db_path: Path) -> Session:
-    """Initialize database and return a session factory."""
+
+def init_db(db_path: Path):
+    """
+    Initialize database schema and session factory.
+    Call this once at startup before handling requests.
+    """
     global _SessionLocal, _engine
     db_path.parent.mkdir(parents=True, exist_ok=True)
     _engine = get_engine(db_path)
     Base.metadata.create_all(_engine)
-
     _SessionLocal = sessionmaker(bind=_engine)
-    return _SessionLocal()
+
+
+import time as _time
+
+
+def _create_session_with_retry(max_retries: int = 3, retry_delay: float = 0.5) -> Session:
+    """Create a session with retry logic for transient network failures."""
+    from sqlalchemy import text
+
+    for attempt in range(max_retries):
+        db = _SessionLocal()
+        try:
+            # Test the connection with a simple query
+            db.execute(text("SELECT 1"))
+            return db
+        except Exception as e:
+            db.close()
+
+            # Check if it's a retryable error (network/file access issues)
+            error_str = str(e).lower()
+            is_retryable = (
+                "unable to open database" in error_str or
+                "database is locked" in error_str or
+                "disk i/o error" in error_str
+            )
+
+            if is_retryable and attempt < max_retries - 1:
+                print(f"[DB] Retrying connection (attempt {attempt + 1}/{max_retries}): {e}")
+                _time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
+                continue
+            raise
+
+    raise RuntimeError("Failed to create database session after retries")
 
 
 def get_db():
     """
-    Dependency that provides a database session per request.
-    Automatically handles rollback on errors and closes session after request.
+    FastAPI dependency that provides a database session per request.
+
+    Usage:
+        @app.get("/items")
+        def get_items(db: Session = Depends(get_db)):
+            return db.query(Item).all()
+
+    Each request gets its own session that is:
+    - Committed on success
+    - Rolled back on exception
+    - Closed when the request completes
+
+    Includes retry logic for transient network drive failures.
     """
     if _SessionLocal is None:
         raise RuntimeError("Database not initialized. Call init_db() first.")
 
-    db = _SessionLocal()
+    db = _create_session_with_retry()
     try:
         yield db
         db.commit()
@@ -333,6 +379,29 @@ def get_db():
         raise
     finally:
         db.close()
+
+
+def get_session() -> Session:
+    """
+    Get a database session for use outside of FastAPI request handling.
+
+    Use this for startup operations, background tasks, etc.
+    Caller is responsible for committing, rolling back, and closing the session.
+
+    Usage:
+        db = get_session()
+        try:
+            # do work
+            db.commit()
+        except:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+    """
+    if _SessionLocal is None:
+        raise RuntimeError("Database not initialized. Call init_db() first.")
+    return _SessionLocal()
 
 
 # Quick test

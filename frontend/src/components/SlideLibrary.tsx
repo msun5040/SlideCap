@@ -52,6 +52,8 @@ export function SlideLibrary() {
   const [stainFilter, setStainFilter] = useState<string>('all')
   const [yearFilter, setYearFilter] = useState<string>('all')
   const [statusFilter, setStatusFilter] = useState<string>('all')
+  const [tagFilter, setTagFilter] = useState<string>('all')
+  const [availableTags, setAvailableTags] = useState<Tag[]>([])
   const [selectedSlide, setSelectedSlide] = useState<Slide | null>(null)
   const [isTagDialogOpen, setIsTagDialogOpen] = useState(false)
   const [isDetailsDialogOpen, setIsDetailsDialogOpen] = useState(false)
@@ -59,6 +61,7 @@ export function SlideLibrary() {
   const [slideTags, setSlideTags] = useState<Tag[]>([])
   const [loadingTags, setLoadingTags] = useState(false)
   const [stats, setStats] = useState<{ total_slides: number; total_cases: number } | null>(null)
+  const [resultsTruncated, setResultsTruncated] = useState(false)
 
   // Bulk selection state
   const [selectedSlides, setSelectedSlides] = useState<Set<string>>(new Set())
@@ -161,19 +164,40 @@ export function SlideLibrary() {
     }
   }
 
-  const handleSearch = async () => {
-    if (!searchTerm.trim()) return
-
-    setLoading(true)
+  const fetchAvailableTags = async () => {
     try {
-      let url = `${API_BASE}/search?q=${encodeURIComponent(searchTerm)}`
-      if (yearFilter !== 'all') url += `&year=${yearFilter}`
-      if (stainFilter !== 'all') url += `&stain=${stainFilter}`
+      const response = await fetch(`${API_BASE}/tags`)
+      if (response.ok) {
+        const data = await response.json()
+        setAvailableTags(data)
+      }
+    } catch (error) {
+      console.error('Failed to fetch tags:', error)
+    }
+  }
 
+  // Fetch available tags on mount
+  useEffect(() => {
+    fetchAvailableTags()
+  }, [])
+
+  const handleSearch = async () => {
+    setLoading(true)
+    setSelectedSlides(new Set()) // Clear selection on new search
+    try {
+      // Build URL with optional query and filters
+      const params = new URLSearchParams()
+      if (searchTerm.trim()) params.append('q', searchTerm.trim())
+      if (yearFilter !== 'all') params.append('year', yearFilter)
+      if (stainFilter !== 'all') params.append('stain', stainFilter)
+      if (tagFilter !== 'all') params.append('tag', tagFilter)
+
+      const url = `${API_BASE}/search?${params.toString()}`
       const response = await fetch(url)
       if (response.ok) {
         const data = await response.json()
         setSlides(data.results)
+        setResultsTruncated(data.truncated || false)
       }
     } catch (error) {
       console.error('Search error:', error)
@@ -453,6 +477,29 @@ export function SlideLibrary() {
             </SelectContent>
           </Select>
 
+          <Select value={tagFilter} onValueChange={setTagFilter}>
+            <SelectTrigger className="w-36">
+              <TagIcon className="mr-2 h-4 w-4" />
+              <SelectValue placeholder="Tag" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All Tags</SelectItem>
+              {availableTags.map((tag) => (
+                <SelectItem key={tag.id} value={tag.name}>
+                  <div className="flex items-center gap-2">
+                    {tag.color && (
+                      <span
+                        className="w-2 h-2 rounded-full"
+                        style={{ backgroundColor: tag.color }}
+                      />
+                    )}
+                    {tag.name}
+                  </div>
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+
           <Button onClick={handleSearch} disabled={loading}>
             {loading ? 'Searching...' : 'Search'}
           </Button>
@@ -462,6 +509,9 @@ export function SlideLibrary() {
       <div className="flex items-center justify-between">
         <div className="text-sm text-muted-foreground">
           Showing {filteredSlides.length} slides
+          {resultsTruncated && (
+            <span className="ml-1 text-orange-600">(limit reached - refine your search)</span>
+          )}
           {selectedSlides.size > 0 && (
             <span className="ml-2 text-foreground font-medium">
               ({selectedSlides.size} selected)
@@ -503,7 +553,7 @@ export function SlideLibrary() {
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead className="w-[50px]">
+              <TableHead className="w-12.5">
                 <Checkbox
                   checked={filteredSlides.length > 0 && selectedSlides.size === filteredSlides.length}
                   onCheckedChange={toggleSelectAll}

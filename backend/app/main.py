@@ -1,15 +1,16 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Depends
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
 from io import BytesIO
 import os
+from sqlalchemy.orm import Session
 
 from .config import settings
-from .db import init_db, Case, Slide, Tag, Project, Cohort, init_lock, get_lock
+from .db import init_db, get_db, get_session, Case, Slide, Tag, Project, Cohort, init_lock, get_lock
 from .services import SlideHasher, SlideIndexer
 
 
@@ -21,7 +22,6 @@ class BulkTagRequest(BaseModel):
 
 
 # Global instances (initialized on startup)
-db_session = None
 hasher = None
 indexer = None
 db_lock = None
@@ -29,7 +29,7 @@ db_lock = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global db_session, hasher, indexer, db_lock
+    global hasher, indexer, db_lock
 
     print("=" * 60)
     print("Starting Slide Organizer API")
@@ -48,41 +48,48 @@ async def lifespan(app: FastAPI):
     print("Initializing database lock...")
     db_lock = init_lock(settings.app_data_path)
 
-    # Initialize database
+    # Initialize database (creates session factory)
     print("Initializing database...")
-    db_session = init_db(settings.db_path)
-    
+    init_db(settings.db_path)
+
     # Initialize hasher
     print("Initializing hasher...")
     hasher = SlideHasher(settings.salt_path)
-    
-    # Initialize indexer
+
+    # Initialize indexer (no longer takes db_session)
     print("Initializing indexer...")
-    indexer = SlideIndexer(db_session, hasher, settings.NETWORK_ROOT)
-    
+    indexer = SlideIndexer(hasher, settings.NETWORK_ROOT)
+
     # Build path cache for fast lookups
     print("Building path cache...")
     cache_count = indexer.build_path_cache()
     print(f"Cached {cache_count} slide paths")
 
     # Auto-run incremental indexing to catch new files
+    # Use a dedicated session for startup operations
     print("Running incremental index...")
-    index_stats = indexer.build_incremental_index()
-    if index_stats['new_slides_indexed'] > 0:
-        print(f"Indexed {index_stats['new_slides_indexed']} new slides")
-    else:
-        print("No new slides found")
+    startup_db = get_session()
+    try:
+        index_stats = indexer.build_incremental_index(startup_db)
+        startup_db.commit()
+        if index_stats['new_slides_indexed'] > 0:
+            print(f"Indexed {index_stats['new_slides_indexed']} new slides")
+        else:
+            print("No new slides found")
+    except Exception:
+        startup_db.rollback()
+        raise
+    finally:
+        startup_db.close()
 
     print("=" * 60)
     print(f"API ready at http://{settings.HOST}:{settings.PORT}")
     print("=" * 60)
 
     yield  # Application runs here
-    
+
     # Cleanup
     print("Shutting down...")
-    if db_session:
-        db_session.close()
 
 
 # Create FastAPI app
@@ -101,21 +108,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-# Session cleanup middleware - prevents "prepared state" errors
-@app.middleware("http")
-async def db_session_cleanup(request, call_next):
-    """Clean up database session after each request to prevent stale state."""
-    response = await call_next(request)
-    # Always rollback and expire after request to ensure clean state
-    try:
-        if db_session is not None:
-            db_session.rollback()
-            db_session.expire_all()
-    except Exception:
-        pass  # Ignore cleanup errors
-    return response
 
 
 # ============================================================
@@ -143,11 +135,11 @@ def health():
 
 
 @app.get("/stats")
-def get_stats():
+def get_stats(db: Session = Depends(get_db)):
     """Get index statistics."""
     if not indexer:
         raise HTTPException(status_code=503, detail="Indexer not initialized")
-    return indexer.get_stats()
+    return indexer.get_stats(db)
 
 
 @app.get("/thumbnails/stats")
@@ -180,29 +172,29 @@ def get_thumbnail_stats():
 # ============================================================
 
 @app.post("/index/full")
-def run_full_index():
+def run_full_index(db: Session = Depends(get_db)):
     """
     Run a full index of all slides.
-    
+
     This scans the entire network drive and updates the database.
     May take several minutes for large collections.
     """
     if not indexer:
         raise HTTPException(status_code=503, detail="Indexer not initialized")
-    
+
     print("Starting full index...")
-    stats = indexer.build_full_index()
-    
+    stats = indexer.build_full_index(db)
+
     # Rebuild path cache
     cache_count = indexer.build_path_cache()
     stats['cache_rebuilt'] = cache_count
-    
+
     print(f"Index complete: {stats}")
     return stats
 
 
 @app.post("/index/incremental")
-def run_incremental_index():
+def run_incremental_index(db: Session = Depends(get_db)):
     """
     Index only new slides that aren't already in the database.
 
@@ -212,7 +204,7 @@ def run_incremental_index():
         raise HTTPException(status_code=503, detail="Indexer not initialized")
 
     print("Starting incremental index...")
-    stats = indexer.build_incremental_index()
+    stats = indexer.build_incremental_index(db)
     print(f"Incremental index complete: {stats['new_slides_indexed']} new slides")
     return stats
 
@@ -233,30 +225,52 @@ def refresh_cache():
 
 @app.get("/search")
 def search_slides(
-    q: str = Query(..., description="Search query (matches against filename)"),
+    db: Session = Depends(get_db),
+    q: Optional[str] = Query(None, description="Search query (matches against filename). If empty, returns all slides matching filters."),
     year: Optional[int] = Query(None, description="Filter by year"),
     stain: Optional[str] = Query(None, description="Filter by stain type: HE (exact), IHC (prefix match), Special (not HE or IHC)"),
-    limit: int = Query(100, le=500, description="Maximum results")
+    tag: Optional[str] = Query(None, description="Filter by tag name"),
+    limit: int = Query(500, le=500, description="Maximum results")
 ):
     """
     Search for slides by accession number or other filename components.
-    
+
     Supports partial matching (e.g., "S24-123" will match "S24-12345").
+    If no query is provided, returns all slides matching the filters (up to limit).
     """
     if not indexer:
         raise HTTPException(status_code=503, detail="Indexer not initialized")
-    
+
+    # Use empty string if no query provided - indexer will return all slides
+    search_query = q or ""
+
     results = indexer.search(
-        query=q,
+        db=db,
+        query=search_query,
         year=year,
         stain_type=stain,
         limit=limit
     )
-    
+
+    # Filter by tag if specified
+    if tag:
+        tag_obj = db.query(Tag).filter_by(name=tag).first()
+        if tag_obj:
+            # Get slide hashes that have this tag
+            tagged_hashes = set()
+            for slide in tag_obj.slides:
+                tagged_hashes.add(slide.slide_hash)
+            # Filter results to only include slides with this tag
+            results = [r for r in results if r.get('slide_hash') in tagged_hashes]
+        else:
+            # Tag doesn't exist, return empty results
+            results = []
+
     return {
         "query": q,
-        "filters": {"year": year, "stain": stain},
+        "filters": {"year": year, "stain": stain, "tag": tag},
         "count": len(results),
+        "truncated": len(results) == limit,
         "results": results
     }
 
@@ -266,64 +280,59 @@ def search_slides(
 # ============================================================
 
 @app.post("/slides/bulk/tags/add")
-def bulk_add_tags(request: BulkTagRequest):
+def bulk_add_tags(request: BulkTagRequest, db: Session = Depends(get_db)):
     """Add tags to multiple slides at once."""
-    try:
-        db_session.rollback()
-        updated = []
-        not_found = []
+    updated = []
+    not_found = []
 
-        with get_lock().write_lock():
-            for slide_hash in request.slide_hashes:
-                slide = db_session.query(Slide).filter_by(slide_hash=slide_hash).first()
-                if not slide:
-                    not_found.append(slide_hash)
-                    continue
+    with get_lock().write_lock():
+        for slide_hash in request.slide_hashes:
+            slide = db.query(Slide).filter_by(slide_hash=slide_hash).first()
+            if not slide:
+                not_found.append(slide_hash)
+                continue
 
-                for tag_name in request.tags:
-                    tag = db_session.query(Tag).filter_by(name=tag_name).first()
-                    if not tag:
-                        tag = Tag(name=tag_name, color=request.color)
-                        db_session.add(tag)
+            for tag_name in request.tags:
+                tag = db.query(Tag).filter_by(name=tag_name).first()
+                if not tag:
+                    tag = Tag(name=tag_name, color=request.color)
+                    db.add(tag)
 
-                    if tag not in slide.tags:
-                        slide.tags.append(tag)
+                if tag not in slide.tags:
+                    slide.tags.append(tag)
 
-                updated.append(slide_hash)
+            updated.append(slide_hash)
 
-            db_session.commit()
+        db.commit()  # Commit while holding lock to ensure data is written
 
-        return {
-            "status": "ok",
-            "updated": len(updated),
-            "not_found": not_found
-        }
-    except Exception as e:
-        db_session.rollback()
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    return {
+        "status": "ok",
+        "updated": len(updated),
+        "not_found": not_found
+    }
 
 
 @app.post("/slides/bulk/tags/remove")
-def bulk_remove_tags(request: BulkTagRequest):
+def bulk_remove_tags(request: BulkTagRequest, db: Session = Depends(get_db)):
     """Remove tags from multiple slides at once."""
     updated = []
     not_found = []
 
     with get_lock().write_lock():
         for slide_hash in request.slide_hashes:
-            slide = db_session.query(Slide).filter_by(slide_hash=slide_hash).first()
+            slide = db.query(Slide).filter_by(slide_hash=slide_hash).first()
             if not slide:
                 not_found.append(slide_hash)
                 continue
 
             for tag_name in request.tags:
-                tag = db_session.query(Tag).filter_by(name=tag_name).first()
+                tag = db.query(Tag).filter_by(name=tag_name).first()
                 if tag and tag in slide.tags:
                     slide.tags.remove(tag)
 
             updated.append(slide_hash)
 
-        db_session.commit()
+        db.commit()  # Commit while holding lock
 
     return {
         "status": "ok",
@@ -333,7 +342,7 @@ def bulk_remove_tags(request: BulkTagRequest):
 
 
 @app.put("/slides/bulk/tags")
-def bulk_set_tags(request: BulkTagRequest):
+def bulk_set_tags(request: BulkTagRequest, db: Session = Depends(get_db)):
     """Replace all tags on multiple slides (removes existing tags first)."""
     updated = []
     not_found = []
@@ -341,14 +350,14 @@ def bulk_set_tags(request: BulkTagRequest):
     with get_lock().write_lock():
         tags_to_set = []
         for tag_name in request.tags:
-            tag = db_session.query(Tag).filter_by(name=tag_name).first()
+            tag = db.query(Tag).filter_by(name=tag_name).first()
             if not tag:
                 tag = Tag(name=tag_name)
-                db_session.add(tag)
+                db.add(tag)
             tags_to_set.append(tag)
 
         for slide_hash in request.slide_hashes:
-            slide = db_session.query(Slide).filter_by(slide_hash=slide_hash).first()
+            slide = db.query(Slide).filter_by(slide_hash=slide_hash).first()
             if not slide:
                 not_found.append(slide_hash)
                 continue
@@ -356,7 +365,7 @@ def bulk_set_tags(request: BulkTagRequest):
             slide.tags = tags_to_set.copy()
             updated.append(slide_hash)
 
-        db_session.commit()
+        db.commit()  # Commit while holding lock
 
     return {
         "status": "ok",
@@ -366,17 +375,17 @@ def bulk_set_tags(request: BulkTagRequest):
 
 
 @app.get("/slides/{slide_hash}")
-def get_slide(slide_hash: str):
+def get_slide(slide_hash: str, db: Session = Depends(get_db)):
     """Get details for a specific slide by its hash."""
     if not indexer:
         raise HTTPException(status_code=503, detail="Indexer not initialized")
-    
-    slide = db_session.query(Slide).filter_by(slide_hash=slide_hash).first()
+
+    slide = db.query(Slide).filter_by(slide_hash=slide_hash).first()
     if not slide:
         raise HTTPException(status_code=404, detail="Slide not found")
-    
+
     filepath = indexer.get_filepath(slide_hash)
-    
+
     return {
         "slide_hash": slide.slide_hash,
         "case_hash": slide.case.accession_hash,
@@ -660,9 +669,9 @@ class TagUpdate(BaseModel):
 
 
 @app.get("/tags")
-def list_tags():
+def list_tags(db: Session = Depends(get_db)):
     """List all tags with usage counts."""
-    tags = db_session.query(Tag).order_by(Tag.name).all()
+    tags = db.query(Tag).order_by(Tag.name).all()
     return [
         {
             "id": t.id,
@@ -677,54 +686,47 @@ def list_tags():
 
 
 @app.get("/tags/search")
-def search_tags(q: str = Query(..., min_length=1)):
+def search_tags(db: Session = Depends(get_db), q: str = Query(..., min_length=1)):
     """Search/autocomplete tags by name prefix."""
-    try:
-        db_session.rollback()
-        db_session.expire_all()
+    tags = db.query(Tag).filter(
+        Tag.name.ilike(f"{q}%")
+    ).order_by(Tag.name).limit(10).all()
 
-        tags = db_session.query(Tag).filter(
-            Tag.name.ilike(f"{q}%")
-        ).order_by(Tag.name).limit(10).all()
-
-        return [
-            {
-                "id": t.id,
-                "name": t.name,
-                "color": t.color,
-                "category": t.category
-            }
-            for t in tags
-        ]
-    except Exception as e:
-        db_session.rollback()
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    return [
+        {
+            "id": t.id,
+            "name": t.name,
+            "color": t.color,
+            "category": t.category
+        }
+        for t in tags
+    ]
 
 
 @app.post("/tags")
-def create_tag(tag_data: TagCreate):
+def create_tag(tag_data: TagCreate, db: Session = Depends(get_db)):
     """Create a new tag."""
-    existing = db_session.query(Tag).filter_by(name=tag_data.name).first()
+    existing = db.query(Tag).filter_by(name=tag_data.name).first()
     if existing:
         raise HTTPException(status_code=400, detail="Tag already exists")
 
     tag = Tag(name=tag_data.name, color=tag_data.color, category=tag_data.category)
-    db_session.add(tag)
-    db_session.commit()
+    db.add(tag)
+    db.commit()
 
     return {"id": tag.id, "name": tag.name, "color": tag.color, "category": tag.category}
 
 
 @app.patch("/tags/{tag_id}")
-def update_tag(tag_id: int, tag_data: TagUpdate):
+def update_tag(tag_id: int, tag_data: TagUpdate, db: Session = Depends(get_db)):
     """Update a tag's name, color, or category."""
-    tag = db_session.query(Tag).filter_by(id=tag_id).first()
+    tag = db.query(Tag).filter_by(id=tag_id).first()
     if not tag:
         raise HTTPException(status_code=404, detail="Tag not found")
 
     if tag_data.name is not None:
         # Check for name conflict
-        existing = db_session.query(Tag).filter(Tag.name == tag_data.name, Tag.id != tag_id).first()
+        existing = db.query(Tag).filter(Tag.name == tag_data.name, Tag.id != tag_id).first()
         if existing:
             raise HTTPException(status_code=400, detail="Tag name already exists")
         tag.name = tag_data.name
@@ -735,28 +737,28 @@ def update_tag(tag_id: int, tag_data: TagUpdate):
     if tag_data.category is not None:
         tag.category = tag_data.category
 
-    db_session.commit()
+    db.commit()
 
     return {"id": tag.id, "name": tag.name, "color": tag.color, "category": tag.category}
 
 
 @app.delete("/tags/{tag_id}")
-def delete_tag(tag_id: int):
+def delete_tag(tag_id: int, db: Session = Depends(get_db)):
     """Delete a tag."""
-    tag = db_session.query(Tag).filter_by(id=tag_id).first()
+    tag = db.query(Tag).filter_by(id=tag_id).first()
     if not tag:
         raise HTTPException(status_code=404, detail="Tag not found")
 
-    db_session.delete(tag)
-    db_session.commit()
+    db.delete(tag)
+    db.commit()
 
     return {"status": "ok"}
 
 
 @app.get("/tags/{tag_name}/slides")
-def get_slides_by_tag(tag_name: str, limit: int = Query(100, le=500)):
+def get_slides_by_tag(tag_name: str, db: Session = Depends(get_db), limit: int = Query(100, le=500)):
     """Get all slides with a given tag."""
-    tag = db_session.query(Tag).filter_by(name=tag_name).first()
+    tag = db.query(Tag).filter_by(name=tag_name).first()
     if not tag:
         raise HTTPException(status_code=404, detail="Tag not found")
 
@@ -781,30 +783,21 @@ def get_slides_by_tag(tag_name: str, limit: int = Query(100, le=500)):
 
 
 @app.get("/slides/{slide_hash}/tags")
-def get_slide_tags(slide_hash: str):
+def get_slide_tags(slide_hash: str, db: Session = Depends(get_db)):
     """Get all tags for a slide."""
-    try:
-        db_session.rollback()
-        db_session.expire_all()  # Clear cached data to get fresh results
+    slide = db.query(Slide).filter_by(slide_hash=slide_hash).first()
+    if not slide:
+        raise HTTPException(status_code=404, detail="Slide not found")
 
-        slide = db_session.query(Slide).filter_by(slide_hash=slide_hash).first()
-        if not slide:
-            raise HTTPException(status_code=404, detail="Slide not found")
-
-        return [
-            {
-                "id": t.id,
-                "name": t.name,
-                "color": t.color,
-                "category": t.category
-            }
-            for t in slide.tags
-        ]
-    except HTTPException:
-        raise
-    except Exception as e:
-        db_session.rollback()
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    return [
+        {
+            "id": t.id,
+            "name": t.name,
+            "color": t.color,
+            "category": t.category
+        }
+        for t in slide.tags
+    ]
 
 
 class AddTagRequest(BaseModel):
@@ -813,88 +806,71 @@ class AddTagRequest(BaseModel):
 
 
 @app.post("/slides/{slide_hash}/tags")
-def add_tag_to_slide(slide_hash: str, tag_data: AddTagRequest):
+def add_tag_to_slide(slide_hash: str, tag_data: AddTagRequest, db: Session = Depends(get_db)):
     """Add a tag to a slide. Creates the tag if it doesn't exist."""
-    try:
-        # Rollback any pending transaction first
-        db_session.rollback()
-
-        slide = db_session.query(Slide).filter_by(slide_hash=slide_hash).first()
-        if not slide:
-            raise HTTPException(status_code=404, detail="Slide not found")
-
-        with get_lock().write_lock():
-            tag = db_session.query(Tag).filter_by(name=tag_data.name).first()
-            if not tag:
-                # Auto-create the tag with color
-                tag = Tag(name=tag_data.name, color=tag_data.color)
-                db_session.add(tag)
-                db_session.flush()  # Get the ID
-
-            if tag not in slide.tags:
-                slide.tags.append(tag)
-
-            db_session.commit()
-
-        return {
-            "status": "ok",
-            "tag": {
-                "id": tag.id,
-                "name": tag.name,
-                "color": tag.color,
-                "category": tag.category
-            }
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        db_session.rollback()
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-
-
-@app.post("/slides/{slide_hash}/tags/{tag_name}")
-def add_tag_to_slide_by_name(slide_hash: str, tag_name: str):
-    """Add a tag to a slide by name (legacy endpoint)."""
-    slide = db_session.query(Slide).filter_by(slide_hash=slide_hash).first()
+    slide = db.query(Slide).filter_by(slide_hash=slide_hash).first()
     if not slide:
         raise HTTPException(status_code=404, detail="Slide not found")
 
     with get_lock().write_lock():
-        tag = db_session.query(Tag).filter_by(name=tag_name).first()
+        tag = db.query(Tag).filter_by(name=tag_data.name).first()
         if not tag:
-            # Auto-create the tag
-            tag = Tag(name=tag_name)
-            db_session.add(tag)
+            # Auto-create the tag with color
+            tag = Tag(name=tag_data.name, color=tag_data.color)
+            db.add(tag)
+            db.flush()  # Get the ID
 
         if tag not in slide.tags:
             slide.tags.append(tag)
-            db_session.commit()
+
+        db.commit()
+
+    return {
+        "status": "ok",
+        "tag": {
+            "id": tag.id,
+            "name": tag.name,
+            "color": tag.color,
+            "category": tag.category
+        }
+    }
+
+
+@app.post("/slides/{slide_hash}/tags/{tag_name}")
+def add_tag_to_slide_by_name(slide_hash: str, tag_name: str, db: Session = Depends(get_db)):
+    """Add a tag to a slide by name (legacy endpoint)."""
+    slide = db.query(Slide).filter_by(slide_hash=slide_hash).first()
+    if not slide:
+        raise HTTPException(status_code=404, detail="Slide not found")
+
+    with get_lock().write_lock():
+        tag = db.query(Tag).filter_by(name=tag_name).first()
+        if not tag:
+            # Auto-create the tag
+            tag = Tag(name=tag_name)
+            db.add(tag)
+
+        if tag not in slide.tags:
+            slide.tags.append(tag)
+            db.commit()
 
     return {"status": "ok", "slide_hash": slide_hash, "tag": tag_name}
 
 
 @app.delete("/slides/{slide_hash}/tags/{tag_name}")
-def remove_tag_from_slide(slide_hash: str, tag_name: str):
+def remove_tag_from_slide(slide_hash: str, tag_name: str, db: Session = Depends(get_db)):
     """Remove a tag from a slide."""
-    try:
-        db_session.rollback()
+    slide = db.query(Slide).filter_by(slide_hash=slide_hash).first()
+    if not slide:
+        raise HTTPException(status_code=404, detail="Slide not found")
 
-        slide = db_session.query(Slide).filter_by(slide_hash=slide_hash).first()
-        if not slide:
-            raise HTTPException(status_code=404, detail="Slide not found")
+    with get_lock().write_lock():
+        tag = db.query(Tag).filter_by(name=tag_name).first()
+        if tag and tag in slide.tags:
+            slide.tags.remove(tag)
+            db.commit()
 
-        with get_lock().write_lock():
-            tag = db_session.query(Tag).filter_by(name=tag_name).first()
-            if tag and tag in slide.tags:
-                slide.tags.remove(tag)
-                db_session.commit()
-
-        return {"status": "ok"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        db_session.rollback()
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    return {"status": "ok"}
 
 
 # ============================================================
@@ -902,9 +878,9 @@ def remove_tag_from_slide(slide_hash: str, tag_name: str):
 # ============================================================
 
 @app.get("/projects")
-def list_projects():
+def list_projects(db: Session = Depends(get_db)):
     """List all projects."""
-    projects = db_session.query(Project).order_by(Project.created_at.desc()).all()
+    projects = db.query(Project).order_by(Project.created_at.desc()).all()
     return [
         {
             "id": p.id,
@@ -919,23 +895,23 @@ def list_projects():
 
 
 @app.post("/projects")
-def create_project(name: str, description: Optional[str] = None, created_by: Optional[str] = None):
+def create_project(db: Session = Depends(get_db), name: str = Query(...), description: Optional[str] = None, created_by: Optional[str] = None):
     """Create a new project."""
     with get_lock().write_lock():
         project = Project(name=name, description=description, created_by=created_by)
-        db_session.add(project)
-        db_session.commit()
+        db.add(project)
+        db.commit()
 
     return {"id": project.id, "name": project.name}
 
 
 @app.get("/projects/{project_id}")
-def get_project(project_id: int):
+def get_project(project_id: int, db: Session = Depends(get_db)):
     """Get project details including all cases."""
-    project = db_session.query(Project).filter_by(id=project_id).first()
+    project = db.query(Project).filter_by(id=project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-    
+
     return {
         "id": project.id,
         "name": project.name,
@@ -957,20 +933,20 @@ def get_project(project_id: int):
 
 
 @app.post("/projects/{project_id}/cases/{case_hash}")
-def add_case_to_project(project_id: int, case_hash: str):
+def add_case_to_project(project_id: int, case_hash: str, db: Session = Depends(get_db)):
     """Add a case to a project."""
-    project = db_session.query(Project).filter_by(id=project_id).first()
+    project = db.query(Project).filter_by(id=project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    case = db_session.query(Case).filter_by(accession_hash=case_hash).first()
+    case = db.query(Case).filter_by(accession_hash=case_hash).first()
     if not case:
         raise HTTPException(status_code=404, detail="Case not found")
 
     with get_lock().write_lock():
         if case not in project.cases:
             project.cases.append(case)
-            db_session.commit()
+            db.commit()
 
     return {"status": "ok", "project_id": project_id, "case_hash": case_hash}
 
@@ -997,219 +973,171 @@ class CohortAddSlides(BaseModel):
 
 
 @app.get("/cohorts")
-def list_cohorts():
+def list_cohorts(db: Session = Depends(get_db)):
     """List all cohorts."""
-    try:
-        db_session.rollback()
-        db_session.expire_all()
-        cohorts = db_session.query(Cohort).order_by(Cohort.created_at.desc()).all()
-        return [
-            {
-                "id": c.id,
-                "name": c.name,
-                "description": c.description,
-                "source_type": c.source_type,
-                "slide_count": c.slide_count,
-                "case_count": c.case_count,
-                "created_by": c.created_by,
-                "created_at": c.created_at.isoformat() if c.created_at else None,
-                "updated_at": c.updated_at.isoformat() if c.updated_at else None
-            }
-            for c in cohorts
-        ]
-    except Exception as e:
-        db_session.rollback()
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    cohorts = db.query(Cohort).order_by(Cohort.created_at.desc()).all()
+    return [
+        {
+            "id": c.id,
+            "name": c.name,
+            "description": c.description,
+            "source_type": c.source_type,
+            "slide_count": c.slide_count,
+            "case_count": c.case_count,
+            "created_by": c.created_by,
+            "created_at": c.created_at.isoformat() if c.created_at else None,
+            "updated_at": c.updated_at.isoformat() if c.updated_at else None
+        }
+        for c in cohorts
+    ]
 
 
 @app.post("/cohorts")
-def create_cohort(cohort_data: CohortCreate):
+def create_cohort(cohort_data: CohortCreate, db: Session = Depends(get_db)):
     """Create an empty cohort."""
-    try:
-        db_session.rollback()
-        with get_lock().write_lock():
-            cohort = Cohort(
-                name=cohort_data.name,
-                description=cohort_data.description,
-                source_type='manual',
-                created_by=cohort_data.created_by
-            )
-            db_session.add(cohort)
-            db_session.commit()
+    with get_lock().write_lock():
+        cohort = Cohort(
+            name=cohort_data.name,
+            description=cohort_data.description,
+            source_type='manual',
+            created_by=cohort_data.created_by
+        )
+        db.add(cohort)
+        db.commit()
 
-        return {
-            "id": cohort.id,
-            "name": cohort.name,
-            "slide_count": 0
-        }
-    except Exception as e:
-        db_session.rollback()
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    return {
+        "id": cohort.id,
+        "name": cohort.name,
+        "slide_count": 0
+    }
 
 
 @app.get("/cohorts/{cohort_id}")
-def get_cohort(cohort_id: int):
+def get_cohort(cohort_id: int, db: Session = Depends(get_db)):
     """Get cohort details including all slides."""
-    try:
-        db_session.rollback()
-        db_session.expire_all()
+    cohort = db.query(Cohort).filter_by(id=cohort_id).first()
+    if not cohort:
+        raise HTTPException(status_code=404, detail="Cohort not found")
 
-        cohort = db_session.query(Cohort).filter_by(id=cohort_id).first()
-        if not cohort:
-            raise HTTPException(status_code=404, detail="Cohort not found")
-
-        return {
-            "id": cohort.id,
-            "name": cohort.name,
-            "description": cohort.description,
-            "source_type": cohort.source_type,
-            "source_details": cohort.source_details,
-            "created_by": cohort.created_by,
-            "created_at": cohort.created_at.isoformat() if cohort.created_at else None,
-            "updated_at": cohort.updated_at.isoformat() if cohort.updated_at else None,
-            "slide_count": cohort.slide_count,
-            "case_count": cohort.case_count,
-            "slides": [
-                {
-                    "slide_hash": s.slide_hash,
-                    "block_id": s.block_id,
-                    "stain_type": s.stain_type,
-                    "year": s.case.year if s.case else None,
-                    "tags": [t.name for t in s.tags]
-                }
-                for s in cohort.slides
-            ]
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        db_session.rollback()
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    return {
+        "id": cohort.id,
+        "name": cohort.name,
+        "description": cohort.description,
+        "source_type": cohort.source_type,
+        "source_details": cohort.source_details,
+        "created_by": cohort.created_by,
+        "created_at": cohort.created_at.isoformat() if cohort.created_at else None,
+        "updated_at": cohort.updated_at.isoformat() if cohort.updated_at else None,
+        "slide_count": cohort.slide_count,
+        "case_count": cohort.case_count,
+        "slides": [
+            {
+                "slide_hash": s.slide_hash,
+                "block_id": s.block_id,
+                "stain_type": s.stain_type,
+                "year": s.case.year if s.case else None,
+                "tags": [t.name for t in s.tags]
+            }
+            for s in cohort.slides
+        ]
+    }
 
 
 @app.delete("/cohorts/{cohort_id}")
-def delete_cohort(cohort_id: int):
+def delete_cohort(cohort_id: int, db: Session = Depends(get_db)):
     """Delete a cohort."""
-    try:
-        db_session.rollback()
-        cohort = db_session.query(Cohort).filter_by(id=cohort_id).first()
-        if not cohort:
-            raise HTTPException(status_code=404, detail="Cohort not found")
+    cohort = db.query(Cohort).filter_by(id=cohort_id).first()
+    if not cohort:
+        raise HTTPException(status_code=404, detail="Cohort not found")
 
-        with get_lock().write_lock():
-            db_session.delete(cohort)
-            db_session.commit()
+    with get_lock().write_lock():
+        db.delete(cohort)
+        db.commit()
 
-        return {"status": "ok"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        db_session.rollback()
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    return {"status": "ok"}
 
 
 @app.post("/cohorts/{cohort_id}/slides")
-def add_slides_to_cohort(cohort_id: int, data: CohortAddSlides):
+def add_slides_to_cohort(cohort_id: int, data: CohortAddSlides, db: Session = Depends(get_db)):
     """Add slides to a cohort."""
-    try:
-        db_session.rollback()
-        cohort = db_session.query(Cohort).filter_by(id=cohort_id).first()
-        if not cohort:
-            raise HTTPException(status_code=404, detail="Cohort not found")
+    cohort = db.query(Cohort).filter_by(id=cohort_id).first()
+    if not cohort:
+        raise HTTPException(status_code=404, detail="Cohort not found")
 
-        added = []
-        not_found = []
+    added = []
+    not_found = []
 
-        with get_lock().write_lock():
-            for slide_hash in data.slide_hashes:
-                slide = db_session.query(Slide).filter_by(slide_hash=slide_hash).first()
-                if not slide:
-                    not_found.append(slide_hash)
-                    continue
+    with get_lock().write_lock():
+        for slide_hash in data.slide_hashes:
+            slide = db.query(Slide).filter_by(slide_hash=slide_hash).first()
+            if not slide:
+                not_found.append(slide_hash)
+                continue
 
-                if slide not in cohort.slides:
-                    cohort.slides.append(slide)
-                    added.append(slide_hash)
+            if slide not in cohort.slides:
+                cohort.slides.append(slide)
+                added.append(slide_hash)
 
-            db_session.commit()
+        db.commit()
 
-        return {
-            "status": "ok",
-            "added": len(added),
-            "not_found": not_found,
-            "total_slides": cohort.slide_count
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        db_session.rollback()
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    return {
+        "status": "ok",
+        "added": len(added),
+        "not_found": not_found,
+        "total_slides": cohort.slide_count
+    }
 
 
 @app.delete("/cohorts/{cohort_id}/slides")
-def remove_slides_from_cohort(cohort_id: int, data: CohortAddSlides):
+def remove_slides_from_cohort(cohort_id: int, data: CohortAddSlides, db: Session = Depends(get_db)):
     """Remove slides from a cohort."""
-    try:
-        db_session.rollback()
-        cohort = db_session.query(Cohort).filter_by(id=cohort_id).first()
-        if not cohort:
-            raise HTTPException(status_code=404, detail="Cohort not found")
+    cohort = db.query(Cohort).filter_by(id=cohort_id).first()
+    if not cohort:
+        raise HTTPException(status_code=404, detail="Cohort not found")
 
-        removed = []
+    removed = []
 
-        with get_lock().write_lock():
-            for slide_hash in data.slide_hashes:
-                slide = db_session.query(Slide).filter_by(slide_hash=slide_hash).first()
-                if slide and slide in cohort.slides:
-                    cohort.slides.remove(slide)
-                    removed.append(slide_hash)
+    with get_lock().write_lock():
+        for slide_hash in data.slide_hashes:
+            slide = db.query(Slide).filter_by(slide_hash=slide_hash).first()
+            if slide and slide in cohort.slides:
+                cohort.slides.remove(slide)
+                removed.append(slide_hash)
 
-            db_session.commit()
+        db.commit()
 
-        return {
-            "status": "ok",
-            "removed": len(removed),
-            "total_slides": cohort.slide_count
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        db_session.rollback()
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    return {
+        "status": "ok",
+        "removed": len(removed),
+        "total_slides": cohort.slide_count
+    }
 
 
 @app.post("/cohorts/from-tag")
-def create_cohort_from_tag(data: CohortFromTag):
+def create_cohort_from_tag(data: CohortFromTag, db: Session = Depends(get_db)):
     """Create a cohort from all slides with a specific tag."""
-    try:
-        db_session.rollback()
-        tag = db_session.query(Tag).filter_by(name=data.tag_name).first()
-        if not tag:
-            raise HTTPException(status_code=404, detail="Tag not found")
+    tag = db.query(Tag).filter_by(name=data.tag_name).first()
+    if not tag:
+        raise HTTPException(status_code=404, detail="Tag not found")
 
-        with get_lock().write_lock():
-            cohort = Cohort(
-                name=data.name,
-                description=data.description,
-                source_type='tag',
-                source_details=f'{{"tag": "{data.tag_name}"}}',
-                created_by=data.created_by
-            )
-            cohort.slides = list(tag.slides)
-            db_session.add(cohort)
-            db_session.commit()
+    with get_lock().write_lock():
+        cohort = Cohort(
+            name=data.name,
+            description=data.description,
+            source_type='tag',
+            source_details=f'{{"tag": "{data.tag_name}"}}',
+            created_by=data.created_by
+        )
+        cohort.slides = list(tag.slides)
+        db.add(cohort)
+        db.commit()
 
-        return {
-            "id": cohort.id,
-            "name": cohort.name,
-            "slide_count": cohort.slide_count,
-            "case_count": cohort.case_count
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        db_session.rollback()
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    return {
+        "id": cohort.id,
+        "name": cohort.name,
+        "slide_count": cohort.slide_count,
+        "case_count": cohort.case_count
+    }
 
 
 from fastapi import UploadFile, File
@@ -1221,109 +1149,103 @@ async def create_cohort_from_file(
     name: str,
     file: UploadFile = File(...),
     description: Optional[str] = None,
-    created_by: Optional[str] = None
+    created_by: Optional[str] = None,
+    db: Session = Depends(get_db)
 ):
     """
     Create a cohort by uploading a file with accession numbers.
     Supports .txt (one per line), .csv (first column), .xlsx (first column).
     """
-    try:
-        db_session.rollback()
+    # Read file content
+    content = await file.read()
+    filename = file.filename or ""
 
-        # Read file content
-        content = await file.read()
-        filename = file.filename or ""
+    accessions = []
 
-        accessions = []
+    if filename.endswith('.xlsx'):
+        # Excel file
+        try:
+            import openpyxl
+            from io import BytesIO
+            wb = openpyxl.load_workbook(BytesIO(content), read_only=True)
+            ws = wb.active
+            for row in ws.iter_rows(min_row=1, max_col=1, values_only=True):
+                if row[0]:
+                    accessions.append(str(row[0]).strip())
+        except ImportError:
+            raise HTTPException(status_code=400, detail="openpyxl not installed for Excel support")
+    elif filename.endswith('.csv'):
+        # CSV file
+        import csv
+        from io import StringIO
+        text = content.decode('utf-8')
+        reader = csv.reader(StringIO(text))
+        for row in reader:
+            if row and row[0].strip():
+                accessions.append(row[0].strip())
+    else:
+        # Assume text file (one accession per line)
+        text = content.decode('utf-8')
+        accessions = [line.strip() for line in text.splitlines() if line.strip()]
 
-        if filename.endswith('.xlsx'):
-            # Excel file
-            try:
-                import openpyxl
-                from io import BytesIO
-                wb = openpyxl.load_workbook(BytesIO(content), read_only=True)
-                ws = wb.active
-                for row in ws.iter_rows(min_row=1, max_col=1, values_only=True):
-                    if row[0]:
-                        accessions.append(str(row[0]).strip())
-            except ImportError:
-                raise HTTPException(status_code=400, detail="openpyxl not installed for Excel support")
-        elif filename.endswith('.csv'):
-            # CSV file
-            import csv
-            from io import StringIO
-            text = content.decode('utf-8')
-            reader = csv.reader(StringIO(text))
-            for row in reader:
-                if row and row[0].strip():
-                    accessions.append(row[0].strip())
-        else:
-            # Assume text file (one accession per line)
-            text = content.decode('utf-8')
-            accessions = [line.strip() for line in text.splitlines() if line.strip()]
+    if not accessions:
+        raise HTTPException(status_code=400, detail="No accession numbers found in file")
 
-        if not accessions:
-            raise HTTPException(status_code=400, detail="No accession numbers found in file")
+    # Find slides matching these accessions
+    # We need to search the path cache since accession numbers are hashed
+    matching_slides = []
+    found_accessions = set()
+    not_found_accessions = []
 
-        # Find slides matching these accessions
-        # We need to search the path cache since accession numbers are hashed
-        matching_slides = []
-        found_accessions = set()
-        not_found_accessions = []
+    for accession in accessions:
+        accession_upper = accession.upper()
+        found = False
 
-        for accession in accessions:
-            accession_upper = accession.upper()
-            found = False
+        for slide_hash, filepath in indexer.slide_hash_to_path.items():
+            parsed = indexer.parser.parse(filepath.name)
+            if parsed and parsed.accession.upper() == accession_upper:
+                slide = db.query(Slide).filter_by(slide_hash=slide_hash).first()
+                if slide and slide not in matching_slides:
+                    matching_slides.append(slide)
+                    found_accessions.add(accession_upper)
+                    found = True
 
-            for slide_hash, filepath in indexer.slide_hash_to_path.items():
-                parsed = indexer.parser.parse(filepath.name)
-                if parsed and parsed.accession.upper() == accession_upper:
-                    slide = db_session.query(Slide).filter_by(slide_hash=slide_hash).first()
-                    if slide and slide not in matching_slides:
-                        matching_slides.append(slide)
-                        found_accessions.add(accession_upper)
-                        found = True
+        if not found and accession_upper not in found_accessions:
+            not_found_accessions.append(accession)
 
-            if not found and accession_upper not in found_accessions:
-                not_found_accessions.append(accession)
+    # Create cohort
+    with get_lock().write_lock():
+        cohort = Cohort(
+            name=name,
+            description=description,
+            source_type='upload',
+            source_details=json.dumps({
+                "filename": filename,
+                "accessions_requested": len(accessions),
+                "accessions_found": len(found_accessions),
+                "accessions_not_found": not_found_accessions[:50]  # Limit stored
+            }),
+            created_by=created_by
+        )
+        cohort.slides = matching_slides
+        db.add(cohort)
+        db.commit()
 
-        # Create cohort
-        with get_lock().write_lock():
-            cohort = Cohort(
-                name=name,
-                description=description,
-                source_type='upload',
-                source_details=json.dumps({
-                    "filename": filename,
-                    "accessions_requested": len(accessions),
-                    "accessions_found": len(found_accessions),
-                    "accessions_not_found": not_found_accessions[:50]  # Limit stored
-                }),
-                created_by=created_by
-            )
-            cohort.slides = matching_slides
-            db_session.add(cohort)
-            db_session.commit()
-
-        return {
-            "id": cohort.id,
-            "name": cohort.name,
-            "slide_count": cohort.slide_count,
-            "case_count": cohort.case_count,
-            "accessions_requested": len(accessions),
-            "accessions_found": len(found_accessions),
-            "accessions_not_found": not_found_accessions
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        db_session.rollback()
-        raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
+    return {
+        "id": cohort.id,
+        "name": cohort.name,
+        "slide_count": cohort.slide_count,
+        "case_count": cohort.case_count,
+        "accessions_requested": len(accessions),
+        "accessions_found": len(found_accessions),
+        "accessions_not_found": not_found_accessions
+    }
 
 
 @app.post("/cohorts/from-filter")
 def create_cohort_from_filter(
-    name: str,
+    db: Session = Depends(get_db),
+    name: str = Query(...),
     description: Optional[str] = None,
     created_by: Optional[str] = None,
     query: Optional[str] = None,
@@ -1332,54 +1254,47 @@ def create_cohort_from_filter(
     tag: Optional[str] = None
 ):
     """Create a cohort from slides matching filter criteria."""
-    try:
-        db_session.rollback()
+    # Use the search function to find matching slides
+    results = indexer.search(
+        db=db,
+        query=query or "",
+        year=year,
+        stain_type=stain,
+        tags=[tag] if tag else None,
+        limit=10000  # Higher limit for cohort building
+    )
 
-        # Use the search function to find matching slides
-        results = indexer.search(
-            query=query or "",
-            year=year,
-            stain_type=stain,
-            tags=[tag] if tag else None,
-            limit=10000  # Higher limit for cohort building
+    if not results:
+        raise HTTPException(status_code=400, detail="No slides match the filter criteria")
+
+    # Get slide objects
+    slide_hashes = [r['slide_hash'] for r in results]
+    slides = db.query(Slide).filter(Slide.slide_hash.in_(slide_hashes)).all()
+
+    # Create cohort
+    with get_lock().write_lock():
+        cohort = Cohort(
+            name=name,
+            description=description,
+            source_type='filter',
+            source_details=json.dumps({
+                "query": query,
+                "year": year,
+                "stain": stain,
+                "tag": tag
+            }),
+            created_by=created_by
         )
+        cohort.slides = slides
+        db.add(cohort)
+        db.commit()
 
-        if not results:
-            raise HTTPException(status_code=400, detail="No slides match the filter criteria")
-
-        # Get slide objects
-        slide_hashes = [r['slide_hash'] for r in results]
-        slides = db_session.query(Slide).filter(Slide.slide_hash.in_(slide_hashes)).all()
-
-        # Create cohort
-        with get_lock().write_lock():
-            cohort = Cohort(
-                name=name,
-                description=description,
-                source_type='filter',
-                source_details=json.dumps({
-                    "query": query,
-                    "year": year,
-                    "stain": stain,
-                    "tag": tag
-                }),
-                created_by=created_by
-            )
-            cohort.slides = slides
-            db_session.add(cohort)
-            db_session.commit()
-
-        return {
-            "id": cohort.id,
-            "name": cohort.name,
-            "slide_count": cohort.slide_count,
-            "case_count": cohort.case_count
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        db_session.rollback()
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    return {
+        "id": cohort.id,
+        "name": cohort.name,
+        "slide_count": cohort.slide_count,
+        "case_count": cohort.case_count
+    }
 
 
 # ============================================================

@@ -9,6 +9,7 @@ from .models import (
     get_engine,
     init_db,
     get_db,
+    get_session,
 )
 from .lock import DatabaseLock, init_lock, get_lock
 
@@ -23,6 +24,7 @@ __all__ = [
     'get_engine',
     'init_db',
     'get_db',
+    'get_session',
     'DatabaseLock',
     'init_lock',
     'get_lock',
