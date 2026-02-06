@@ -256,7 +256,7 @@ export function CohortDashboard() {
               <TableHead>Slides</TableHead>
               <TableHead>Cases</TableHead>
               <TableHead>Created</TableHead>
-              <TableHead className="w-[100px]">Actions</TableHead>
+              <TableHead className="w-25">Actions</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -286,7 +286,7 @@ export function CohortDashboard() {
                     <div>
                       <p className="font-medium">{cohort.name}</p>
                       {cohort.description && (
-                        <p className="text-sm text-muted-foreground truncate max-w-[300px]">
+                        <p className="text-sm text-muted-foreground truncate max-w-75">
                           {cohort.description}
                         </p>
                       )}

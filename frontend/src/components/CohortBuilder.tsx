@@ -161,9 +161,38 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
     if (e.key === 'Enter') handleSearch()
   }
 
-  // Add slides to cohort
+  // Helper: build a CohortSlide from a search result
+  const searchSlideToCohortSlide = (s: Slide): CohortSlide => ({
+    slide_hash: s.slide_hash,
+    accession_number: s.accession_number || null,
+    block_id: s.block_id,
+    slide_number: s.slide_number || null,
+    stain_type: s.stain_type,
+    random_id: s.random_id,
+    year: s.year || null,
+    case_hash: s.case_hash || null,
+    tags: s.slide_tags || [],
+    file_size_bytes: s.file_size_bytes,
+  })
+
+  // Add slides to cohort (optimistic)
   const addSlides = async (hashes: string[]) => {
-    if (hashes.length === 0) return
+    if (hashes.length === 0 || !cohort) return
+
+    // Optimistic: immediately add to local state
+    const newSlides: CohortSlide[] = []
+    for (const hash of hashes) {
+      if (cohortHashSet.has(hash)) continue
+      const searchSlide = searchResults.find(s => s.slide_hash === hash)
+      if (searchSlide) newSlides.push(searchSlideToCohortSlide(searchSlide))
+    }
+    const prevCohort = cohort
+    if (newSlides.length > 0) {
+      setCohort({ ...cohort, slides: [...cohort.slides, ...newSlides] })
+    }
+    setSelectedHashes(new Set())
+
+    // Fire API call in background
     try {
       const response = await fetch(`${API_BASE}/cohorts/${cohortId}/slides`, {
         method: 'POST',
@@ -172,43 +201,45 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
       })
       if (response.ok) {
         const data = await response.json()
-        // Build new CohortSlide entries from search results for added hashes
-        const addedSet = new Set(data.added_hashes as string[])
-        if (addedSet.size > 0 && cohort) {
-          const newSlides: CohortSlide[] = []
-          for (const hash of addedSet) {
-            const searchSlide = searchResults.find(s => s.slide_hash === hash)
-            if (searchSlide) {
-              newSlides.push({
-                slide_hash: searchSlide.slide_hash,
-                accession_number: searchSlide.accession_number || null,
-                block_id: searchSlide.block_id,
-                slide_number: searchSlide.slide_number || null,
-                stain_type: searchSlide.stain_type,
-                random_id: searchSlide.random_id,
-                year: searchSlide.year || null,
-                case_hash: searchSlide.case_hash || null,
-                tags: searchSlide.slide_tags || [],
-                file_size_bytes: searchSlide.file_size_bytes,
-              })
-            }
-          }
-          setCohort({
-            ...cohort,
-            slides: [...cohort.slides, ...newSlides],
+        // Reconcile with server: use server counts, and remove any not_found slides
+        if (data.not_found?.length > 0) {
+          const notFoundSet = new Set(data.not_found as string[])
+          setCohort(prev => prev ? {
+            ...prev,
+            slides: prev.slides.filter(s => !notFoundSet.has(s.slide_hash)),
             slide_count: data.total_slides,
             case_count: data.total_cases,
-          })
+          } : prev)
+          console.warn('Some slides could not be added (not in database):', data.not_found)
+        } else {
+          // Just sync counts from server
+          setCohort(prev => prev ? {
+            ...prev,
+            slide_count: data.total_slides,
+            case_count: data.total_cases,
+          } : prev)
         }
-        setSelectedHashes(new Set())
+      } else {
+        // Revert on error
+        setCohort(prevCohort)
       }
     } catch (error) {
       console.error('Failed to add slides:', error)
+      setCohort(prevCohort)
     }
   }
 
-  // Remove slide from cohort
+  // Remove slide from cohort (optimistic)
   const removeSlide = async (slideHash: string) => {
+    if (!cohort) return
+
+    // Optimistic: immediately remove from local state
+    const prevCohort = cohort
+    setCohort({
+      ...cohort,
+      slides: cohort.slides.filter(s => s.slide_hash !== slideHash),
+    })
+
     try {
       const response = await fetch(`${API_BASE}/cohorts/${cohortId}/slides`, {
         method: 'DELETE',
@@ -217,18 +248,17 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
       })
       if (response.ok) {
         const data = await response.json()
-        const removedSet = new Set(data.removed_hashes as string[])
-        if (cohort) {
-          setCohort({
-            ...cohort,
-            slides: cohort.slides.filter(s => !removedSet.has(s.slide_hash)),
-            slide_count: data.total_slides,
-            case_count: data.total_cases,
-          })
-        }
+        setCohort(prev => prev ? {
+          ...prev,
+          slide_count: data.total_slides,
+          case_count: data.total_cases,
+        } : prev)
+      } else {
+        setCohort(prevCohort)
       }
     } catch (error) {
       console.error('Failed to remove slide:', error)
+      setCohort(prevCohort)
     }
   }
 
@@ -491,7 +521,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
         </div>
 
         {/* RIGHT: Cohort contents */}
-        <div className="w-[380px] flex flex-col border rounded-lg">
+        <div className="w-95 flex flex-col border rounded-lg">
           <div className="px-4 py-3 border-b bg-muted/30">
             <h3 className="text-sm font-semibold">Cohort Contents</h3>
             <p className="text-xs text-muted-foreground">{stats.slides} slides in {stats.cases} cases</p>
@@ -514,14 +544,14 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                         onClick={() => toggleCaseCollapse(group.case_hash)}
                       >
                         {isCollapsed ? (
-                          <ChevronRight className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
+                          <ChevronRight className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
                         ) : (
-                          <ChevronDown className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
+                          <ChevronDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
                         )}
                         <span className="text-sm font-medium truncate">
                           {group.accession_number || group.case_hash.slice(0, 8) + '...'}
                         </span>
-                        <span className="text-xs text-muted-foreground ml-auto flex-shrink-0">
+                        <span className="text-xs text-muted-foreground ml-auto shrink-0">
                           {group.slides.length} slide{group.slides.length !== 1 ? 's' : ''}
                         </span>
                       </button>
