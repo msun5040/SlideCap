@@ -14,26 +14,26 @@ class Settings(BaseSettings):
     # Windows example: "Z:/slides" or "//server/share/slides"
     # macOS example: "/Volumes/SharedDrive/slides"
     # Linux example: "/mnt/network/slides"
-    
+
     # NETWORK_ROOT: str = '/Volumes/DFCI-LIGONLAB/Ligon Lab/test_directory'
     NETWORK_ROOT: str = '/Volumes/DFCI-LIGONLAB/Ligon Lab/test_directory_pt_slides'
-    
+
     # App data directory (will be created inside NETWORK_ROOT)
     APP_DATA_DIR: str = ".slidecap"
-    
+
     # Database and salt paths (derived from above)
     @property
     def app_data_path(self) -> Path:
         return Path(self.NETWORK_ROOT) / self.APP_DATA_DIR
-    
+
     @property
     def db_path(self) -> Path:
         return self.app_data_path / "database.sqlite"
-    
+
     @property
     def salt_path(self) -> Path:
         return self.app_data_path / ".salt"
-    
+
     @property
     def thumbnail_cache_path(self) -> Path:
         return self.app_data_path / "thumbnails"

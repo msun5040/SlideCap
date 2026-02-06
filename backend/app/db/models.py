@@ -321,6 +321,17 @@ def init_db(db_path: Path):
 import time as _time
 
 
+def _is_retryable_error(e: Exception) -> bool:
+    """Check if an exception is a retryable database error."""
+    error_str = str(e).lower()
+    return (
+        "unable to open database" in error_str or
+        "database is locked" in error_str or
+        "disk i/o error" in error_str or
+        "database disk image is malformed" in error_str
+    )
+
+
 def _create_session_with_retry(max_retries: int = 3, retry_delay: float = 0.5) -> Session:
     """Create a session with retry logic for transient network failures."""
     from sqlalchemy import text
@@ -328,21 +339,14 @@ def _create_session_with_retry(max_retries: int = 3, retry_delay: float = 0.5) -
     for attempt in range(max_retries):
         db = _SessionLocal()
         try:
-            # Test the connection with a simple query
-            db.execute(text("SELECT 1"))
+            # Test the connection by actually touching the database file
+            # SELECT 1 doesn't open the file in SQLite, so query a real table
+            db.execute(text("SELECT name FROM sqlite_master WHERE type='table' LIMIT 1"))
             return db
         except Exception as e:
             db.close()
 
-            # Check if it's a retryable error (network/file access issues)
-            error_str = str(e).lower()
-            is_retryable = (
-                "unable to open database" in error_str or
-                "database is locked" in error_str or
-                "disk i/o error" in error_str
-            )
-
-            if is_retryable and attempt < max_retries - 1:
+            if _is_retryable_error(e) and attempt < max_retries - 1:
                 print(f"[DB] Retrying connection (attempt {attempt + 1}/{max_retries}): {e}")
                 _time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
                 continue
@@ -402,6 +406,40 @@ def get_session() -> Session:
     if _SessionLocal is None:
         raise RuntimeError("Database not initialized. Call init_db() first.")
     return _SessionLocal()
+
+
+def with_retry(func, db: Session, max_retries: int = 3, retry_delay: float = 0.5):
+    """
+    Execute a database operation with retry logic for transient failures.
+
+    Usage:
+        result = with_retry(lambda: db.query(Slide).all(), db)
+
+    Args:
+        func: A callable that performs the database operation
+        db: The database session (used for rollback on retry)
+        max_retries: Maximum number of attempts
+        retry_delay: Base delay between retries (multiplied by attempt number)
+
+    Returns:
+        The result of func()
+    """
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except Exception as e:
+            last_error = e
+            if _is_retryable_error(e) and attempt < max_retries - 1:
+                print(f"[DB] Retrying operation (attempt {attempt + 1}/{max_retries}): {e}")
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                _time.sleep(retry_delay * (attempt + 1))
+                continue
+            raise
+    raise last_error
 
 
 # Quick test

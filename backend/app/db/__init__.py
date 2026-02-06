@@ -10,6 +10,7 @@ from .models import (
     init_db,
     get_db,
     get_session,
+    with_retry,
 )
 from .lock import DatabaseLock, init_lock, get_lock
 
@@ -25,6 +26,7 @@ __all__ = [
     'init_db',
     'get_db',
     'get_session',
+    'with_retry',
     'DatabaseLock',
     'init_lock',
     'get_lock',
