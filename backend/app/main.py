@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from typing import Optional, List
 from io import BytesIO
 import os
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from .config import settings
 from .db import init_db, get_db, get_session, Case, Slide, Tag, Project, Cohort, init_lock, get_lock
@@ -1014,10 +1014,37 @@ def create_cohort(cohort_data: CohortCreate, db: Session = Depends(get_db)):
 
 @app.get("/cohorts/{cohort_id}")
 def get_cohort(cohort_id: int, db: Session = Depends(get_db)):
-    """Get cohort details including all slides."""
-    cohort = db.query(Cohort).filter_by(id=cohort_id).first()
+    """Get cohort details including all slides with enriched data."""
+    cohort = db.query(Cohort).options(
+        joinedload(Cohort.slides).joinedload(Slide.case),
+        joinedload(Cohort.slides).joinedload(Slide.tags),
+    ).filter_by(id=cohort_id).first()
     if not cohort:
         raise HTTPException(status_code=404, detail="Cohort not found")
+
+    slides_data = []
+    for s in cohort.slides:
+        accession_number = None
+        slide_number = None
+        filepath = indexer.get_filepath(s.slide_hash) if indexer else None
+        if filepath:
+            parsed = indexer.parser.parse(filepath.name)
+            if parsed:
+                accession_number = parsed.accession
+                slide_number = parsed.slide_number
+
+        slides_data.append({
+            "slide_hash": s.slide_hash,
+            "accession_number": accession_number,
+            "block_id": s.block_id,
+            "slide_number": slide_number,
+            "stain_type": s.stain_type,
+            "random_id": s.random_id,
+            "year": s.case.year if s.case else None,
+            "case_hash": s.case.accession_hash if s.case else None,
+            "tags": [t.name for t in s.tags],
+            "file_size_bytes": s.file_size_bytes,
+        })
 
     return {
         "id": cohort.id,
@@ -1030,16 +1057,7 @@ def get_cohort(cohort_id: int, db: Session = Depends(get_db)):
         "updated_at": cohort.updated_at.isoformat() if cohort.updated_at else None,
         "slide_count": cohort.slide_count,
         "case_count": cohort.case_count,
-        "slides": [
-            {
-                "slide_hash": s.slide_hash,
-                "block_id": s.block_id,
-                "stain_type": s.stain_type,
-                "year": s.case.year if s.case else None,
-                "tags": [t.name for t in s.tags]
-            }
-            for s in cohort.slides
-        ]
+        "slides": slides_data
     }
 
 
@@ -1083,8 +1101,10 @@ def add_slides_to_cohort(cohort_id: int, data: CohortAddSlides, db: Session = De
     return {
         "status": "ok",
         "added": len(added),
+        "added_hashes": added,
         "not_found": not_found,
-        "total_slides": cohort.slide_count
+        "total_slides": cohort.slide_count,
+        "total_cases": cohort.case_count
     }
 
 
@@ -1109,7 +1129,9 @@ def remove_slides_from_cohort(cohort_id: int, data: CohortAddSlides, db: Session
     return {
         "status": "ok",
         "removed": len(removed),
-        "total_slides": cohort.slide_count
+        "removed_hashes": removed,
+        "total_slides": cohort.slide_count,
+        "total_cases": cohort.case_count
     }
 
 

@@ -18,15 +18,14 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import { CohortBuilder } from '@/components/CohortBuilder'
 import type { Cohort } from '@/types/slide'
 
 const API_BASE = 'http://localhost:8000'
 
-interface CohortDashboardProps {
-  onSelectCohort?: (cohort: Cohort) => void
-}
-
-export function CohortDashboard({ onSelectCohort }: CohortDashboardProps) {
+export function CohortDashboard() {
+  const [subView, setSubView] = useState<'list' | 'builder'>('list')
+  const [activeCohortId, setActiveCohortId] = useState<number | null>(null)
   const [cohorts, setCohorts] = useState<Cohort[]>([])
   const [loading, setLoading] = useState(true)
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false)
@@ -72,9 +71,13 @@ export function CohortDashboard({ onSelectCohort }: CohortDashboardProps) {
       })
 
       if (response.ok) {
-        setCreateResult({ success: true, message: 'Cohort created successfully' })
-        fetchCohorts()
+        const data = await response.json()
+        setIsCreateDialogOpen(false)
         resetCreateDialog()
+        // Navigate to builder for new empty cohort
+        setActiveCohortId(data.id)
+        setSubView('builder')
+        return
       } else {
         const error = await response.json()
         setCreateResult({ success: false, message: error.detail || 'Failed to create cohort' })
@@ -209,6 +212,19 @@ export function CohortDashboard({ onSelectCohort }: CohortDashboardProps) {
     }
   }
 
+  if (subView === 'builder' && activeCohortId !== null) {
+    return (
+      <CohortBuilder
+        cohortId={activeCohortId}
+        onBack={() => {
+          setSubView('list')
+          setActiveCohortId(null)
+          fetchCohorts()
+        }}
+      />
+    )
+  }
+
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
@@ -261,7 +277,10 @@ export function CohortDashboard({ onSelectCohort }: CohortDashboardProps) {
                 <TableRow
                   key={cohort.id}
                   className="cursor-pointer hover:bg-muted/50"
-                  onClick={() => onSelectCohort?.(cohort)}
+                  onClick={() => {
+                    setActiveCohortId(cohort.id)
+                    setSubView('builder')
+                  }}
                 >
                   <TableCell>
                     <div>

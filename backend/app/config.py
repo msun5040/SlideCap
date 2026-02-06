@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     # Linux example: "/mnt/network/slides"
 
     # NETWORK_ROOT: str = '/Volumes/DFCI-LIGONLAB/Ligon Lab/test_directory'
-    NETWORK_ROOT: str = '/Volumes/DFCI-LIGONLAB/Ligon Lab/test_directory_pt_slides'
+    NETWORK_ROOT: str = '/Volumes/DFCI-LIGONLAB-1/Ligon Lab/test_directory_pt_slides'
 
     # App data directory (will be created inside NETWORK_ROOT)
     APP_DATA_DIR: str = ".slidecap"

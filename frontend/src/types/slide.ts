@@ -41,3 +41,37 @@ export interface Cohort {
   created_at?: string
   updated_at?: string
 }
+
+export interface CohortSlide {
+  slide_hash: string
+  accession_number: string | null
+  block_id: string
+  slide_number: string | null
+  stain_type: string
+  random_id?: string
+  year: number | null
+  case_hash: string | null
+  tags: string[]
+  file_size_bytes?: number
+}
+
+export interface CohortDetail {
+  id: number
+  name: string
+  description?: string
+  source_type: string
+  source_details?: string
+  slide_count: number
+  case_count: number
+  created_by?: string
+  created_at?: string
+  updated_at?: string
+  slides: CohortSlide[]
+}
+
+export interface CaseGroup {
+  case_hash: string
+  accession_number: string | null
+  year: number | null
+  slides: CohortSlide[]
+}
