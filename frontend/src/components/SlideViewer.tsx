@@ -84,7 +84,7 @@ export function SlideViewer({ slideHash, slideName, onClose }: SlideViewerProps)
   }, [onClose])
 
   return (
-    <div className="fixed inset-0 z-[100] bg-black flex flex-col">
+    <div className="fixed inset-0 z-100 bg-black flex flex-col">
       {/* Header - always on top so close button works */}
       <div className="flex items-center justify-between px-4 py-3 bg-black/80 border-b border-gray-800 relative z-20">
         <div className="text-white">
@@ -148,12 +148,12 @@ export function SlideViewer({ slideHash, slideName, onClose }: SlideViewerProps)
               <img
                 src={labelUrl}
                 alt="Slide label"
-                className={`max-w-[200px] max-h-[150px] rounded transition-opacity duration-300 ${labelLoaded ? 'opacity-100' : 'opacity-0'}`}
+                className={`max-w-50 max-h-37.5 rounded transition-opacity duration-300 ${labelLoaded ? 'opacity-100' : 'opacity-0'}`}
                 onLoad={() => setLabelLoaded(true)}
                 onError={() => setLabelError(true)}
               />
               {!labelLoaded && !labelError && (
-                <div className="w-[100px] h-[75px] flex items-center justify-center text-gray-400 text-xs">
+                <div className="w-25 h-18.75 flex items-center justify-center text-gray-400 text-xs">
                   Loading label...
                 </div>
               )}

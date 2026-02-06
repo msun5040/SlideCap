@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { Search, Filter, Tag as TagIcon, Eye, CheckSquare, Square, Tags, X, Plus } from 'lucide-react'
+import { Search, Filter, Tag as TagIcon, Eye, Tags, X, Plus, Settings, Trash2, ChevronDown } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { SlideViewer } from '@/components/SlideViewer'
 import { TagInput } from '@/components/TagInput'
@@ -79,6 +79,14 @@ export function SlideLibrary() {
   const bulkSuggestionsRef = useRef<HTMLDivElement>(null)
   const bulkRemoveInputRef = useRef<HTMLInputElement>(null)
   const bulkRemoveSuggestionsRef = useRef<HTMLDivElement>(null)
+
+  // Tag management state
+  const [isTagManagementOpen, setIsTagManagementOpen] = useState(false)
+  const [newTagName, setNewTagName] = useState('')
+  const [newTagColor, setNewTagColor] = useState(PRESET_COLORS[0])
+  const [isCreatingTag, setIsCreatingTag] = useState(false)
+  const [isDeletingTag, setIsDeletingTag] = useState<number | null>(null)
+  const [expandedSlideTags, setExpandedSlideTags] = useState<Set<string>>(new Set())
 
   useEffect(() => {
     fetchStats()
@@ -264,7 +272,7 @@ export function SlideLibrary() {
 
   const handleTagsChange = (newTags: Tag[]) => {
     setSlideTags(newTags)
-    // Update the slide in the list to reflect new tag count
+    // Update the slide in the list to reflect new tags
     if (selectedSlide) {
       setSlides(slides.map(s =>
         s.slide_hash === selectedSlide.slide_hash
@@ -272,6 +280,8 @@ export function SlideLibrary() {
           : s
       ))
     }
+    // Refresh available tags list in case a new tag was created
+    fetchAvailableTags()
   }
 
   const openDetailsDialog = (slide: Slide) => {
@@ -322,11 +332,26 @@ export function SlideLibrary() {
 
       if (response.ok) {
         const data = await response.json()
-        alert(`Tag "${name}" added to ${data.updated} slides`)
+
+        // Optimistically update local slide state immediately
+        setSlides(prevSlides => prevSlides.map(slide => {
+          if (selectedSlides.has(slide.slide_hash)) {
+            const currentTags = slide.slide_tags || []
+            if (!currentTags.includes(name)) {
+              return { ...slide, slide_tags: [...currentTags, name] }
+            }
+          }
+          return slide
+        }))
+
         setBulkTagInput('')
         setIsBulkTagDialogOpen(false)
-        // Refresh search to update tag counts
-        handleSearch()
+
+        // Also refresh available tags list
+        fetchAvailableTags()
+
+        // Small delay then refresh search to get server state (for network drive sync)
+        setTimeout(() => handleSearch(), 500)
       }
     } catch (error) {
       console.error('Failed to bulk add tag:', error)
@@ -376,12 +401,23 @@ export function SlideLibrary() {
       })
 
       if (response.ok) {
-        const data = await response.json()
-        alert(`Tag "${name}" removed from ${data.updated} slides`)
+        // Optimistically update local slide state immediately
+        setSlides(prevSlides => prevSlides.map(slide => {
+          if (selectedSlides.has(slide.slide_hash)) {
+            const currentTags = slide.slide_tags || []
+            return { ...slide, slide_tags: currentTags.filter(t => t !== name) }
+          }
+          return slide
+        }))
+
         setBulkRemoveTagInput('')
         setIsBulkRemoveTagDialogOpen(false)
-        // Refresh search to update tag counts
-        handleSearch()
+
+        // Refresh available tags list
+        fetchAvailableTags()
+
+        // Small delay then refresh search
+        setTimeout(() => handleSearch(), 500)
       }
     } catch (error) {
       console.error('Failed to bulk remove tag:', error)
@@ -410,6 +446,84 @@ export function SlideLibrary() {
   }
 
   const isBulkRemoveExistingTag = bulkRemoveTagSuggestions.some(s => s.name.toLowerCase() === bulkRemoveTagInput.toLowerCase())
+
+  // Tag management functions
+  const handleCreateTag = async () => {
+    if (!newTagName.trim()) return
+
+    setIsCreatingTag(true)
+    try {
+      const response = await fetch(`${API_BASE}/tags`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: newTagName.trim(),
+          color: newTagColor
+        })
+      })
+
+      if (response.ok) {
+        setNewTagName('')
+        setNewTagColor(PRESET_COLORS[0])
+        fetchAvailableTags()
+      } else {
+        const data = await response.json()
+        alert(data.detail || 'Failed to create tag')
+      }
+    } catch (error) {
+      console.error('Failed to create tag:', error)
+      alert('Failed to create tag')
+    } finally {
+      setIsCreatingTag(false)
+    }
+  }
+
+  const handleDeleteTag = async (tagId: number, tagName: string) => {
+    if (!confirm(`Delete tag "${tagName}"? This will remove it from all slides.`)) return
+
+    setIsDeletingTag(tagId)
+    try {
+      const response = await fetch(`${API_BASE}/tags/${tagId}`, {
+        method: 'DELETE'
+      })
+
+      if (response.ok || response.status === 404) {
+        // 404 means tag was already deleted (e.g., double-click) - treat as success
+        fetchAvailableTags()
+        // If we're filtering by this tag, clear the filter
+        if (tagFilter === tagName) {
+          setTagFilter('all')
+        }
+        // Optimistically remove tag from local slides
+        setSlides(prevSlides => prevSlides.map(slide => ({
+          ...slide,
+          slide_tags: (slide.slide_tags || []).filter(t => t !== tagName)
+        })))
+        // Refresh search results after a delay
+        if (slides.length > 0) {
+          setTimeout(() => handleSearch(), 500)
+        }
+      } else {
+        alert('Failed to delete tag')
+      }
+    } catch (error) {
+      console.error('Failed to delete tag:', error)
+      alert('Failed to delete tag')
+    } finally {
+      setIsDeletingTag(null)
+    }
+  }
+
+  const toggleExpandedTags = (slideHash: string, e: React.MouseEvent) => {
+    e.stopPropagation()
+    const newExpanded = new Set(expandedSlideTags)
+    if (newExpanded.has(slideHash)) {
+      newExpanded.delete(slideHash)
+    } else {
+      newExpanded.add(slideHash)
+    }
+    setExpandedSlideTags(newExpanded)
+  }
 
   const years = ['2024', '2023', '2022', '2021', '2020']
   const stainTypes = ['HE', 'IHC', 'Special']
@@ -477,14 +591,20 @@ export function SlideLibrary() {
             </SelectContent>
           </Select>
 
-          <Select value={tagFilter} onValueChange={setTagFilter}>
+          <Select value={tagFilter} onValueChange={(value) => {
+            if (value === '__manage__') {
+              setIsTagManagementOpen(true)
+            } else {
+              setTagFilter(value)
+            }
+          }}>
             <SelectTrigger className="w-36">
               <TagIcon className="mr-2 h-4 w-4" />
               <SelectValue placeholder="Tag" />
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="all">All Tags</SelectItem>
-              {availableTags.map((tag) => (
+              {availableTags.filter(t => (t.slide_count ?? 0) > 0).map((tag) => (
                 <SelectItem key={tag.id} value={tag.name}>
                   <div className="flex items-center gap-2">
                     {tag.color && (
@@ -494,9 +614,17 @@ export function SlideLibrary() {
                       />
                     )}
                     {tag.name}
+                    <span className="text-muted-foreground text-xs">({tag.slide_count})</span>
                   </div>
                 </SelectItem>
               ))}
+              <div className="border-t my-1" />
+              <SelectItem value="__manage__">
+                <div className="flex items-center gap-2">
+                  <Settings className="h-3 w-3" />
+                  Manage Tags...
+                </div>
+              </SelectItem>
             </SelectContent>
           </Select>
 
@@ -604,16 +732,65 @@ export function SlideLibrary() {
                       {slide.status || 'unknown'}
                     </Badge>
                   </TableCell>
-                  <TableCell>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={(e) => openTagDialog(slide, e)}
-                      className="h-7"
-                    >
-                      <TagIcon className="mr-1 h-3 w-3" />
-                      {slide.slide_tags?.length || 0}
-                    </Button>
+                  <TableCell onClick={(e) => e.stopPropagation()}>
+                    <div className="flex items-center gap-1 flex-wrap">
+                      {slide.slide_tags && slide.slide_tags.length > 0 ? (
+                        <>
+                          {/* Show first 2 tags, or all if expanded */}
+                          {(expandedSlideTags.has(slide.slide_hash)
+                            ? slide.slide_tags
+                            : slide.slide_tags.slice(0, 2)
+                          ).map((tagName: string) => {
+                            const tagInfo = availableTags.find(t => t.name === tagName)
+                            return (
+                              <Badge
+                                key={tagName}
+                                variant="secondary"
+                                className="text-xs cursor-pointer hover:opacity-80"
+                                style={tagInfo?.color ? {
+                                  backgroundColor: `${tagInfo.color}20`,
+                                  color: tagInfo.color,
+                                  borderColor: tagInfo.color
+                                } : undefined}
+                                onClick={(e) => openTagDialog(slide, e)}
+                              >
+                                {tagName}
+                              </Badge>
+                            )
+                          })}
+                          {/* Show +N more button if there are more than 2 tags */}
+                          {slide.slide_tags.length > 2 && !expandedSlideTags.has(slide.slide_hash) && (
+                            <Badge
+                              variant="outline"
+                              className="text-xs cursor-pointer hover:bg-muted"
+                              onClick={(e) => toggleExpandedTags(slide.slide_hash, e)}
+                            >
+                              +{slide.slide_tags.length - 2}
+                            </Badge>
+                          )}
+                          {/* Show collapse button if expanded */}
+                          {slide.slide_tags.length > 2 && expandedSlideTags.has(slide.slide_hash) && (
+                            <Badge
+                              variant="outline"
+                              className="text-xs cursor-pointer hover:bg-muted"
+                              onClick={(e) => toggleExpandedTags(slide.slide_hash, e)}
+                            >
+                              <ChevronDown className="h-3 w-3" />
+                            </Badge>
+                          )}
+                        </>
+                      ) : (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={(e) => openTagDialog(slide, e)}
+                          className="h-6 px-2 text-muted-foreground hover:text-foreground"
+                        >
+                          <Plus className="h-3 w-3 mr-1" />
+                          Add
+                        </Button>
+                      )}
+                    </div>
                   </TableCell>
                 </TableRow>
               ))
@@ -894,6 +1071,101 @@ export function SlideLibrary() {
                 {isBulkTagging ? 'Removing...' : 'Remove Tag'}
               </Button>
             </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Tag Management Dialog */}
+      <Dialog open={isTagManagementOpen} onOpenChange={setIsTagManagementOpen}>
+        <DialogContent className="max-w-lg max-h-[80vh] flex flex-col">
+          <DialogHeader>
+            <DialogTitle>Manage Tags</DialogTitle>
+            <DialogDescription>
+              Create, view, and delete tags. Deleting a tag removes it from all slides.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="flex-1 overflow-hidden flex flex-col gap-4">
+            {/* Create new tag section */}
+            <div className="space-y-2 pb-4 border-b">
+              <label className="text-sm font-medium">Create New Tag</label>
+              <div className="flex gap-2 items-center">
+                <div className="flex gap-1">
+                  {PRESET_COLORS.map((color) => (
+                    <button
+                      key={color}
+                      className={`w-5 h-5 rounded-full border-2 transition-all ${
+                        newTagColor === color ? 'border-black scale-110 ring-1 ring-black' : 'border-transparent hover:scale-105'
+                      }`}
+                      style={{ backgroundColor: color }}
+                      onClick={() => setNewTagColor(color)}
+                    />
+                  ))}
+                </div>
+                <Input
+                  placeholder="Tag name..."
+                  value={newTagName}
+                  onChange={(e) => setNewTagName(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && handleCreateTag()}
+                  className="flex-1"
+                />
+                <Button
+                  onClick={handleCreateTag}
+                  disabled={isCreatingTag || !newTagName.trim()}
+                  size="sm"
+                >
+                  {isCreatingTag ? '...' : 'Create'}
+                </Button>
+              </div>
+            </div>
+
+            {/* Tag list */}
+            <div className="flex-1 overflow-y-auto">
+              <div className="space-y-1">
+                {availableTags.length === 0 ? (
+                  <p className="text-sm text-muted-foreground text-center py-4">
+                    No tags created yet. Create one above.
+                  </p>
+                ) : (
+                  availableTags.map((tag) => (
+                    <div
+                      key={tag.id}
+                      className="flex items-center justify-between p-2 rounded-lg hover:bg-muted/50 group"
+                    >
+                      <div className="flex items-center gap-2">
+                        <span
+                          className="w-3 h-3 rounded-full"
+                          style={{ backgroundColor: tag.color || '#6B7280' }}
+                        />
+                        <span className="font-medium">{tag.name}</span>
+                        <span className="text-sm text-muted-foreground">
+                          ({tag.slide_count ?? 0} slide{(tag.slide_count ?? 0) !== 1 ? 's' : ''})
+                        </span>
+                      </div>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="opacity-0 group-hover:opacity-100 text-destructive hover:text-destructive hover:bg-destructive/10"
+                        onClick={() => handleDeleteTag(tag.id, tag.name)}
+                        disabled={isDeletingTag === tag.id}
+                      >
+                        {isDeletingTag === tag.id ? (
+                          '...'
+                        ) : (
+                          <Trash2 className="h-4 w-4" />
+                        )}
+                      </Button>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="flex justify-end pt-4 border-t">
+            <Button variant="outline" onClick={() => setIsTagManagementOpen(false)}>
+              Done
+            </Button>
           </div>
         </DialogContent>
       </Dialog>

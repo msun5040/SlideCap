@@ -3,6 +3,8 @@ export interface Tag {
   name: string
   color?: string  // Hex color like "#FF5733"
   category?: string
+  slide_count?: number  // Number of slides with this tag
+  case_count?: number   // Number of cases with this tag
 }
 
 export interface Slide {
