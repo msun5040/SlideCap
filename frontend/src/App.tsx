@@ -46,7 +46,7 @@ export default function App() {
       <aside
         className={`${
           isSidebarOpen ? 'w-64' : 'w-0'
-        } flex-shrink-0 border-r bg-card transition-all duration-300 overflow-hidden`}
+        } shrink-0 border-r bg-card transition-all duration-300 overflow-hidden`}
       >
         <div className="flex h-full flex-col">
           {/* Logo */}

@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useCallback } from 'react'
-import { ArrowLeft, Search, Filter, X, Plus, ChevronDown, ChevronRight, Check } from 'lucide-react'
+import { ArrowLeft, Search, Filter, X, Plus, ChevronDown, ChevronRight, Check, Download, FolderArchive, AlertTriangle } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
@@ -19,6 +19,13 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import type { Slide, CohortSlide, CohortDetail, CaseGroup } from '@/types/slide'
 
 const API_BASE = 'http://localhost:8000'
@@ -45,6 +52,10 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
 
   // Selection state
   const [selectedHashes, setSelectedHashes] = useState<Set<string>>(new Set())
+
+  // Export state
+  const [isExportDialogOpen, setIsExportDialogOpen] = useState(false)
+  const [isExporting, setIsExporting] = useState(false)
 
   // Right panel collapse state
   const [collapsedCases, setCollapsedCases] = useState<Set<string>>(new Set())
@@ -97,6 +108,41 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
       stains,
     }
   }, [cohort, caseGroups])
+
+  // Export stats
+  const exportInfo = useMemo(() => {
+    if (!cohort) return { totalBytes: 0, knownCount: 0, unknownCount: 0 }
+    let totalBytes = 0
+    let knownCount = 0
+    let unknownCount = 0
+    for (const s of cohort.slides) {
+      if (s.file_size_bytes) {
+        totalBytes += s.file_size_bytes
+        knownCount++
+      } else {
+        unknownCount++
+      }
+    }
+    return { totalBytes, knownCount, unknownCount }
+  }, [cohort])
+
+  const formatBytes = (bytes: number): string => {
+    if (bytes === 0) return '0 B'
+    const units = ['B', 'KB', 'MB', 'GB', 'TB']
+    const i = Math.floor(Math.log(bytes) / Math.log(1024))
+    return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${units[i]}`
+  }
+
+  const handleExport = () => {
+    setIsExporting(true)
+    // Browser handles the download via native download manager
+    window.location.href = `${API_BASE}/cohorts/${cohortId}/export`
+    // Close dialog after a short delay (download starts in background)
+    setTimeout(() => {
+      setIsExporting(false)
+      setIsExportDialogOpen(false)
+    }, 1500)
+  }
 
   // Fetch cohort details
   const fetchCohort = useCallback(async () => {
@@ -262,6 +308,41 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
     }
   }
 
+  // Remove all slides for a case from cohort (optimistic)
+  const removeCase = async (caseSlides: CohortSlide[]) => {
+    if (!cohort || caseSlides.length === 0) return
+
+    const hashes = caseSlides.map(s => s.slide_hash)
+    const hashSet = new Set(hashes)
+
+    const prevCohort = cohort
+    setCohort({
+      ...cohort,
+      slides: cohort.slides.filter(s => !hashSet.has(s.slide_hash)),
+    })
+
+    try {
+      const response = await fetch(`${API_BASE}/cohorts/${cohortId}/slides`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ slide_hashes: hashes }),
+      })
+      if (response.ok) {
+        const data = await response.json()
+        setCohort(prev => prev ? {
+          ...prev,
+          slide_count: data.total_slides,
+          case_count: data.total_cases,
+        } : prev)
+      } else {
+        setCohort(prevCohort)
+      }
+    } catch (error) {
+      console.error('Failed to remove case:', error)
+      setCohort(prevCohort)
+    }
+  }
+
   // Selection helpers
   const toggleSelection = (hash: string) => {
     const next = new Set(selectedHashes)
@@ -330,6 +411,16 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
             <p className="text-sm text-muted-foreground truncate">{cohort.description}</p>
           )}
         </div>
+        {stats.slides > 0 && (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setIsExportDialogOpen(true)}
+          >
+            <Download className="mr-2 h-4 w-4" />
+            Export
+          </Button>
+        )}
       </div>
 
       {/* Stats bar */}
@@ -539,22 +630,31 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                   return (
                     <div key={group.case_hash}>
                       {/* Case header */}
-                      <button
-                        className="w-full flex items-center gap-2 px-4 py-2 text-left hover:bg-muted/50 transition-colors"
-                        onClick={() => toggleCaseCollapse(group.case_hash)}
-                      >
-                        {isCollapsed ? (
-                          <ChevronRight className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-                        ) : (
-                          <ChevronDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-                        )}
-                        <span className="text-sm font-medium truncate">
-                          {group.accession_number || group.case_hash.slice(0, 8) + '...'}
-                        </span>
-                        <span className="text-xs text-muted-foreground ml-auto shrink-0">
-                          {group.slides.length} slide{group.slides.length !== 1 ? 's' : ''}
-                        </span>
-                      </button>
+                      <div className="flex items-center group/case hover:bg-muted/50 transition-colors">
+                        <button
+                          className="flex-1 flex items-center gap-2 px-4 py-2 text-left"
+                          onClick={() => toggleCaseCollapse(group.case_hash)}
+                        >
+                          {isCollapsed ? (
+                            <ChevronRight className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                          ) : (
+                            <ChevronDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                          )}
+                          <span className="text-sm font-medium truncate">
+                            {group.accession_number || group.case_hash.slice(0, 8) + '...'}
+                          </span>
+                          <span className="text-xs text-muted-foreground ml-auto shrink-0">
+                            {group.slides.length} slide{group.slides.length !== 1 ? 's' : ''}
+                          </span>
+                        </button>
+                        <button
+                          className="px-3 py-2 opacity-0 group-hover/case:opacity-100 text-muted-foreground hover:text-destructive transition-opacity"
+                          onClick={() => removeCase(group.slides)}
+                          title="Remove entire case"
+                        >
+                          <X className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
 
                       {/* Slides under this case */}
                       {!isCollapsed && (
@@ -599,6 +699,100 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
           </div>
         </div>
       </div>
+
+      {/* Export Dialog */}
+      <Dialog open={isExportDialogOpen} onOpenChange={setIsExportDialogOpen}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <FolderArchive className="h-5 w-5" />
+              Export Cohort
+            </DialogTitle>
+            <DialogDescription>
+              Download all slides as a ZIP file organized by accession number.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4 py-2">
+            {/* Summary */}
+            <div className="rounded-lg border p-4 space-y-3">
+              <div className="flex justify-between text-sm">
+                <span className="text-muted-foreground">Slides</span>
+                <span className="font-medium">{stats.slides}</span>
+              </div>
+              <div className="flex justify-between text-sm">
+                <span className="text-muted-foreground">Cases</span>
+                <span className="font-medium">{stats.cases}</span>
+              </div>
+              <div className="flex justify-between text-sm">
+                <span className="text-muted-foreground">Estimated size</span>
+                <span className="font-medium">
+                  {exportInfo.totalBytes > 0
+                    ? formatBytes(exportInfo.totalBytes)
+                    : 'Unknown'}
+                  {exportInfo.unknownCount > 0 && (
+                    <span className="text-muted-foreground font-normal ml-1">
+                      ({exportInfo.unknownCount} unknown)
+                    </span>
+                  )}
+                </span>
+              </div>
+              {Object.keys(stats.stains).length > 0 && (
+                <div className="flex justify-between text-sm">
+                  <span className="text-muted-foreground">Stains</span>
+                  <span className="font-medium">
+                    {Object.entries(stats.stains).map(([s, n]) => `${s}: ${n}`).join(', ')}
+                  </span>
+                </div>
+              )}
+            </div>
+
+            {/* Folder structure preview */}
+            <div className="rounded-lg border p-4">
+              <p className="text-xs font-medium text-muted-foreground mb-2">Folder structure</p>
+              <div className="text-xs font-mono text-muted-foreground space-y-0.5">
+                <p>{cohort?.name.replace(/\s+/g, '_')}.zip</p>
+                {caseGroups.slice(0, 3).map((g) => (
+                  <div key={g.case_hash} className="pl-4">
+                    <p>{g.accession_number || '...'}/</p>
+                    {g.slides.slice(0, 2).map((s) => (
+                      <p key={s.slide_hash} className="pl-4 truncate">
+                        {s.accession_number}_{s.block_id}_{s.stain_type}.svs
+                      </p>
+                    ))}
+                    {g.slides.length > 2 && (
+                      <p className="pl-4">... +{g.slides.length - 2} more</p>
+                    )}
+                  </div>
+                ))}
+                {caseGroups.length > 3 && (
+                  <p className="pl-4">... +{caseGroups.length - 3} more cases</p>
+                )}
+              </div>
+            </div>
+
+            {/* Large export warning */}
+            {exportInfo.totalBytes > 10 * 1024 * 1024 * 1024 && (
+              <div className="flex items-start gap-2 rounded-lg bg-orange-500/10 p-3 text-sm text-orange-700">
+                <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
+                <span>
+                  This export is over {formatBytes(exportInfo.totalBytes)}. Large downloads may take a while and require sufficient disk space.
+                </span>
+              </div>
+            )}
+          </div>
+
+          <div className="flex justify-end gap-2 pt-2">
+            <Button variant="outline" onClick={() => setIsExportDialogOpen(false)}>
+              Cancel
+            </Button>
+            <Button onClick={handleExport} disabled={isExporting}>
+              <Download className="mr-2 h-4 w-4" />
+              {isExporting ? 'Starting...' : 'Download ZIP'}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

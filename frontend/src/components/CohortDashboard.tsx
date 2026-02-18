@@ -108,12 +108,15 @@ export function CohortDashboard() {
 
       if (response.ok) {
         const data = await response.json()
-        const notFoundMsg = data.accessions_not_found?.length > 0
-          ? ` (${data.accessions_not_found.length} accessions not found)`
-          : ''
+        let detail = ''
+        if (data.rows_not_matched?.length > 0) {
+          detail = `\n\nUnmatched rows (${data.rows_not_matched.length}):\n${data.rows_not_matched.join('\n')}`
+        } else if (data.accessions_not_found?.length > 0) {
+          detail = ` (${data.accessions_not_found.length} accessions not found: ${data.accessions_not_found.slice(0, 10).join(', ')})`
+        }
         setCreateResult({
           success: true,
-          message: `Cohort created with ${data.slide_count} slides from ${data.case_count} cases${notFoundMsg}`
+          message: `Cohort created with ${data.slide_count} slides from ${data.case_count} cases${detail}`
         })
         fetchCohorts()
         resetCreateDialog()
@@ -241,7 +244,7 @@ export function CohortDashboard() {
       </div>
 
       {createResult && (
-        <div className={`p-4 rounded-lg ${createResult.success ? 'bg-green-500/10 text-green-700' : 'bg-red-500/10 text-red-700'}`}>
+        <div className={`p-4 rounded-lg whitespace-pre-wrap ${createResult.success ? 'bg-green-500/10 text-green-700' : 'bg-red-500/10 text-red-700'}`}>
           {createResult.message}
           <button onClick={() => setCreateResult(null)} className="ml-2 underline">Dismiss</button>
         </div>
@@ -356,8 +359,8 @@ export function CohortDashboard() {
               >
                 <Upload className="mr-3 h-5 w-5" />
                 <div className="text-left">
-                  <p className="font-medium">From Accession List</p>
-                  <p className="text-sm text-muted-foreground">Upload .txt, .csv, or .xlsx with accession numbers</p>
+                  <p className="font-medium">From Accession List / Manifest</p>
+                  <p className="text-sm text-muted-foreground whitespace-normal">Upload .txt, .csv, or .xlsx — 1 column for accessions, or 3 columns (accession, block, stain) for specific slides</p>
                 </div>
               </Button>
 
@@ -399,14 +402,14 @@ export function CohortDashboard() {
 
               {createMode === 'upload' && (
                 <div className="space-y-2">
-                  <label className="text-sm font-medium">Accession List File</label>
+                  <label className="text-sm font-medium">Accession List / Manifest File</label>
                   <Input
                     type="file"
                     accept=".txt,.csv,.xlsx"
                     onChange={(e) => setSelectedFile(e.target.files?.[0] || null)}
                   />
                   <p className="text-xs text-muted-foreground">
-                    Upload a file with one accession number per line (or first column for CSV/Excel)
+                    Single column: one accession per row (matches all slides). Three columns: accession, block, stain (matches specific slides).
                   </p>
                 </div>
               )}

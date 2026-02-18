@@ -1,12 +1,16 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query, Depends
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
 from io import BytesIO
 import os
+import zipfile
+import queue
+import threading
+import re
 from sqlalchemy.orm import Session, joinedload
 
 from .config import settings
@@ -1135,6 +1139,98 @@ def remove_slides_from_cohort(cohort_id: int, data: CohortAddSlides, db: Session
     }
 
 
+class _ZipStreamWriter:
+    """File-like object that feeds zip data to a queue in ~1 MB chunks."""
+
+    def __init__(self, q: queue.Queue, chunk_size: int = 1024 * 1024):
+        self._q = q
+        self._chunk_size = chunk_size
+        self._buf = bytearray()
+        self._pos = 0
+
+    def write(self, data: bytes) -> int:
+        self._buf.extend(data)
+        self._pos += len(data)
+        while len(self._buf) >= self._chunk_size:
+            self._q.put(bytes(self._buf[:self._chunk_size]))
+            self._buf = self._buf[self._chunk_size:]
+        return len(data)
+
+    def tell(self) -> int:
+        return self._pos
+
+    def flush(self):
+        if self._buf:
+            self._q.put(bytes(self._buf))
+            self._buf.clear()
+
+    def close(self):
+        self.flush()
+
+
+@app.get("/cohorts/{cohort_id}/export")
+def export_cohort(cohort_id: int, db: Session = Depends(get_db)):
+    """Stream cohort slides as a ZIP file, organized by accession number."""
+    if not indexer:
+        raise HTTPException(status_code=503, detail="Indexer not initialized")
+
+    cohort = db.query(Cohort).options(
+        joinedload(Cohort.slides).joinedload(Slide.case),
+    ).filter_by(id=cohort_id).first()
+    if not cohort:
+        raise HTTPException(status_code=404, detail="Cohort not found")
+
+    # Gather (filesystem_path, archive_name) pairs, skip missing files
+    slides_info: list[tuple[str, str]] = []
+    for s in cohort.slides:
+        filepath = indexer.get_filepath(s.slide_hash)
+        if not filepath or not filepath.exists():
+            continue
+        parsed = indexer.parser.parse(filepath.name)
+        folder = parsed.accession if parsed else s.slide_hash[:12]
+        arcname = f"{folder}/{filepath.name}"
+        slides_info.append((str(filepath), arcname))
+
+    if not slides_info:
+        raise HTTPException(status_code=404, detail="No slide files available for export")
+
+    def generate():
+        q: queue.Queue = queue.Queue(maxsize=32)
+
+        def writer():
+            try:
+                stream = _ZipStreamWriter(q)
+                with zipfile.ZipFile(stream, 'w', zipfile.ZIP_STORED, allowZip64=True) as zf:
+                    for filepath, arcname in slides_info:
+                        zf.write(filepath, arcname)
+                stream.flush()
+            except Exception as e:
+                print(f"ZIP export error: {e}")
+            finally:
+                q.put(None)  # sentinel
+
+        t = threading.Thread(target=writer, daemon=True)
+        t.start()
+
+        while True:
+            chunk = q.get()
+            if chunk is None:
+                break
+            yield chunk
+
+        t.join(timeout=5)
+
+    # Sanitize cohort name for filename
+    safe_name = re.sub(r'[^\w\s-]', '', cohort.name).strip().replace(' ', '_') or 'cohort'
+    return StreamingResponse(
+        generate(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_name}.zip"',
+        },
+    )
+
+
 @app.post("/cohorts/from-tag")
 def create_cohort_from_tag(data: CohortFromTag, db: Session = Depends(get_db)):
     """Create a cohort from all slides with a specific tag."""
@@ -1175,93 +1271,194 @@ async def create_cohort_from_file(
     db: Session = Depends(get_db)
 ):
     """
-    Create a cohort by uploading a file with accession numbers.
-    Supports .txt (one per line), .csv (first column), .xlsx (first column).
+    Create a cohort by uploading a file with accession numbers or a manifest.
+    Supports .txt (one per line), .csv, .xlsx.
+
+    Single column: matches all slides for each accession number.
+    Three columns (accession, block, stain): matches specific slides by all three fields.
     """
-    # Read file content
+    # Read file content (strip BOM if present)
     content = await file.read()
+    if content.startswith(b'\xef\xbb\xbf'):
+        content = content[3:]
     filename = file.filename or ""
 
-    accessions = []
+    # Parse rows — each row is a list of column values
+    raw_rows = []
 
     if filename.endswith('.xlsx'):
-        # Excel file
         try:
             import openpyxl
             from io import BytesIO
             wb = openpyxl.load_workbook(BytesIO(content), read_only=True)
             ws = wb.active
-            for row in ws.iter_rows(min_row=1, max_col=1, values_only=True):
-                if row[0]:
-                    accessions.append(str(row[0]).strip())
+            for row in ws.iter_rows(values_only=True):
+                cells = [str(c).strip() if c is not None else "" for c in row]
+                if any(cells):
+                    raw_rows.append(cells)
         except ImportError:
             raise HTTPException(status_code=400, detail="openpyxl not installed for Excel support")
     elif filename.endswith('.csv'):
-        # CSV file
         import csv
         from io import StringIO
         text = content.decode('utf-8')
         reader = csv.reader(StringIO(text))
         for row in reader:
-            if row and row[0].strip():
-                accessions.append(row[0].strip())
+            cells = [c.strip() for c in row]
+            if any(cells):
+                raw_rows.append(cells)
     else:
-        # Assume text file (one accession per line)
+        # Text file — split each line by tab, comma, or whitespace
+        import re as _re
         text = content.decode('utf-8')
-        accessions = [line.strip() for line in text.splitlines() if line.strip()]
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if '\t' in line:
+                cells = [c.strip() for c in line.split('\t')]
+            elif ',' in line:
+                cells = [c.strip() for c in line.split(',')]
+            else:
+                # Split by whitespace (handles multiple spaces)
+                cells = _re.split(r'\s+', line)
+            raw_rows.append(cells)
 
-    if not accessions:
-        raise HTTPException(status_code=400, detail="No accession numbers found in file")
+    if not raw_rows:
+        raise HTTPException(status_code=400, detail="No data found in file")
 
-    # Find slides matching these accessions
-    # We need to search the path cache since accession numbers are hashed
+    # Detect mode: manifest (3 cols) vs accession list (1 col)
+    is_manifest = len(raw_rows[0]) >= 3 and all(len(r) >= 3 for r in raw_rows)
+
+    import re as _re2
+
+    def normalize_accession(acc: str) -> str:
+        """Normalize BS-?YY- prefix so BS18- and BS-18- both match."""
+        return _re2.sub(r'^BS-?', 'BS', acc.upper())
+
     matching_slides = []
-    found_accessions = set()
-    not_found_accessions = []
+    matching_slide_ids = set()  # track by id to avoid duplicates
 
-    for accession in accessions:
-        accession_upper = accession.upper()
-        found = False
+    if is_manifest:
+        # Manifest mode: each row is (accession, block, stain)
+        manifest_rows = [(r[0], r[1], r[2]) for r in raw_rows]
+        rows_matched = []
+        rows_not_matched = []
 
-        for slide_hash, filepath in indexer.slide_hash_to_path.items():
-            parsed = indexer.parser.parse(filepath.name)
-            if parsed and parsed.accession.upper() == accession_upper:
-                slide = db.query(Slide).filter_by(slide_hash=slide_hash).first()
-                if slide and slide not in matching_slides:
-                    matching_slides.append(slide)
-                    found_accessions.add(accession_upper)
-                    found = True
+        for acc, block, stain in manifest_rows:
+            acc_norm = normalize_accession(acc)
+            block_upper = block.upper()
+            stain_lower = stain.lower()
+            found = False
+            near_misses = []
 
-        if not found and accession_upper not in found_accessions:
-            not_found_accessions.append(accession)
+            for slide_hash, filepath in indexer.slide_hash_to_path.items():
+                parsed = indexer.parser.parse(filepath.name)
+                if not parsed:
+                    continue
+                if normalize_accession(parsed.accession) == acc_norm:
+                    # Accession matched — check block + stain
+                    if (parsed.block_id.upper() == block_upper
+                            and parsed.stain_type.lower() == stain_lower):
+                        slide = db.query(Slide).filter_by(slide_hash=slide_hash).first()
+                        if slide and slide.id not in matching_slide_ids:
+                            matching_slides.append(slide)
+                            matching_slide_ids.add(slide.id)
+                        found = True
+                    else:
+                        near_misses.append(f"block={parsed.block_id},stain={parsed.stain_type}")
 
-    # Create cohort
-    with get_lock().write_lock():
-        cohort = Cohort(
-            name=name,
-            description=description,
-            source_type='upload',
-            source_details=json.dumps({
-                "filename": filename,
-                "accessions_requested": len(accessions),
-                "accessions_found": len(found_accessions),
-                "accessions_not_found": not_found_accessions[:50]  # Limit stored
-            }),
-            created_by=created_by
-        )
-        cohort.slides = matching_slides
-        db.add(cohort)
-        db.commit()
+            if found:
+                rows_matched.append(f"{acc},{block},{stain}")
+            else:
+                detail = f"{acc},{block},{stain}"
+                if near_misses:
+                    detail += f" (accession found but slides have: {'; '.join(near_misses[:5])})"
+                rows_not_matched.append(detail)
 
-    return {
-        "id": cohort.id,
-        "name": cohort.name,
-        "slide_count": cohort.slide_count,
-        "case_count": cohort.case_count,
-        "accessions_requested": len(accessions),
-        "accessions_found": len(found_accessions),
-        "accessions_not_found": not_found_accessions
-    }
+        # Create cohort
+        with get_lock().write_lock():
+            cohort = Cohort(
+                name=name,
+                description=description,
+                source_type='upload',
+                source_details=json.dumps({
+                    "filename": filename,
+                    "mode": "manifest",
+                    "rows_requested": len(manifest_rows),
+                    "rows_matched": len(rows_matched),
+                    "rows_not_matched": rows_not_matched[:50]
+                }),
+                created_by=created_by
+            )
+            cohort.slides = matching_slides
+            db.add(cohort)
+            db.commit()
+
+        return {
+            "id": cohort.id,
+            "name": cohort.name,
+            "slide_count": cohort.slide_count,
+            "case_count": cohort.case_count,
+            "rows_requested": len(manifest_rows),
+            "rows_matched": len(rows_matched),
+            "rows_not_matched": rows_not_matched
+        }
+    else:
+        # Accession list mode (original behavior)
+        accessions = [r[0] for r in raw_rows if r[0]]
+
+        if not accessions:
+            raise HTTPException(status_code=400, detail="No accession numbers found in file")
+
+        found_accessions = set()
+        not_found_accessions = []
+
+        for accession in accessions:
+            acc_norm = normalize_accession(accession)
+            found = False
+
+            for slide_hash, filepath in indexer.slide_hash_to_path.items():
+                parsed = indexer.parser.parse(filepath.name)
+                if parsed and normalize_accession(parsed.accession) == acc_norm:
+                    slide = db.query(Slide).filter_by(slide_hash=slide_hash).first()
+                    if slide and slide.id not in matching_slide_ids:
+                        matching_slides.append(slide)
+                        matching_slide_ids.add(slide.id)
+                        found_accessions.add(acc_norm)
+                        found = True
+
+            if not found and acc_norm not in found_accessions:
+                not_found_accessions.append(accession)
+
+        # Create cohort
+        with get_lock().write_lock():
+            cohort = Cohort(
+                name=name,
+                description=description,
+                source_type='upload',
+                source_details=json.dumps({
+                    "filename": filename,
+                    "mode": "accession_list",
+                    "accessions_requested": len(accessions),
+                    "accessions_found": len(found_accessions),
+                    "accessions_not_found": not_found_accessions[:50]
+                }),
+                created_by=created_by
+            )
+            cohort.slides = matching_slides
+            db.add(cohort)
+            db.commit()
+
+        return {
+            "id": cohort.id,
+            "name": cohort.name,
+            "slide_count": cohort.slide_count,
+            "case_count": cohort.case_count,
+            "accessions_requested": len(accessions),
+            "accessions_found": len(found_accessions),
+            "accessions_not_found": not_found_accessions
+        }
 
 
 @app.post("/cohorts/from-filter")

@@ -516,6 +516,10 @@ class SlideIndexer:
                 if not any(t.lower() in all_tags for t in tags):
                     continue
 
+            # Skip slides that are in path cache but not in DB
+            if not slide:
+                continue
+
             result = {
                 'slide_hash': slide_hash,
                 'accession_number': parsed.accession,
@@ -524,14 +528,12 @@ class SlideIndexer:
                 'year': parsed.year,
                 'stain_type': parsed.stain_type,
                 'random_id': parsed.random_id,
+                'case_hash': slide.case.accession_hash,
+                'slide_tags': [t.name for t in slide.tags],
+                'case_tags': [t.name for t in slide.case.tags],
+                'projects': [p.name for p in slide.case.projects],
+                'file_size_bytes': slide.file_size_bytes,
             }
-
-            if slide:
-                result['case_hash'] = slide.case.accession_hash
-                result['slide_tags'] = [t.name for t in slide.tags]
-                result['case_tags'] = [t.name for t in slide.case.tags]
-                result['projects'] = [p.name for p in slide.case.projects]
-                result['file_size_bytes'] = slide.file_size_bytes
 
             results.append(result)
 
