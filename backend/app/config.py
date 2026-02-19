@@ -42,11 +42,18 @@ class Settings(BaseSettings):
     HOST: str = "127.0.0.1"
     PORT: int = 8000
     
-    # SSH settings for GPU cluster (configure later)
-    SSH_HOST: Optional[str] = None
-    SSH_USER: Optional[str] = None
-    SSH_KEY_PATH: Optional[str] = None
-    
+    # Cluster settings (SSH + tmux, no Slurm)
+    CLUSTER_HOST: Optional[str] = None   # Default hostname, overridable in UI
+    CLUSTER_PORT: int = 22
+
+    @property
+    def analyses_path(self) -> Path:
+        return Path(self.NETWORK_ROOT) / "analyses"
+
+    @property
+    def ssh_configured(self) -> bool:
+        return bool(self.CLUSTER_HOST)
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

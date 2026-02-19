@@ -18,7 +18,10 @@ from sqlalchemy import (
     ForeignKey,
     Table,
     Index,
+    Boolean,
+    Text,
     event,
+    inspect,
 )
 from sqlalchemy.orm import (
     declarative_base,
@@ -122,7 +125,7 @@ class Slide(Base):
     # Relationships
     case = relationship('Case', back_populates='slides')
     tags = relationship('Tag', secondary=slide_tags, back_populates='slides')
-    analysis_jobs = relationship('AnalysisJob', back_populates='slide', cascade='all, delete-orphan')
+    job_slides = relationship('JobSlide', back_populates='slide', cascade='all, delete-orphan')
     
     def __repr__(self):
         return f"<Slide(id={self.id}, block={self.block_id}, stain={self.stain_type})>"
@@ -219,37 +222,117 @@ class Cohort(Base):
         return f"<Cohort(name={self.name}, slides={self.slide_count})>"
 
 
+class Analysis(Base):
+    """
+    Registry of available AI analysis pipelines.
+
+    Each analysis defines a script on the cluster, parameter schema,
+    and resource requirements for running on a GPU cluster via SSH + tmux.
+    """
+    __tablename__ = 'analyses'
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(200), unique=True, nullable=False, index=True)
+    version = Column(String(50), nullable=False, default='1.0')
+    description = Column(Text)
+
+    # Script-based execution config (replaces container_image)
+    script_path = Column(String(500))       # Path to script on cluster
+    working_directory = Column(String(500))  # cd here before running
+    env_setup = Column(Text)                 # Commands to run before script (e.g. source venv)
+    command_template = Column(Text)          # Full command with {placeholders}
+    postprocess_template = Column(Text)      # Post-processing command with {input_dir} {output_dir} {filename_stem}
+
+    # Parameter schema (JSON Schema string) and defaults (JSON string)
+    parameters_schema = Column(Text)  # JSON Schema defining accepted parameters
+    default_parameters = Column(Text)  # JSON string of default parameter values
+
+    # Resource requirements
+    gpu_required = Column(Boolean, default=True)
+    estimated_runtime_minutes = Column(Integer, default=60)
+
+    # Status
+    active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    # Relationships
+    jobs = relationship('AnalysisJob', back_populates='analysis', passive_deletes=True)
+
+    def __repr__(self):
+        return f"<Analysis(name={self.name}, version={self.version})>"
+
+
 class AnalysisJob(Base):
     """
-    Track AI model runs on slides.
-    
-    Stores job metadata and paths to results (results stay on network drive).
+    Track AI model runs on slides (parent job).
+
+    A single job groups multiple slides. Per-slide tracking is in JobSlide.
     """
     __tablename__ = 'analysis_jobs'
-    
+
     id = Column(Integer, primary_key=True)
-    slide_id = Column(Integer, ForeignKey('slides.id', ondelete='CASCADE'), nullable=False)
-    
+    analysis_id = Column(Integer, ForeignKey('analyses.id', ondelete='SET NULL'), nullable=True)
+
     # Job info
     model_name = Column(String(100), nullable=False)
     model_version = Column(String(50))
-    
+    parameters = Column(Text)  # JSON of actual params used
+
+    # Cluster config
+    gpu_index = Column(Integer, default=0)
+    remote_wsi_dir = Column(String(500))      # Base WSI directory on cluster
+    remote_output_dir = Column(String(500))   # Base output directory on cluster
+
     # Status tracking
-    status = Column(String(20), default='pending')  # pending, queued, running, completed, failed
+    status = Column(String(20), default='pending')  # pending, transferring, running, completed, failed
     submitted_by = Column(String(100))
     submitted_at = Column(DateTime, default=datetime.utcnow)
     started_at = Column(DateTime)
     completed_at = Column(DateTime)
-    
+
     # Results
     error_message = Column(String(1000))
-    result_path = Column(String(500))  # Relative path to results on network drive
-    
+    output_path = Column(String(500))  # Result directory path
+
     # Relationships
-    slide = relationship('Slide', back_populates='analysis_jobs')
-    
+    slides = relationship('JobSlide', back_populates='job', cascade='all, delete-orphan')
+    analysis = relationship('Analysis', back_populates='jobs')
+
     def __repr__(self):
-        return f"<AnalysisJob(model={self.model_name}, status={self.status})>"
+        return f"<AnalysisJob(id={self.id}, model={self.model_name}, status={self.status})>"
+
+
+class JobSlide(Base):
+    """
+    Per-slide tracking within an AnalysisJob.
+
+    Each slide gets its own tmux session and tracks individual progress.
+    """
+    __tablename__ = 'job_slides'
+
+    id = Column(Integer, primary_key=True)
+    job_id = Column(Integer, ForeignKey('analysis_jobs.id', ondelete='CASCADE'), nullable=False)
+    slide_id = Column(Integer, ForeignKey('slides.id', ondelete='CASCADE'), nullable=False)
+
+    # Cluster execution
+    cluster_job_id = Column(String(100))      # tmux session name
+    remote_wsi_path = Column(String(500))     # Where the slide was rsynced to
+    remote_output_path = Column(String(500))  # Output directory for this slide
+    local_output_path = Column(String(500))   # Local path after rsync back from cluster
+    log_tail = Column(Text)                   # Last ~50 lines of progress log
+
+    # Status tracking
+    status = Column(String(20), default='pending')  # pending, transferring, running, completed, failed
+    started_at = Column(DateTime)
+    completed_at = Column(DateTime)
+    error_message = Column(String(1000))
+
+    # Relationships
+    job = relationship('AnalysisJob', back_populates='slides')
+    slide = relationship('Slide', back_populates='job_slides')
+
+    def __repr__(self):
+        return f"<JobSlide(id={self.id}, job_id={self.job_id}, status={self.status})>"
 
 
 # ============================================================
@@ -261,6 +344,8 @@ Index('idx_slides_block_stain', Slide.block_id, Slide.stain_type)
 Index('idx_cases_year', Case.year)
 Index('idx_jobs_status', AnalysisJob.status)
 Index('idx_jobs_model_status', AnalysisJob.model_name, AnalysisJob.status)
+Index('idx_job_slides_job_id', JobSlide.job_id)
+Index('idx_job_slides_status', JobSlide.status)
 
 
 # ============================================================
@@ -306,6 +391,116 @@ _SessionLocal = None
 _engine = None
 
 
+def _migrate_analysis_jobs(engine):
+    """Add new columns to existing tables if missing. Skips gracefully on DB errors."""
+    from sqlalchemy import text
+
+    try:
+        insp = inspect(engine)
+    except Exception as e:
+        print(f"[DB Migration] Skipping migration (cannot inspect DB): {e}")
+        return
+
+    # Migrate analysis_jobs table
+    try:
+        if insp.has_table('analysis_jobs'):
+            existing_cols = {col['name'] for col in insp.get_columns('analysis_jobs')}
+            job_migrations = {
+                'analysis_id': "ALTER TABLE analysis_jobs ADD COLUMN analysis_id INTEGER REFERENCES analyses(id) ON DELETE SET NULL",
+                'parameters': "ALTER TABLE analysis_jobs ADD COLUMN parameters TEXT",
+                'output_path': "ALTER TABLE analysis_jobs ADD COLUMN output_path VARCHAR(500)",
+                'gpu_index': "ALTER TABLE analysis_jobs ADD COLUMN gpu_index INTEGER DEFAULT 0",
+                'remote_wsi_dir': "ALTER TABLE analysis_jobs ADD COLUMN remote_wsi_dir VARCHAR(500)",
+                'remote_output_dir': "ALTER TABLE analysis_jobs ADD COLUMN remote_output_dir VARCHAR(500)",
+            }
+
+            with engine.connect() as conn:
+                for col_name, ddl in job_migrations.items():
+                    if col_name not in existing_cols:
+                        print(f"[DB Migration] Adding column: analysis_jobs.{col_name}")
+                        conn.execute(text(ddl))
+                conn.commit()
+    except Exception as e:
+        print(f"[DB Migration] Skipping analysis_jobs migration: {e}")
+
+    # Migrate analyses table (container_image → script-based fields)
+    try:
+        if insp.has_table('analyses'):
+            existing_cols = {col['name'] for col in insp.get_columns('analyses')}
+            analysis_migrations = {
+                'script_path': "ALTER TABLE analyses ADD COLUMN script_path VARCHAR(500)",
+                'working_directory': "ALTER TABLE analyses ADD COLUMN working_directory VARCHAR(500)",
+                'env_setup': "ALTER TABLE analyses ADD COLUMN env_setup TEXT",
+                'command_template': "ALTER TABLE analyses ADD COLUMN command_template TEXT",
+                'postprocess_template': "ALTER TABLE analyses ADD COLUMN postprocess_template TEXT",
+            }
+
+            with engine.connect() as conn:
+                for col_name, ddl in analysis_migrations.items():
+                    if col_name not in existing_cols:
+                        print(f"[DB Migration] Adding column: analyses.{col_name}")
+                        conn.execute(text(ddl))
+                conn.commit()
+    except Exception as e:
+        print(f"[DB Migration] Skipping analyses migration: {e}")
+
+    # Migrate job_slides table
+    try:
+        if insp.has_table('job_slides'):
+            existing_cols = {col['name'] for col in insp.get_columns('job_slides')}
+            js_migrations = {
+                'local_output_path': "ALTER TABLE job_slides ADD COLUMN local_output_path VARCHAR(500)",
+            }
+
+            with engine.connect() as conn:
+                for col_name, ddl in js_migrations.items():
+                    if col_name not in existing_cols:
+                        print(f"[DB Migration] Adding column: job_slides.{col_name}")
+                        conn.execute(text(ddl))
+                conn.commit()
+    except Exception as e:
+        print(f"[DB Migration] Skipping job_slides column migration: {e}")
+
+    # Migrate existing AnalysisJob rows → JobSlide (one-time migration)
+    try:
+        if insp.has_table('analysis_jobs') and insp.has_table('job_slides'):
+            old_cols = {col['name'] for col in insp.get_columns('analysis_jobs')}
+            # If old schema had slide_id column, migrate those rows to job_slides
+            if 'slide_id' in old_cols:
+                with engine.connect() as conn:
+                    # Check if any rows need migration (old jobs with slide_id that have no job_slides)
+                    rows = conn.execute(text(
+                        "SELECT aj.id, aj.slide_id, aj.cluster_job_id, aj.remote_wsi_path, "
+                        "aj.remote_output_path, aj.log_tail, aj.status, aj.started_at, "
+                        "aj.completed_at, aj.error_message "
+                        "FROM analysis_jobs aj "
+                        "WHERE aj.slide_id IS NOT NULL "
+                        "AND NOT EXISTS (SELECT 1 FROM job_slides js WHERE js.job_id = aj.id)"
+                    )).fetchall()
+
+                    if rows:
+                        print(f"[DB Migration] Migrating {len(rows)} old AnalysisJob rows to JobSlide...")
+                        for row in rows:
+                            conn.execute(text(
+                                "INSERT INTO job_slides (job_id, slide_id, cluster_job_id, "
+                                "remote_wsi_path, remote_output_path, log_tail, status, "
+                                "started_at, completed_at, error_message) "
+                                "VALUES (:job_id, :slide_id, :cluster_job_id, :remote_wsi_path, "
+                                ":remote_output_path, :log_tail, :status, :started_at, "
+                                ":completed_at, :error_message)"
+                            ), {
+                                "job_id": row[0], "slide_id": row[1],
+                                "cluster_job_id": row[2], "remote_wsi_path": row[3],
+                                "remote_output_path": row[4], "log_tail": row[5],
+                                "status": row[6], "started_at": row[7],
+                                "completed_at": row[8], "error_message": row[9],
+                            })
+                        conn.commit()
+                        print(f"[DB Migration] Migrated {len(rows)} rows to job_slides")
+    except Exception as e:
+        print(f"[DB Migration] Skipping job_slides migration: {e}")
+
+
 def init_db(db_path: Path):
     """
     Initialize database schema and session factory.
@@ -314,6 +509,7 @@ def init_db(db_path: Path):
     global _SessionLocal, _engine
     db_path.parent.mkdir(parents=True, exist_ok=True)
     _engine = get_engine(db_path)
+    _migrate_analysis_jobs(_engine)
     Base.metadata.create_all(_engine)
     _SessionLocal = sessionmaker(bind=_engine)
 

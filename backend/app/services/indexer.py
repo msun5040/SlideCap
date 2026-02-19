@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from .filename_parser import FilenameParser
 from .hasher import SlideHasher
-from ..db.models import Case, Slide
+from ..db.models import Case, Slide, JobSlide, AnalysisJob
 
 
 class SlideIndexer:
@@ -494,7 +494,8 @@ class SlideIndexer:
         slides_db = db.query(Slide).options(
             joinedload(Slide.tags),
             joinedload(Slide.case).joinedload(Case.tags),
-            joinedload(Slide.case).joinedload(Case.projects)
+            joinedload(Slide.case).joinedload(Case.projects),
+            joinedload(Slide.job_slides).joinedload(JobSlide.job),
         ).filter(
             Slide.slide_hash.in_(matching_hashes)
         ).all()
@@ -533,6 +534,10 @@ class SlideIndexer:
                 'case_tags': [t.name for t in slide.case.tags],
                 'projects': [p.name for p in slide.case.projects],
                 'file_size_bytes': slide.file_size_bytes,
+                'completed_analyses': list(set(
+                    js.job.model_name for js in slide.job_slides
+                    if js.status == "completed" and js.job
+                )),
             }
 
             results.append(result)

@@ -22,6 +22,7 @@ export interface Slide {
   file_size_bytes?: number
   file_path?: string
   status?: 'available' | 'in-analysis' | 'archived'
+  completed_analyses?: string[]
 }
 
 export interface SearchFilters {
@@ -74,4 +75,73 @@ export interface CaseGroup {
   accession_number: string | null
   year: number | null
   slides: CohortSlide[]
+}
+
+export interface Analysis {
+  id: number
+  name: string
+  version: string
+  description?: string
+  script_path?: string
+  working_directory?: string
+  env_setup?: string
+  command_template?: string
+  postprocess_template?: string  // Post-processing command template
+  parameters_schema?: string   // JSON Schema string
+  default_parameters?: string  // JSON string
+  gpu_required: boolean
+  estimated_runtime_minutes: number
+  active: boolean
+  created_at?: string
+  job_count?: number
+}
+
+export interface JobSlide {
+  id: number
+  slide_hash?: string
+  cluster_job_id?: string
+  status: 'pending' | 'transferring' | 'running' | 'completed' | 'failed'
+  started_at?: string
+  completed_at?: string
+  error_message?: string
+  log_tail?: string
+  remote_output_path?: string
+}
+
+export interface AnalysisJob {
+  id: number
+  analysis_id?: number
+  model_name: string
+  model_version?: string
+  parameters?: string
+  gpu_index?: number
+  status: 'pending' | 'transferring' | 'running' | 'completed' | 'failed'
+  submitted_by?: string
+  submitted_at?: string
+  started_at?: string
+  completed_at?: string
+  error_message?: string
+  // Progress
+  slide_count: number
+  completed_count: number
+  failed_count: number
+  // Nested slides (in detail view)
+  slides?: JobSlide[]
+}
+
+export interface GpuInfo {
+  index: number
+  name: string
+  memory_used_mb: number
+  memory_total_mb: number
+  utilization_pct: number
+}
+
+export interface ClusterStatus {
+  connected: boolean
+  host?: string
+  port?: number
+  username?: string
+  gpus?: GpuInfo[]
+  gpu_error?: string
 }

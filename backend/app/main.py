@@ -7,15 +7,17 @@ from pydantic import BaseModel
 from typing import Optional, List
 from io import BytesIO
 import os
+import json
 import zipfile
 import queue
 import threading
 import re
+from datetime import datetime
 from sqlalchemy.orm import Session, joinedload
 
 from .config import settings
-from .db import init_db, get_db, get_session, Case, Slide, Tag, Project, Cohort, init_lock, get_lock
-from .services import SlideHasher, SlideIndexer
+from .db import init_db, get_db, get_session, Case, Slide, Tag, Project, Cohort, Analysis, AnalysisJob, JobSlide, init_lock, get_lock
+from .services import SlideHasher, SlideIndexer, ClusterService, JobStatusPoller
 
 
 # Request models for bulk operations
@@ -29,11 +31,13 @@ class BulkTagRequest(BaseModel):
 hasher = None
 indexer = None
 db_lock = None
+cluster_service: Optional[ClusterService] = None
+job_poller: Optional[JobStatusPoller] = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global hasher, indexer, db_lock
+    global hasher, indexer, db_lock, cluster_service, job_poller
 
     print("=" * 60)
     print("Starting Slide Organizer API")
@@ -86,6 +90,18 @@ async def lifespan(app: FastAPI):
     finally:
         startup_db.close()
 
+    # Initialize cluster service (connection is per-session via UI)
+    cluster_service = ClusterService(
+        host=settings.CLUSTER_HOST,
+        port=settings.CLUSTER_PORT,
+    )
+    job_poller = JobStatusPoller(
+        cluster_service, interval=30,
+        indexer=indexer, analyses_path=settings.analyses_path,
+    )
+    job_poller.start()
+    print("Cluster service initialized (connect via UI to enable job submission)")
+
     print("=" * 60)
     print(f"API ready at http://{settings.HOST}:{settings.PORT}")
     print("=" * 60)
@@ -93,6 +109,10 @@ async def lifespan(app: FastAPI):
     yield  # Application runs here
 
     # Cleanup
+    if job_poller:
+        job_poller.stop()
+    if cluster_service:
+        cluster_service.disconnect()
     print("Shutting down...")
 
 
@@ -405,12 +425,12 @@ def get_slide(slide_hash: str, db: Session = Depends(get_db)):
         "projects": [{"id": p.id, "name": p.name} for p in slide.case.projects],
         "analysis_jobs": [
             {
-                "id": j.id,
-                "model": j.model_name,
-                "status": j.status,
-                "submitted_at": j.submitted_at.isoformat() if j.submitted_at else None
+                "id": js.job.id,
+                "model": js.job.model_name,
+                "status": js.status,
+                "submitted_at": js.job.submitted_at.isoformat() if js.job.submitted_at else None
             }
-            for j in slide.analysis_jobs
+            for js in slide.job_slides if js.job
         ]
     }
 
@@ -1231,6 +1251,123 @@ def export_cohort(cohort_id: int, db: Session = Depends(get_db)):
     )
 
 
+@app.post("/cohorts/{cohort_id}/export-analyses")
+def export_cohort_analyses(
+    cohort_id: int,
+    analysis_name: Optional[str] = Query(None, description="Filter by analysis name"),
+    db: Session = Depends(get_db),
+):
+    """
+    Export post-processed analysis results for a cohort as a ZIP.
+    Structure: {accession_number}/{analysis_name}/{files}
+    """
+    import subprocess
+    import tempfile
+
+    if not indexer:
+        raise HTTPException(status_code=503, detail="Indexer not initialized")
+
+    cohort = db.query(Cohort).options(
+        joinedload(Cohort.slides).joinedload(Slide.case),
+        joinedload(Cohort.slides).joinedload(Slide.job_slides).joinedload(JobSlide.job).joinedload(AnalysisJob.analysis),
+    ).filter_by(id=cohort_id).first()
+    if not cohort:
+        raise HTTPException(status_code=404, detail="Cohort not found")
+
+    # Collect (output_dir, archive_prefix, postprocess_template) for each completed slide analysis
+    export_items: list[tuple[Path, str, str | None]] = []
+
+    for slide in cohort.slides:
+        # Resolve accession number for folder name
+        filepath = indexer.get_filepath(slide.slide_hash)
+        if filepath:
+            parsed = indexer.parser.parse(filepath.name)
+            folder = parsed.accession if parsed else slide.slide_hash[:12]
+        else:
+            folder = slide.slide_hash[:12]
+
+        for js in slide.job_slides:
+            if js.status != "completed":
+                continue
+            if not js.local_output_path:
+                continue
+            local_out = Path(js.local_output_path)
+            if not local_out.is_dir():
+                continue
+
+            job = js.job
+            if not job:
+                continue
+
+            a_name = job.model_name
+            if analysis_name and a_name != analysis_name:
+                continue
+
+            pp_template = job.analysis.postprocess_template if job.analysis else None
+            arc_prefix = f"{folder}/{a_name}"
+            export_items.append((local_out, arc_prefix, pp_template))
+
+    if not export_items:
+        raise HTTPException(status_code=404, detail="No completed analysis results available for export")
+
+    def generate():
+        q: queue.Queue = queue.Queue(maxsize=32)
+
+        def writer():
+            try:
+                stream = _ZipStreamWriter(q)
+                with zipfile.ZipFile(stream, 'w', zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+                    for output_dir, arc_prefix, pp_template in export_items:
+                        if pp_template:
+                            # Run postprocess into a temp dir
+                            with tempfile.TemporaryDirectory() as tmpdir:
+                                cmd = pp_template.format(
+                                    input_dir=str(output_dir),
+                                    output_dir=tmpdir,
+                                    filename_stem=output_dir.name,
+                                )
+                                try:
+                                    subprocess.run(cmd, shell=True, check=True, timeout=300)
+                                    src_dir = Path(tmpdir)
+                                except Exception as e:
+                                    print(f"Postprocess failed for {arc_prefix}: {e}, using raw files")
+                                    src_dir = output_dir
+
+                                for f in sorted(src_dir.iterdir()):
+                                    if f.is_file():
+                                        zf.write(str(f), f"{arc_prefix}/{f.name}")
+                        else:
+                            # No postprocessing — copy raw files
+                            for f in sorted(output_dir.iterdir()):
+                                if f.is_file():
+                                    zf.write(str(f), f"{arc_prefix}/{f.name}")
+                stream.flush()
+            except Exception as e:
+                print(f"Analysis export error: {e}")
+            finally:
+                q.put(None)
+
+        t = threading.Thread(target=writer, daemon=True)
+        t.start()
+
+        while True:
+            chunk = q.get()
+            if chunk is None:
+                break
+            yield chunk
+
+        t.join(timeout=5)
+
+    safe_name = re.sub(r'[^\w\s-]', '', cohort.name).strip().replace(' ', '_') or 'cohort'
+    return StreamingResponse(
+        generate(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_name}_analyses.zip"',
+        },
+    )
+
+
 @app.post("/cohorts/from-tag")
 def create_cohort_from_tag(data: CohortFromTag, db: Session = Depends(get_db)):
     """Create a cohort from all slides with a specific tag."""
@@ -1259,7 +1396,6 @@ def create_cohort_from_tag(data: CohortFromTag, db: Session = Depends(get_db)):
 
 
 from fastapi import UploadFile, File
-import json
 
 
 @app.post("/cohorts/from-file")
@@ -1514,6 +1650,842 @@ def create_cohort_from_filter(
         "slide_count": cohort.slide_count,
         "case_count": cohort.case_count
     }
+
+
+# ============================================================
+# Analysis Registry Endpoints
+# ============================================================
+
+class AnalysisCreate(BaseModel):
+    name: str
+    version: str = '1.0'
+    description: Optional[str] = None
+    script_path: Optional[str] = None
+    working_directory: Optional[str] = None
+    env_setup: Optional[str] = None
+    command_template: Optional[str] = None
+    postprocess_template: Optional[str] = None
+    parameters_schema: Optional[str] = None
+    default_parameters: Optional[str] = None
+    gpu_required: bool = True
+    estimated_runtime_minutes: int = 60
+
+
+class AnalysisUpdate(BaseModel):
+    name: Optional[str] = None
+    version: Optional[str] = None
+    description: Optional[str] = None
+    script_path: Optional[str] = None
+    working_directory: Optional[str] = None
+    env_setup: Optional[str] = None
+    command_template: Optional[str] = None
+    postprocess_template: Optional[str] = None
+    parameters_schema: Optional[str] = None
+    default_parameters: Optional[str] = None
+    gpu_required: Optional[bool] = None
+    estimated_runtime_minutes: Optional[int] = None
+    active: Optional[bool] = None
+
+
+@app.get("/analyses")
+def list_analyses(
+    db: Session = Depends(get_db),
+    active_only: bool = Query(False, description="Only return active analyses"),
+):
+    """List all registered analyses."""
+    query = db.query(Analysis)
+    if active_only:
+        query = query.filter(Analysis.active == True)
+    analyses = query.order_by(Analysis.name).all()
+    return [
+        {
+            "id": a.id,
+            "name": a.name,
+            "version": a.version,
+            "description": a.description,
+            "script_path": a.script_path,
+            "working_directory": a.working_directory,
+            "env_setup": a.env_setup,
+            "command_template": a.command_template,
+            "postprocess_template": a.postprocess_template,
+            "parameters_schema": a.parameters_schema,
+            "default_parameters": a.default_parameters,
+            "gpu_required": a.gpu_required,
+            "estimated_runtime_minutes": a.estimated_runtime_minutes,
+            "active": a.active,
+            "created_at": a.created_at.isoformat() if a.created_at else None,
+            "job_count": len(a.jobs),
+        }
+        for a in analyses
+    ]
+
+
+@app.post("/analyses")
+def create_analysis(data: AnalysisCreate, db: Session = Depends(get_db)):
+    """Register a new analysis pipeline."""
+    existing = db.query(Analysis).filter_by(name=data.name).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Analysis with this name already exists")
+
+    analysis = Analysis(
+        name=data.name,
+        version=data.version,
+        description=data.description,
+        script_path=data.script_path,
+        working_directory=data.working_directory,
+        env_setup=data.env_setup,
+        command_template=data.command_template,
+        postprocess_template=data.postprocess_template,
+        parameters_schema=data.parameters_schema,
+        default_parameters=data.default_parameters,
+        gpu_required=data.gpu_required,
+        estimated_runtime_minutes=data.estimated_runtime_minutes,
+    )
+    db.add(analysis)
+    db.commit()
+
+    return {
+        "id": analysis.id,
+        "name": analysis.name,
+        "version": analysis.version,
+    }
+
+
+@app.get("/analyses/{analysis_id}")
+def get_analysis(analysis_id: int, db: Session = Depends(get_db)):
+    """Get a single analysis by ID."""
+    analysis = db.query(Analysis).filter_by(id=analysis_id).first()
+    if not analysis:
+        raise HTTPException(status_code=404, detail="Analysis not found")
+
+    return {
+        "id": analysis.id,
+        "name": analysis.name,
+        "version": analysis.version,
+        "description": analysis.description,
+        "script_path": analysis.script_path,
+        "working_directory": analysis.working_directory,
+        "env_setup": analysis.env_setup,
+        "command_template": analysis.command_template,
+        "postprocess_template": analysis.postprocess_template,
+        "parameters_schema": analysis.parameters_schema,
+        "default_parameters": analysis.default_parameters,
+        "gpu_required": analysis.gpu_required,
+        "estimated_runtime_minutes": analysis.estimated_runtime_minutes,
+        "active": analysis.active,
+        "created_at": analysis.created_at.isoformat() if analysis.created_at else None,
+        "job_count": len(analysis.jobs),
+    }
+
+
+@app.patch("/analyses/{analysis_id}")
+def update_analysis(analysis_id: int, data: AnalysisUpdate, db: Session = Depends(get_db)):
+    """Update an analysis pipeline."""
+    analysis = db.query(Analysis).filter_by(id=analysis_id).first()
+    if not analysis:
+        raise HTTPException(status_code=404, detail="Analysis not found")
+
+    if data.name is not None:
+        existing = db.query(Analysis).filter(Analysis.name == data.name, Analysis.id != analysis_id).first()
+        if existing:
+            raise HTTPException(status_code=400, detail="Analysis name already exists")
+        analysis.name = data.name
+    if data.version is not None:
+        analysis.version = data.version
+    if data.description is not None:
+        analysis.description = data.description
+    if data.script_path is not None:
+        analysis.script_path = data.script_path
+    if data.working_directory is not None:
+        analysis.working_directory = data.working_directory
+    if data.env_setup is not None:
+        analysis.env_setup = data.env_setup
+    if data.command_template is not None:
+        analysis.command_template = data.command_template
+    if data.postprocess_template is not None:
+        analysis.postprocess_template = data.postprocess_template
+    if data.parameters_schema is not None:
+        analysis.parameters_schema = data.parameters_schema
+    if data.default_parameters is not None:
+        analysis.default_parameters = data.default_parameters
+    if data.gpu_required is not None:
+        analysis.gpu_required = data.gpu_required
+    if data.estimated_runtime_minutes is not None:
+        analysis.estimated_runtime_minutes = data.estimated_runtime_minutes
+    if data.active is not None:
+        analysis.active = data.active
+
+    db.commit()
+
+    return {
+        "id": analysis.id,
+        "name": analysis.name,
+        "version": analysis.version,
+        "active": analysis.active,
+    }
+
+
+@app.delete("/analyses/{analysis_id}")
+def delete_analysis(analysis_id: int, db: Session = Depends(get_db)):
+    """Soft-delete an analysis (sets active=False)."""
+    analysis = db.query(Analysis).filter_by(id=analysis_id).first()
+    if not analysis:
+        raise HTTPException(status_code=404, detail="Analysis not found")
+
+    analysis.active = False
+    db.commit()
+
+    return {"status": "ok", "id": analysis_id, "active": False}
+
+
+# ============================================================
+# Job Submission & Management Endpoints
+# ============================================================
+
+class JobSubmitRequest(BaseModel):
+    analysis_id: int
+    slide_hashes: List[str]
+    gpu_index: int = 0
+    remote_wsi_dir: str = "/tmp/slidecap_wsi"
+    remote_output_dir: str = "/tmp/slidecap_output"
+    parameters: Optional[str] = None
+    submitted_by: Optional[str] = None
+
+
+class CohortJobSubmitRequest(BaseModel):
+    analysis_id: int
+    gpu_index: int = 0
+    remote_wsi_dir: str = "/tmp/slidecap_wsi"
+    remote_output_dir: str = "/tmp/slidecap_output"
+    parameters: Optional[str] = None
+    submitted_by: Optional[str] = None
+
+
+class JobCancelRequest(BaseModel):
+    job_ids: List[int]
+
+
+@app.post("/jobs/submit")
+def submit_jobs(data: JobSubmitRequest, db: Session = Depends(get_db)):
+    """Submit a multi-slide analysis job. Creates one parent job with N child JobSlides."""
+    if not cluster_service or not cluster_service.is_connected:
+        raise HTTPException(status_code=503, detail="Not connected to cluster. Connect first via /cluster/connect")
+
+    analysis = db.query(Analysis).filter_by(id=data.analysis_id, active=True).first()
+    if not analysis:
+        raise HTTPException(status_code=404, detail="Analysis not found or inactive")
+
+    params = None
+    if data.parameters:
+        try:
+            params = json.loads(data.parameters)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Invalid JSON in parameters")
+
+    # Create ONE parent job
+    job = AnalysisJob(
+        analysis_id=analysis.id,
+        model_name=analysis.name,
+        model_version=analysis.version,
+        parameters=data.parameters,
+        gpu_index=data.gpu_index,
+        remote_wsi_dir=data.remote_wsi_dir,
+        remote_output_dir=data.remote_output_dir,
+        output_path=str(settings.analyses_path),
+        status="pending",
+        submitted_by=data.submitted_by,
+    )
+    db.add(job)
+    db.flush()
+
+    errors = []
+    slides_created = 0
+
+    for slide_hash in data.slide_hashes:
+        slide = db.query(Slide).filter_by(slide_hash=slide_hash).first()
+        if not slide:
+            errors.append(f"Slide not found: {slide_hash[:12]}")
+            continue
+
+        slide_path = indexer.get_filepath(slide_hash) if indexer else None
+        if not slide_path:
+            errors.append(f"No filepath for {slide_hash[:12]}")
+            continue
+
+        remote_wsi_path = f"{data.remote_wsi_dir}/{slide_path.name}"
+        remote_out = f"{data.remote_output_dir}/{slide.slide_hash}/{analysis.name}_v{analysis.version}"
+
+        job_slide = JobSlide(
+            job_id=job.id,
+            slide_id=slide.id,
+            remote_wsi_path=remote_wsi_path,
+            remote_output_path=remote_out,
+            status="transferring",
+        )
+        db.add(job_slide)
+        db.flush()
+
+        try:
+            if not slide_path.exists():
+                raise FileNotFoundError(f"Local slide file not found: {slide_path}")
+
+            print(f"[Job {job.id}/Slide {job_slide.id}] Rsyncing {slide_path} ({slide_path.stat().st_size / 1e6:.0f} MB) -> {data.remote_wsi_dir}/")
+            cluster_service.rsync_slide(slide_path, data.remote_wsi_dir)
+            print(f"[Job {job.id}/Slide {job_slide.id}] Rsync complete, starting tmux job...")
+
+            session_name = cluster_service.start_job(
+                analysis=analysis,
+                slide_hash=slide_hash,
+                remote_wsi_path=remote_wsi_path,
+                remote_output_dir=remote_out,
+                gpu_index=data.gpu_index,
+                parameters=params,
+            )
+            job_slide.cluster_job_id = session_name
+            job_slide.status = "running"
+            job_slide.started_at = datetime.utcnow()
+            print(f"[Job {job.id}/Slide {job_slide.id}] Started tmux session: {session_name}")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            job_slide.status = "failed"
+            job_slide.error_message = f"Submission failed: {e}"
+            errors.append(f"Submit failed for {slide_hash[:12]}: {e}")
+
+        slides_created += 1
+
+    # Compute parent job status from children
+    _recompute_job_status(job)
+    db.commit()
+
+    return {
+        "job_id": job.id,
+        "slides_created": slides_created,
+        "errors": errors,
+        "cluster_connected": cluster_service.is_connected,
+    }
+
+
+def _recompute_job_status(job: AnalysisJob):
+    """Derive parent job status from its child JobSlides."""
+    if not job.slides:
+        return
+    statuses = [js.status for js in job.slides]
+    if any(s in ("running", "transferring") for s in statuses):
+        job.status = "running"
+        if not job.started_at:
+            job.started_at = datetime.utcnow()
+    elif all(s == "completed" for s in statuses):
+        job.status = "completed"
+        job.completed_at = datetime.utcnow()
+    elif any(s == "failed" for s in statuses) and not any(s in ("running", "transferring", "pending") for s in statuses):
+        job.status = "failed"
+        job.completed_at = datetime.utcnow()
+    elif all(s == "pending" for s in statuses):
+        job.status = "pending"
+
+
+@app.post("/jobs/submit-cohort/{cohort_id}")
+def submit_cohort_jobs(cohort_id: int, data: CohortJobSubmitRequest, db: Session = Depends(get_db)):
+    """Submit a multi-slide analysis job for all slides in a cohort."""
+    cohort = db.query(Cohort).filter_by(id=cohort_id).first()
+    if not cohort:
+        raise HTTPException(status_code=404, detail="Cohort not found")
+
+    slide_hashes = [s.slide_hash for s in cohort.slides]
+    submit_data = JobSubmitRequest(
+        analysis_id=data.analysis_id,
+        slide_hashes=slide_hashes,
+        gpu_index=data.gpu_index,
+        remote_wsi_dir=data.remote_wsi_dir,
+        remote_output_dir=data.remote_output_dir,
+        parameters=data.parameters,
+        submitted_by=data.submitted_by,
+    )
+    return submit_jobs(submit_data, db)
+
+
+@app.get("/jobs")
+def list_jobs(
+    db: Session = Depends(get_db),
+    status: Optional[str] = Query(None),
+    analysis_id: Optional[int] = Query(None),
+    limit: int = Query(200, le=1000),
+):
+    """List analysis jobs with slide progress counts."""
+    query = db.query(AnalysisJob).options(joinedload(AnalysisJob.slides))
+    if status:
+        query = query.filter(AnalysisJob.status == status)
+    if analysis_id:
+        query = query.filter(AnalysisJob.analysis_id == analysis_id)
+
+    jobs = query.order_by(AnalysisJob.submitted_at.desc()).limit(limit).all()
+
+    def _job_dict(j):
+        slide_count = len(j.slides)
+        completed_count = sum(1 for js in j.slides if js.status == "completed")
+        failed_count = sum(1 for js in j.slides if js.status == "failed")
+        return {
+            "id": j.id,
+            "analysis_id": j.analysis_id,
+            "model_name": j.model_name,
+            "model_version": j.model_version,
+            "parameters": j.parameters,
+            "gpu_index": j.gpu_index,
+            "status": j.status,
+            "submitted_by": j.submitted_by,
+            "submitted_at": j.submitted_at.isoformat() if j.submitted_at else None,
+            "started_at": j.started_at.isoformat() if j.started_at else None,
+            "completed_at": j.completed_at.isoformat() if j.completed_at else None,
+            "error_message": j.error_message,
+            "slide_count": slide_count,
+            "completed_count": completed_count,
+            "failed_count": failed_count,
+        }
+
+    return [_job_dict(j) for j in jobs]
+
+
+@app.get("/jobs/{job_id}")
+def get_job(job_id: int, db: Session = Depends(get_db)):
+    """Get a single job with nested slides detail."""
+    job = db.query(AnalysisJob).options(
+        joinedload(AnalysisJob.slides).joinedload(JobSlide.slide)
+    ).filter_by(id=job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    slide_count = len(job.slides)
+    completed_count = sum(1 for js in job.slides if js.status == "completed")
+    failed_count = sum(1 for js in job.slides if js.status == "failed")
+
+    return {
+        "id": job.id,
+        "analysis_id": job.analysis_id,
+        "model_name": job.model_name,
+        "model_version": job.model_version,
+        "parameters": job.parameters,
+        "gpu_index": job.gpu_index,
+        "status": job.status,
+        "submitted_by": job.submitted_by,
+        "submitted_at": job.submitted_at.isoformat() if job.submitted_at else None,
+        "started_at": job.started_at.isoformat() if job.started_at else None,
+        "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+        "error_message": job.error_message,
+        "slide_count": slide_count,
+        "completed_count": completed_count,
+        "failed_count": failed_count,
+        "slides": [
+            {
+                "id": js.id,
+                "slide_hash": js.slide.slide_hash if js.slide else None,
+                "cluster_job_id": js.cluster_job_id,
+                "status": js.status,
+                "started_at": js.started_at.isoformat() if js.started_at else None,
+                "completed_at": js.completed_at.isoformat() if js.completed_at else None,
+                "error_message": js.error_message,
+                "log_tail": js.log_tail,
+                "remote_output_path": js.remote_output_path,
+            }
+            for js in job.slides
+        ],
+    }
+
+
+@app.get("/jobs/{job_id}/log")
+def get_job_log(
+    job_id: int,
+    slide_id: Optional[int] = Query(None, description="Optional JobSlide ID for specific slide log"),
+    db: Session = Depends(get_db),
+):
+    """Fetch log from the cluster for a job or specific slide within it."""
+    job = db.query(AnalysisJob).options(
+        joinedload(AnalysisJob.slides)
+    ).filter_by(id=job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # If slide_id specified, get that specific slide's log
+    if slide_id is not None:
+        job_slide = next((js for js in job.slides if js.id == slide_id), None)
+        if not job_slide:
+            raise HTTPException(status_code=404, detail="JobSlide not found in this job")
+        slides_to_check = [job_slide]
+    else:
+        slides_to_check = job.slides
+
+    if not cluster_service or not cluster_service.is_connected:
+        logs = []
+        for js in slides_to_check:
+            logs.append({"slide_id": js.id, "log": js.log_tail or "(not connected)", "source": "cached"})
+        return {"job_id": job_id, "slides": logs}
+
+    results = []
+    for js in slides_to_check:
+        remote_out = js.remote_output_path
+        if not remote_out:
+            results.append({"slide_id": js.id, "log": "(no remote output path)", "source": "none"})
+            continue
+        try:
+            stdout, stderr, exit_code = cluster_service.run_command(f"cat {remote_out}/run.log 2>&1")
+            _, _, tmux_code = cluster_service.run_command(
+                f"tmux has-session -t {js.cluster_job_id} 2>/dev/null" if js.cluster_job_id else "false"
+            )
+            results.append({
+                "slide_id": js.id,
+                "log": stdout if exit_code == 0 else f"(no run.log found)\nstderr: {stderr}",
+                "tmux_alive": tmux_code == 0,
+                "cluster_job_id": js.cluster_job_id,
+                "source": "live",
+            })
+        except Exception as e:
+            results.append({"slide_id": js.id, "log": f"Error fetching log: {e}", "source": "error"})
+
+    return {"job_id": job_id, "slides": results}
+
+
+@app.post("/jobs/cancel")
+def cancel_jobs(data: JobCancelRequest, db: Session = Depends(get_db)):
+    """Cancel jobs by their IDs. Cancels all active child slides."""
+    cancelled = 0
+    errors = []
+
+    for job_id in data.job_ids:
+        job = db.query(AnalysisJob).options(
+            joinedload(AnalysisJob.slides)
+        ).filter_by(id=job_id).first()
+        if not job:
+            errors.append(f"Job {job_id} not found")
+            continue
+
+        if job.status not in ("queued", "running", "pending", "transferring"):
+            errors.append(f"Job {job_id} is already {job.status}")
+            continue
+
+        # Cancel all active child slides
+        for js in job.slides:
+            if js.status in ("pending", "transferring", "running", "queued"):
+                if cluster_service and cluster_service.is_connected and js.cluster_job_id:
+                    try:
+                        cluster_service.cancel_job(js.cluster_job_id)
+                    except Exception:
+                        pass
+                js.status = "failed"
+                js.error_message = "Cancelled by user"
+                js.completed_at = datetime.utcnow()
+
+        job.status = "failed"
+        job.error_message = "Cancelled by user"
+        job.completed_at = datetime.utcnow()
+        cancelled += 1
+
+    db.commit()
+
+    return {"cancelled": cancelled, "errors": errors}
+
+
+@app.post("/jobs/refresh")
+def refresh_job_statuses():
+    """Trigger an immediate job status refresh from the cluster."""
+    if not job_poller:
+        raise HTTPException(status_code=503, detail="Job poller not running")
+    if not cluster_service or not cluster_service.is_connected:
+        raise HTTPException(status_code=503, detail="Not connected to cluster")
+
+    job_poller.poll_now()
+    return {"status": "ok", "message": "Status refresh triggered"}
+
+
+# ============================================================
+# Cluster Connection Endpoints
+# ============================================================
+
+class ClusterConnectRequest(BaseModel):
+    host: str
+    port: int = 22
+    username: str
+    password: str
+
+
+@app.post("/cluster/connect")
+def cluster_connect(data: ClusterConnectRequest):
+    """Connect to the GPU cluster via SSH."""
+    if not cluster_service:
+        raise HTTPException(status_code=503, detail="Cluster service not initialized")
+
+    try:
+        result = cluster_service.connect(data.host, data.port, data.username, data.password)
+        # Immediately query GPU status
+        try:
+            gpus = cluster_service.get_gpu_status()
+            result["gpus"] = gpus
+        except Exception as e:
+            result["gpus"] = []
+            result["gpu_error"] = str(e)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/cluster/disconnect")
+def cluster_disconnect():
+    """Disconnect from the GPU cluster."""
+    if cluster_service:
+        cluster_service.disconnect()
+    return {"status": "ok", "connected": False}
+
+
+@app.get("/cluster/status")
+def cluster_status():
+    """Get cluster connection status."""
+    if not cluster_service:
+        return {"connected": False}
+
+    info = cluster_service.connection_info
+    if info["connected"]:
+        try:
+            info["gpus"] = cluster_service.get_gpu_status()
+        except Exception:
+            info["gpus"] = []
+    return info
+
+
+@app.get("/cluster/gpus")
+def cluster_gpus():
+    """Get current GPU status from the cluster."""
+    if not cluster_service or not cluster_service.is_connected:
+        raise HTTPException(status_code=503, detail="Not connected to cluster")
+
+    try:
+        return cluster_service.get_gpu_status()
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to query GPUs: {e}")
+
+
+# ============================================================
+# Seed / Pre-configuration Endpoints
+# ============================================================
+
+@app.post("/analyses/seed-cellvit")
+def seed_cellvit(db: Session = Depends(get_db)):
+    """Pre-populate registry with the CellViT analysis pipeline."""
+    existing = db.query(Analysis).filter_by(name="CellViT").first()
+    if existing:
+        return {"status": "already_exists", "id": existing.id}
+
+    # Resolve postprocess script path relative to this file
+    scripts_dir = Path(__file__).resolve().parent.parent / "scripts"
+    postprocess_cmd = f"python {scripts_dir / 'postprocess_cellvit.py'} --input-dir {{input_dir}} --output-dir {{output_dir}}"
+
+    analysis = Analysis(
+        name="CellViT",
+        version="SAM-H-x40",
+        description="Cell detection and segmentation using CellViT with SAM-H backbone at 40x magnification",
+        script_path="/ligonlab/Prem/CellViT_CCNU/CellViT-plus-plus/run_cellvit_resume.sh",
+        working_directory="/ligonlab/Prem/CellViT_CCNU/CellViT-plus-plus",
+        env_setup="source cellvit_env/bin/activate && export TMPDIR=/ligonlab/Prem/CellViT_CCNU/tmp && export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1",
+        command_template="./run_cellvit_resume.sh {wsi_dir} {outdir} ./checkpoints/CellViT-SAM-H-x40-AMP.pth {gpu} {batch_size}",
+        postprocess_template=postprocess_cmd,
+        default_parameters='{"batch_size": 4}',
+        gpu_required=True,
+        estimated_runtime_minutes=120,
+    )
+    db.add(analysis)
+    db.commit()
+
+    return {"status": "created", "id": analysis.id, "name": analysis.name}
+
+
+# ============================================================
+# Results Endpoints
+# ============================================================
+
+@app.get("/results/search")
+def search_results(
+    q: str = Query(..., min_length=1, description="Accession number search query"),
+    db: Session = Depends(get_db),
+):
+    """
+    Search for analysis results by accession number.
+    Returns slides matching the query with their completed analyses.
+    """
+    if not indexer:
+        raise HTTPException(status_code=503, detail="Indexer not initialized")
+
+    query_upper = q.strip().upper()
+
+    # Find matching slides via the path cache (same pattern as /search)
+    matching: list[dict] = []
+    seen_hashes: set[str] = set()
+
+    for slide_hash, filepath in indexer.slide_hash_to_path.items():
+        parsed = indexer.parser.parse(filepath.name)
+        if not parsed:
+            continue
+        if query_upper not in parsed.accession.upper():
+            continue
+        if slide_hash in seen_hashes:
+            continue
+        seen_hashes.add(slide_hash)
+
+        slide = db.query(Slide).filter_by(slide_hash=slide_hash).first()
+        if not slide:
+            continue
+
+        # Get completed analyses for this slide
+        completed = (
+            db.query(JobSlide)
+            .join(AnalysisJob)
+            .filter(
+                JobSlide.slide_id == slide.id,
+                JobSlide.status == "completed",
+            )
+            .order_by(JobSlide.completed_at.desc())
+            .all()
+        )
+
+        if not completed:
+            continue
+
+        matching.append({
+            "slide_hash": slide.slide_hash,
+            "accession_number": parsed.accession,
+            "block_id": slide.block_id,
+            "stain_type": slide.stain_type,
+            "year": slide.case.year if slide.case else None,
+            "results": [
+                {
+                    "job_id": js.job_id,
+                    "job_slide_id": js.id,
+                    "analysis_name": js.job.model_name,
+                    "version": js.job.model_version or "",
+                    "status": js.status,
+                    "completed_at": js.completed_at.isoformat() if js.completed_at else None,
+                    "output_path": js.local_output_path or js.remote_output_path,
+                }
+                for js in completed
+            ],
+        })
+
+    return {"query": q, "count": len(matching), "results": matching}
+
+
+@app.get("/slides/{slide_hash}/results")
+def get_slide_results(slide_hash: str, db: Session = Depends(get_db)):
+    """List completed analysis results for a slide."""
+    slide = db.query(Slide).filter_by(slide_hash=slide_hash).first()
+    if not slide:
+        raise HTTPException(status_code=404, detail="Slide not found")
+
+    completed_job_slides = (
+        db.query(JobSlide)
+        .join(AnalysisJob)
+        .filter(
+            JobSlide.slide_id == slide.id,
+            JobSlide.status == "completed",
+        )
+        .order_by(JobSlide.completed_at.desc())
+        .all()
+    )
+
+    return [
+        {
+            "job_id": js.job_id,
+            "job_slide_id": js.id,
+            "analysis_name": js.job.model_name,
+            "version": js.job.model_version or "",
+            "status": js.status,
+            "completed_at": js.completed_at.isoformat() if js.completed_at else None,
+            "output_path": js.local_output_path or js.remote_output_path,
+        }
+        for js in completed_job_slides
+    ]
+
+
+@app.get("/results/{job_id}/files")
+def list_result_files(
+    job_id: int,
+    slide_hash: Optional[str] = Query(None, description="Slide hash to get per-slide output"),
+    db: Session = Depends(get_db),
+):
+    """List output files for a completed job. Use slide_hash for per-slide results."""
+    job = db.query(AnalysisJob).options(
+        joinedload(AnalysisJob.slides).joinedload(JobSlide.slide)
+    ).filter_by(id=job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Determine output directory (prefer local path if available)
+    output_dir = None
+    if slide_hash:
+        js = next((js for js in job.slides if js.slide and js.slide.slide_hash == slide_hash), None)
+        if js:
+            if js.local_output_path:
+                output_dir = Path(js.local_output_path)
+            elif js.remote_output_path:
+                output_dir = Path(js.remote_output_path)
+    elif job.output_path:
+        output_dir = Path(job.output_path)
+
+    if not output_dir or not output_dir.exists():
+        return []
+
+    IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".svg"}
+
+    files = []
+    for f in sorted(output_dir.iterdir()):
+        if f.is_file():
+            files.append({
+                "name": f.name,
+                "size": f.stat().st_size,
+                "is_image": f.suffix.lower() in IMAGE_EXTS,
+            })
+
+    return files
+
+
+from fastapi.responses import FileResponse
+
+
+@app.get("/results/{job_id}/file/{filename}")
+def get_result_file(
+    job_id: int,
+    filename: str,
+    slide_hash: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    """Serve a single result file for download or preview."""
+    job = db.query(AnalysisJob).options(
+        joinedload(AnalysisJob.slides).joinedload(JobSlide.slide)
+    ).filter_by(id=job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Determine output directory (prefer local path if available)
+    output_dir = None
+    if slide_hash:
+        js = next((js for js in job.slides if js.slide and js.slide.slide_hash == slide_hash), None)
+        if js:
+            if js.local_output_path:
+                output_dir = Path(js.local_output_path)
+            elif js.remote_output_path:
+                output_dir = Path(js.remote_output_path)
+    elif job.output_path:
+        output_dir = Path(job.output_path)
+
+    if not output_dir:
+        raise HTTPException(status_code=404, detail="No output path for this job")
+
+    # Prevent path traversal
+    safe_name = Path(filename).name
+    file_path = output_dir / safe_name
+
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    return FileResponse(str(file_path), filename=safe_name)
 
 
 # ============================================================

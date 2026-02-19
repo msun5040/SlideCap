@@ -694,12 +694,13 @@ export function SlideLibrary() {
               <TableHead>Year</TableHead>
               <TableHead>Status</TableHead>
               <TableHead>Tags</TableHead>
+              <TableHead>Analyses</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {filteredSlides.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={8} className="h-24 text-center">
+                <TableCell colSpan={9} className="h-24 text-center">
                   {slides.length === 0
                     ? 'Search for slides to get started.'
                     : 'No slides found matching your criteria.'}
@@ -792,6 +793,28 @@ export function SlideLibrary() {
                       )}
                     </div>
                   </TableCell>
+                  <TableCell>
+                    <div className="flex items-center gap-1 flex-wrap">
+                      {slide.completed_analyses && slide.completed_analyses.length > 0 ? (
+                        slide.completed_analyses.map((name: string) => (
+                          <Badge
+                            key={name}
+                            variant="secondary"
+                            className="text-xs"
+                            style={{
+                              backgroundColor: '#3B82F620',
+                              color: '#3B82F6',
+                              borderColor: '#3B82F6',
+                            }}
+                          >
+                            {name}
+                          </Badge>
+                        ))
+                      ) : (
+                        <span className="text-xs text-muted-foreground">-</span>
+                      )}
+                    </div>
+                  </TableCell>
                 </TableRow>
               ))
             )}
@@ -871,6 +894,26 @@ export function SlideLibrary() {
                   <div className="flex flex-wrap gap-2 mt-1">
                     {selectedSlide.slide_tags.map((tag: string) => (
                       <Badge key={tag} variant="secondary">{tag}</Badge>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {selectedSlide.completed_analyses && selectedSlide.completed_analyses.length > 0 && (
+                <div className="col-span-2">
+                  <label className="text-sm text-muted-foreground">Completed Analyses</label>
+                  <div className="flex flex-wrap gap-2 mt-1">
+                    {selectedSlide.completed_analyses.map((name: string) => (
+                      <Badge
+                        key={name}
+                        variant="secondary"
+                        style={{
+                          backgroundColor: '#3B82F620',
+                          color: '#3B82F6',
+                          borderColor: '#3B82F6',
+                        }}
+                      >
+                        {name}
+                      </Badge>
                     ))}
                   </div>
                 </div>
