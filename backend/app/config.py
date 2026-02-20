@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     CLUSTER_PORT: int = 22
 
     @property
+    def slides_path(self) -> Path:
+        return Path(self.NETWORK_ROOT) / "slides"
+
+    @property
     def analyses_path(self) -> Path:
         return Path(self.NETWORK_ROOT) / "analyses"
 

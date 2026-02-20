@@ -22,6 +22,10 @@ def fix_geometry(geojson_bytes: bytes) -> bytes:
     """Parse GeoJSON, fix any invalid geometries, return corrected GeoJSON bytes."""
     data = json.loads(geojson_bytes)
 
+    # If data is a list (array of features/geometries), wrap or skip geometry fixing
+    if isinstance(data, list):
+        return json.dumps(data).encode("utf-8")
+
     if data.get("type") == "FeatureCollection":
         for feature in data.get("features", []):
             geom = feature.get("geometry")

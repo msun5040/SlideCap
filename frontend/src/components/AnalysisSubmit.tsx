@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react'
-import { Search, Send, Users, AlertTriangle } from 'lucide-react'
+import { useState, useEffect, useRef } from 'react'
+import { Search, Send, Users, AlertTriangle, Loader2, CheckCircle, XCircle } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
@@ -11,7 +11,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import type { Analysis, Cohort, Slide, GpuInfo } from '@/types/slide'
+import type { Analysis, AnalysisJob, Cohort, Slide, GpuInfo } from '@/types/slide'
 
 const API_BASE = 'http://localhost:8000'
 
@@ -42,10 +42,43 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [submitResult, setSubmitResult] = useState<{ success: boolean; message: string } | null>(null)
 
+  // Progress tracking
+  const [trackedJobId, setTrackedJobId] = useState<number | null>(null)
+  const [trackedJob, setTrackedJob] = useState<AnalysisJob | null>(null)
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
   useEffect(() => {
     fetchCohorts()
     fetchAnalyses()
   }, [])
+
+  // Poll job progress
+  useEffect(() => {
+    if (!trackedJobId) return
+    const poll = async () => {
+      try {
+        // Trigger backend to refresh statuses from cluster before fetching
+        await fetch(`${API_BASE}/jobs/refresh`, { method: 'POST' }).catch(() => {})
+        const res = await fetch(`${API_BASE}/jobs/${trackedJobId}`)
+        if (res.ok) {
+          const data: AnalysisJob = await res.json()
+          setTrackedJob(data)
+          if (data.status === 'completed' || data.status === 'failed') {
+            if (pollRef.current) clearInterval(pollRef.current)
+            pollRef.current = null
+          }
+        }
+      } catch (e) {
+        console.error('Poll failed:', e)
+      }
+    }
+    poll()
+    pollRef.current = setInterval(poll, 10000)
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current)
+      pollRef.current = null
+    }
+  }, [trackedJobId])
 
   // Fetch GPUs when entering step 2 and connected
   useEffect(() => {
@@ -148,11 +181,12 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
         const jobMsg = data.job_id != null ? `Job #${data.job_id}` : 'Job'
         setSubmitResult({
           success: true,
-          message: `${jobMsg} created with ${slidesMsg}${errMsg}`,
+          message: `${jobMsg} submitted with ${slidesMsg}${errMsg}. Transferring slides...`,
         })
-        setStep(1)
-        setSelectedHashes(new Set())
-        setSelectedCohortId(null)
+        if (data.job_id) {
+          setTrackedJobId(data.job_id)
+          setTrackedJob(null)
+        }
       } else {
         const err = await res.json()
         setSubmitResult({ success: false, message: err.detail || 'Submission failed' })
@@ -189,6 +223,89 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
           <button onClick={() => setSubmitResult(null)} className="ml-2 underline">
             Dismiss
           </button>
+        </div>
+      )}
+
+      {/* Job progress tracker */}
+      {trackedJob && (
+        <div className="rounded-lg border p-4 space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              {(trackedJob.status === 'pending' || trackedJob.status === 'transferring' || trackedJob.status === 'running') ? (
+                <Loader2 className="h-4 w-4 animate-spin text-blue-600" />
+              ) : trackedJob.status === 'completed' ? (
+                <CheckCircle className="h-4 w-4 text-green-600" />
+              ) : (
+                <XCircle className="h-4 w-4 text-red-600" />
+              )}
+              <span className="text-sm font-medium">
+                Job #{trackedJob.id} — {trackedJob.status === 'transferring' ? 'Transferring slides' : trackedJob.status === 'running' ? 'Running analysis' : trackedJob.status}
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-muted-foreground">
+                {trackedJob.completed_count + trackedJob.failed_count} / {trackedJob.slide_count} done
+              </span>
+              {(trackedJob.status === 'completed' || trackedJob.status === 'failed') && (
+                <Button variant="ghost" size="sm" onClick={() => { setTrackedJobId(null); setTrackedJob(null) }}>
+                  Dismiss
+                </Button>
+              )}
+            </div>
+          </div>
+
+          {/* Overall progress bar */}
+          <div className="h-3 bg-gray-200 rounded-full overflow-hidden">
+            <div className="h-full flex transition-all duration-500">
+              {trackedJob.completed_count > 0 && (
+                <div
+                  className="bg-green-500 h-full"
+                  style={{ width: `${(trackedJob.completed_count / trackedJob.slide_count) * 100}%` }}
+                />
+              )}
+              {trackedJob.failed_count > 0 && (
+                <div
+                  className="bg-red-500 h-full"
+                  style={{ width: `${(trackedJob.failed_count / trackedJob.slide_count) * 100}%` }}
+                />
+              )}
+              {trackedJob.status === 'transferring' && (
+                <div
+                  className="bg-purple-400 h-full animate-pulse"
+                  style={{ width: `${Math.max(5, ((trackedJob.slide_count - trackedJob.completed_count - trackedJob.failed_count) / trackedJob.slide_count) * 20)}%` }}
+                />
+              )}
+              {trackedJob.status === 'running' && trackedJob.completed_count === 0 && trackedJob.failed_count === 0 && (
+                <div className="bg-blue-400 h-full animate-pulse" style={{ width: '10%' }} />
+              )}
+            </div>
+          </div>
+
+          {/* Per-slide breakdown */}
+          {trackedJob.slides && trackedJob.slides.length > 0 && (
+            <div className="grid gap-1 max-h-[200px] overflow-auto">
+              {trackedJob.slides.map((s) => (
+                <div key={s.id} className="flex items-center gap-2 text-xs">
+                  <span className="font-mono w-28 truncate">{s.slide_hash ? s.slide_hash.slice(0, 12) + '...' : '-'}</span>
+                  <Badge
+                    variant="outline"
+                    className={`text-[10px] px-1.5 py-0 ${
+                      s.status === 'completed' ? 'bg-green-500/10 text-green-700' :
+                      s.status === 'failed' ? 'bg-red-500/10 text-red-700' :
+                      s.status === 'transferring' ? 'bg-purple-500/10 text-purple-700' :
+                      s.status === 'running' ? 'bg-blue-500/10 text-blue-700' :
+                      'bg-gray-500/10 text-gray-600'
+                    }`}
+                  >
+                    {s.status}
+                  </Badge>
+                  {s.error_message && (
+                    <span className="text-red-600 truncate">{s.error_message}</span>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
 

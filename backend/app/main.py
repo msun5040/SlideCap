@@ -49,7 +49,12 @@ async def lifespan(app: FastAPI):
         print("Please update NETWORK_ROOT in config.py or set via environment variable")
         raise RuntimeError(f"Network root not found: {settings.NETWORK_ROOT}")
 
+    if not settings.slides_path.exists():
+        print(f"Creating slides directory: {settings.slides_path}")
+        settings.slides_path.mkdir(parents=True, exist_ok=True)
+
     print(f"Network root: {settings.NETWORK_ROOT}")
+    print(f"Slides path: {settings.slides_path}")
     print(f"Database: {settings.db_path}")
 
     # Initialize database lock for multi-user safety
@@ -64,9 +69,9 @@ async def lifespan(app: FastAPI):
     print("Initializing hasher...")
     hasher = SlideHasher(settings.salt_path)
 
-    # Initialize indexer (no longer takes db_session)
+    # Initialize indexer (scans slides/ subdirectory for year folders)
     print("Initializing indexer...")
-    indexer = SlideIndexer(hasher, settings.NETWORK_ROOT)
+    indexer = SlideIndexer(hasher, str(settings.slides_path))
 
     # Build path cache for fast lookups
     print("Building path cache...")
@@ -96,7 +101,7 @@ async def lifespan(app: FastAPI):
         port=settings.CLUSTER_PORT,
     )
     job_poller = JobStatusPoller(
-        cluster_service, interval=30,
+        cluster_service, interval=15,
         indexer=indexer, analyses_path=settings.analyses_path,
     )
     job_poller.start()
@@ -1867,7 +1872,12 @@ class JobCancelRequest(BaseModel):
 
 @app.post("/jobs/submit")
 def submit_jobs(data: JobSubmitRequest, db: Session = Depends(get_db)):
-    """Submit a multi-slide analysis job. Creates one parent job with N child JobSlides."""
+    """
+    Submit a multi-slide analysis job.
+
+    Creates DB records immediately (pending), then spawns a background thread
+    to do rsync + tmux start. This avoids holding the DB lock during long transfers.
+    """
     if not cluster_service or not cluster_service.is_connected:
         raise HTTPException(status_code=503, detail="Not connected to cluster. Connect first via /cluster/connect")
 
@@ -1882,7 +1892,19 @@ def submit_jobs(data: JobSubmitRequest, db: Session = Depends(get_db)):
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON in parameters")
 
-    # Create ONE parent job
+    # Snapshot analysis config for the background thread (detached from session)
+    analysis_snapshot = {
+        "id": analysis.id,
+        "name": analysis.name,
+        "version": analysis.version,
+        "script_path": analysis.script_path,
+        "working_directory": analysis.working_directory,
+        "env_setup": analysis.env_setup,
+        "command_template": analysis.command_template,
+        "gpu_required": analysis.gpu_required,
+    }
+
+    # --- Phase 1: Create all DB records and commit (fast, releases DB) ---
     job = AnalysisJob(
         analysis_id=analysis.id,
         model_name=analysis.name,
@@ -1900,6 +1922,10 @@ def submit_jobs(data: JobSubmitRequest, db: Session = Depends(get_db)):
 
     errors = []
     slides_created = 0
+    old_records_cleaned = 0
+
+    # List of (job_slide_id, slide_hash, local_path, remote_wsi_path, remote_out) for bg thread
+    slides_to_process: list[tuple[int, str, str, str, str]] = []
 
     for slide_hash in data.slide_hashes:
         slide = db.query(Slide).filter_by(slide_hash=slide_hash).first()
@@ -1912,7 +1938,29 @@ def submit_jobs(data: JobSubmitRequest, db: Session = Depends(get_db)):
             errors.append(f"No filepath for {slide_hash[:12]}")
             continue
 
-        remote_wsi_path = f"{data.remote_wsi_dir}/{slide_path.name}"
+        # Clean up old completed/failed JobSlide records for same analysis
+        old_job_slides = (
+            db.query(JobSlide)
+            .join(AnalysisJob)
+            .filter(
+                JobSlide.slide_id == slide.id,
+                AnalysisJob.analysis_id == analysis.id,
+                JobSlide.status.in_(["completed", "failed"]),
+            )
+            .all()
+        )
+        for old_js in old_job_slides:
+            db.delete(old_js)
+            old_records_cleaned += 1
+            remaining = db.query(JobSlide).filter(
+                JobSlide.job_id == old_js.job_id, JobSlide.id != old_js.id
+            ).count()
+            if remaining == 0:
+                old_job = db.query(AnalysisJob).filter_by(id=old_js.job_id).first()
+                if old_job:
+                    db.delete(old_job)
+
+        remote_wsi_path = f"{data.remote_wsi_dir}/{slide.slide_hash}/{slide_path.name}"
         remote_out = f"{data.remote_output_dir}/{slide.slide_hash}/{analysis.name}_v{analysis.version}"
 
         job_slide = JobSlide(
@@ -1920,47 +1968,136 @@ def submit_jobs(data: JobSubmitRequest, db: Session = Depends(get_db)):
             slide_id=slide.id,
             remote_wsi_path=remote_wsi_path,
             remote_output_path=remote_out,
-            status="transferring",
+            status="pending",
         )
         db.add(job_slide)
         db.flush()
 
-        try:
-            if not slide_path.exists():
-                raise FileNotFoundError(f"Local slide file not found: {slide_path}")
-
-            print(f"[Job {job.id}/Slide {job_slide.id}] Rsyncing {slide_path} ({slide_path.stat().st_size / 1e6:.0f} MB) -> {data.remote_wsi_dir}/")
-            cluster_service.rsync_slide(slide_path, data.remote_wsi_dir)
-            print(f"[Job {job.id}/Slide {job_slide.id}] Rsync complete, starting tmux job...")
-
-            session_name = cluster_service.start_job(
-                analysis=analysis,
-                slide_hash=slide_hash,
-                remote_wsi_path=remote_wsi_path,
-                remote_output_dir=remote_out,
-                gpu_index=data.gpu_index,
-                parameters=params,
-            )
-            job_slide.cluster_job_id = session_name
-            job_slide.status = "running"
-            job_slide.started_at = datetime.utcnow()
-            print(f"[Job {job.id}/Slide {job_slide.id}] Started tmux session: {session_name}")
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            job_slide.status = "failed"
-            job_slide.error_message = f"Submission failed: {e}"
-            errors.append(f"Submit failed for {slide_hash[:12]}: {e}")
-
+        slides_to_process.append((job_slide.id, slide_hash, str(slide_path), remote_wsi_path, remote_out))
         slides_created += 1
 
-    # Compute parent job status from children
-    _recompute_job_status(job)
-    db.commit()
+    db.commit()  # Commit and release DB immediately
+
+    # --- Phase 2: Background thread for rsync + tmux start ---
+    job_id = job.id
+    gpu_index = data.gpu_index
+    remote_wsi_dir = data.remote_wsi_dir
+
+    def _run_submissions():
+        # --- Phase A: Transfer ALL slides first ---
+        transfer_ok: list[tuple[int, str, str, str]] = []  # (js_id, slide_hash, remote_wsi_path, remote_out)
+
+        for i, (js_id, slide_hash, local_path_str, remote_wsi_path, remote_out) in enumerate(slides_to_process):
+            bg_db = get_session()
+            try:
+                js = bg_db.query(JobSlide).filter_by(id=js_id).first()
+                if not js:
+                    continue
+
+                local_path = Path(local_path_str)
+                if not local_path.exists():
+                    js.status = "failed"
+                    js.error_message = f"Local file not found: {local_path}"
+                    bg_db.commit()
+                    continue
+
+                js.status = "transferring"
+                bg_db.commit()
+
+                # rsync to per-slide subdirectory so CellViT only sees this one slide
+                per_slide_wsi_dir = str(Path(remote_wsi_path).parent)
+                print(f"[Job {job_id}/Transfer {i+1}/{len(slides_to_process)}] Rsyncing {local_path.name} ({local_path.stat().st_size / 1e6:.0f} MB)")
+                cluster_service.rsync_slide(local_path, per_slide_wsi_dir)
+                print(f"[Job {job_id}/Transfer {i+1}/{len(slides_to_process)}] Done: {local_path.name}")
+                transfer_ok.append((js_id, slide_hash, remote_wsi_path, remote_out))
+
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                try:
+                    js = bg_db.query(JobSlide).filter_by(id=js_id).first()
+                    if js:
+                        js.status = "failed"
+                        js.error_message = f"Transfer failed: {e}"
+                        bg_db.commit()
+                except Exception:
+                    bg_db.rollback()
+            finally:
+                bg_db.close()
+
+        def _recompute_and_commit():
+            _db = get_session()
+            try:
+                parent = _db.query(AnalysisJob).options(
+                    joinedload(AnalysisJob.slides)
+                ).filter_by(id=job_id).first()
+                if parent:
+                    _recompute_job_status(parent)
+                    _db.commit()
+            except Exception:
+                _db.rollback()
+            finally:
+                _db.close()
+
+        if not transfer_ok:
+            print(f"[Job {job_id}] All transfers failed.")
+            _recompute_and_commit()
+            return
+
+        print(f"[Job {job_id}] All transfers complete ({len(transfer_ok)}/{len(slides_to_process)}). Starting analysis...")
+
+        # --- Phase B: Start all jobs (now that all slides are on the cluster) ---
+        for js_id, slide_hash, remote_wsi_path, remote_out in transfer_ok:
+            bg_db = get_session()
+            try:
+                js = bg_db.query(JobSlide).filter_by(id=js_id).first()
+                if not js:
+                    continue
+
+                _analysis = bg_db.query(Analysis).filter_by(id=analysis_snapshot["id"]).first()
+                if not _analysis:
+                    js.status = "failed"
+                    js.error_message = "Analysis not found"
+                    bg_db.commit()
+                    continue
+
+                session_name = cluster_service.start_job(
+                    analysis=_analysis,
+                    slide_hash=slide_hash,
+                    remote_wsi_path=remote_wsi_path,
+                    remote_output_dir=remote_out,
+                    gpu_index=gpu_index,
+                    parameters=params,
+                )
+                js.cluster_job_id = session_name
+                js.status = "running"
+                js.started_at = datetime.utcnow()
+                bg_db.commit()
+                print(f"[Job {job_id}/Slide {js_id}] Started tmux session: {session_name}")
+
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                try:
+                    js = bg_db.query(JobSlide).filter_by(id=js_id).first()
+                    if js:
+                        js.status = "failed"
+                        js.error_message = f"Job start failed: {e}"
+                        bg_db.commit()
+                except Exception:
+                    bg_db.rollback()
+            finally:
+                bg_db.close()
+
+        _recompute_and_commit()
+
+    t = threading.Thread(target=_run_submissions, daemon=True)
+    t.start()
 
     return {
-        "job_id": job.id,
+        "job_id": job_id,
         "slides_created": slides_created,
+        "old_records_cleaned": old_records_cleaned,
         "errors": errors,
         "cluster_connected": cluster_service.is_connected,
     }
@@ -2184,6 +2321,59 @@ def cancel_jobs(data: JobCancelRequest, db: Session = Depends(get_db)):
     return {"cancelled": cancelled, "errors": errors}
 
 
+@app.delete("/jobs/{job_id}")
+def delete_job(job_id: int, db: Session = Depends(get_db)):
+    """Hard-delete a job and all its JobSlide records from the database."""
+    job = db.query(AnalysisJob).options(
+        joinedload(AnalysisJob.slides)
+    ).filter_by(id=job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.status in ("running", "transferring"):
+        raise HTTPException(status_code=400, detail="Cannot delete a running job. Cancel it first.")
+
+    with get_lock().write_lock():
+        # Delete child JobSlides first (cascade should handle this, but be explicit)
+        for js in job.slides:
+            db.delete(js)
+        db.delete(job)
+        db.commit()
+
+    return {"status": "ok", "deleted_job_id": job_id}
+
+
+class JobDeleteBulkRequest(BaseModel):
+    job_ids: List[int]
+
+
+@app.post("/jobs/delete-bulk")
+def delete_jobs_bulk(data: JobDeleteBulkRequest, db: Session = Depends(get_db)):
+    """Hard-delete multiple jobs and their JobSlide records."""
+    deleted = 0
+    errors = []
+
+    with get_lock().write_lock():
+        for job_id in data.job_ids:
+            job = db.query(AnalysisJob).options(
+                joinedload(AnalysisJob.slides)
+            ).filter_by(id=job_id).first()
+            if not job:
+                errors.append(f"Job {job_id} not found")
+                continue
+            if job.status in ("running", "transferring"):
+                errors.append(f"Job {job_id} is still {job.status}")
+                continue
+            for js in job.slides:
+                db.delete(js)
+            db.delete(job)
+            deleted += 1
+
+        db.commit()
+
+    return {"deleted": deleted, "errors": errors}
+
+
 @app.post("/jobs/refresh")
 def refresh_job_statuses():
     """Trigger an immediate job status refresh from the cluster."""
@@ -2194,6 +2384,44 @@ def refresh_job_statuses():
 
     job_poller.poll_now()
     return {"status": "ok", "message": "Status refresh triggered"}
+
+
+@app.post("/jobs/{job_id}/transfer-results")
+def transfer_job_results(job_id: int, db: Session = Depends(get_db)):
+    """Manually trigger result transfer from cluster for completed slides in a job."""
+    if not job_poller:
+        raise HTTPException(status_code=503, detail="Job poller not running")
+    if not cluster_service or not cluster_service.is_connected:
+        raise HTTPException(status_code=503, detail="Not connected to cluster")
+
+    job = db.query(AnalysisJob).options(
+        joinedload(AnalysisJob.slides).joinedload(JobSlide.slide)
+    ).filter_by(id=job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    transferred = 0
+    errors = []
+    for js in job.slides:
+        if js.status != "completed":
+            continue
+        if js.local_output_path:
+            local_dir = Path(js.local_output_path)
+            if local_dir.exists() and any(local_dir.iterdir()):
+                # Already transferred and files exist
+                continue
+        try:
+            local_path = job_poller._transfer_results(js)
+            if local_path:
+                js.local_output_path = local_path
+                transferred += 1
+            else:
+                errors.append(f"Slide {js.id}: transfer returned None")
+        except Exception as e:
+            errors.append(f"Slide {js.id}: {e}")
+
+    db.commit()
+    return {"transferred": transferred, "errors": errors}
 
 
 # ============================================================
@@ -2448,6 +2676,31 @@ def list_result_files(
 
 from fastapi.responses import FileResponse
 
+import snappy as snappy_module
+import sys as _sys
+_scripts_dir = str(Path(__file__).resolve().parent.parent / "scripts")
+if _scripts_dir not in _sys.path:
+    _sys.path.insert(0, _scripts_dir)
+from postprocess_cellvit import fix_geometry
+
+
+def _decompress_snappy_file(file_path: Path) -> tuple[bytes, str]:
+    """Decompress a .snappy file and optionally fix geometries.
+    Returns (content_bytes, download_filename)."""
+    compressed = file_path.read_bytes()
+    raw = snappy_module.decompress(compressed)
+    download_name = file_path.name
+
+    if file_path.name.endswith(".geojson.snappy"):
+        # Decompress + fix geometry
+        raw = fix_geometry(raw)
+        download_name = file_path.name.removesuffix(".snappy")
+    elif file_path.name.endswith(".snappy"):
+        # Decompress only (e.g. .json.snappy)
+        download_name = file_path.name.removesuffix(".snappy")
+
+    return raw, download_name
+
 
 @app.get("/results/{job_id}/file/{filename}")
 def get_result_file(
@@ -2456,7 +2709,7 @@ def get_result_file(
     slide_hash: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
-    """Serve a single result file for download or preview."""
+    """Serve a single result file for download or preview. Decompresses .snappy on-the-fly."""
     job = db.query(AnalysisJob).options(
         joinedload(AnalysisJob.slides).joinedload(JobSlide.slide)
     ).filter_by(id=job_id).first()
@@ -2485,7 +2738,175 @@ def get_result_file(
     if not file_path.exists() or not file_path.is_file():
         raise HTTPException(status_code=404, detail="File not found")
 
+    # Decompress .snappy files on-the-fly
+    if safe_name.endswith(".snappy"):
+        content, download_name = _decompress_snappy_file(file_path)
+        media_type = "application/geo+json" if download_name.endswith(".geojson") else "application/octet-stream"
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
+        )
+
     return FileResponse(str(file_path), filename=safe_name)
+
+
+def _resolve_job_slide_output(js) -> Optional[Path]:
+    """Get the output directory for a JobSlide, if it exists locally."""
+    for attr in ("local_output_path", "remote_output_path"):
+        val = getattr(js, attr, None)
+        if val:
+            p = Path(val)
+            if p.is_dir():
+                return p
+    return None
+
+
+def _add_files_to_zip(zf: zipfile.ZipFile, output_dir: Path, arc_prefix: str):
+    """Add all files from output_dir to the ZIP, decompressing .snappy on-the-fly."""
+    for f in sorted(output_dir.iterdir()):
+        if not f.is_file():
+            continue
+        if f.name.endswith(".snappy"):
+            content, download_name = _decompress_snappy_file(f)
+            zf.writestr(f"{arc_prefix}/{download_name}", content)
+        else:
+            zf.write(str(f), f"{arc_prefix}/{f.name}")
+
+
+@app.get("/jobs/{job_id}/download-zip")
+def download_job_zip(job_id: int, db: Session = Depends(get_db)):
+    """Stream a ZIP of all completed slides' output files for a job, decompressing .snappy."""
+    job = db.query(AnalysisJob).options(
+        joinedload(AnalysisJob.slides).joinedload(JobSlide.slide)
+    ).filter_by(id=job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Collect slides with local output
+    slides_with_output: list[tuple[str, Path]] = []
+    for js in job.slides:
+        output_dir = _resolve_job_slide_output(js)
+        if output_dir and js.slide:
+            slides_with_output.append((js.slide.slide_hash, output_dir))
+
+    if not slides_with_output:
+        raise HTTPException(status_code=404, detail="No local output files available")
+
+    def generate():
+        q: queue.Queue = queue.Queue(maxsize=32)
+
+        def writer():
+            try:
+                stream = _ZipStreamWriter(q)
+                with zipfile.ZipFile(stream, 'w', zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+                    for slide_hash, output_dir in slides_with_output:
+                        _add_files_to_zip(zf, output_dir, slide_hash[:12])
+                stream.flush()
+            except Exception as e:
+                print(f"Job ZIP export error: {e}")
+            finally:
+                q.put(None)
+
+        t = threading.Thread(target=writer, daemon=True)
+        t.start()
+        while True:
+            chunk = q.get()
+            if chunk is None:
+                break
+            yield chunk
+        t.join(timeout=5)
+
+    return StreamingResponse(
+        generate(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="job_{job_id}_results.zip"',
+        },
+    )
+
+
+class CartItem(BaseModel):
+    job_id: int
+    slide_hash: str
+    filename: str
+
+
+class CartDownloadRequest(BaseModel):
+    items: List[CartItem]
+
+
+@app.post("/results/download-cart")
+def download_cart(data: CartDownloadRequest, db: Session = Depends(get_db)):
+    """Stream a ZIP of selected files from the download cart, decompressing .snappy."""
+    if not data.items:
+        raise HTTPException(status_code=400, detail="Cart is empty")
+
+    # Resolve each item to a file path
+    resolved: list[tuple[Path, str]] = []  # (file_path, arcname)
+    for item in data.items:
+        job = db.query(AnalysisJob).options(
+            joinedload(AnalysisJob.slides).joinedload(JobSlide.slide)
+        ).filter_by(id=item.job_id).first()
+        if not job:
+            continue
+
+        js = next((js for js in job.slides if js.slide and js.slide.slide_hash == item.slide_hash), None)
+        if not js:
+            continue
+
+        output_dir = _resolve_job_slide_output(js)
+        if not output_dir:
+            continue
+
+        safe_name = Path(item.filename).name
+        file_path = output_dir / safe_name
+        if not file_path.exists() or not file_path.is_file():
+            continue
+
+        arc_prefix = item.slide_hash[:12]
+        resolved.append((file_path, f"{arc_prefix}/{safe_name}"))
+
+    if not resolved:
+        raise HTTPException(status_code=404, detail="No files found for the selected items")
+
+    def generate():
+        q: queue.Queue = queue.Queue(maxsize=32)
+
+        def writer():
+            try:
+                stream = _ZipStreamWriter(q)
+                with zipfile.ZipFile(stream, 'w', zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+                    for file_path, arcname in resolved:
+                        if file_path.name.endswith(".snappy"):
+                            content, download_name = _decompress_snappy_file(file_path)
+                            # Replace the .snappy arcname with decompressed name
+                            arc_dir = str(Path(arcname).parent)
+                            zf.writestr(f"{arc_dir}/{download_name}", content)
+                        else:
+                            zf.write(str(file_path), arcname)
+                stream.flush()
+            except Exception as e:
+                print(f"Cart ZIP export error: {e}")
+            finally:
+                q.put(None)
+
+        t = threading.Thread(target=writer, daemon=True)
+        t.start()
+        while True:
+            chunk = q.get()
+            if chunk is None:
+                break
+            yield chunk
+        t.join(timeout=5)
+
+    return StreamingResponse(
+        generate(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": 'attachment; filename="selected_results.zip"',
+        },
+    )
 
 
 # ============================================================

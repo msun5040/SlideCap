@@ -423,6 +423,47 @@ def _migrate_analysis_jobs(engine):
     except Exception as e:
         print(f"[DB Migration] Skipping analysis_jobs migration: {e}")
 
+    # Fix legacy slide_id NOT NULL constraint on analysis_jobs
+    # The column was migrated to job_slides but SQLite can't ALTER COLUMN,
+    # so we recreate the table if slide_id still has NOT NULL.
+    try:
+        if insp.has_table('analysis_jobs'):
+            with engine.connect() as conn:
+                table_info = conn.execute(text("PRAGMA table_info(analysis_jobs)")).fetchall()
+                slide_id_col = next((c for c in table_info if c[1] == 'slide_id'), None)
+                # PRAGMA table_info returns: (cid, name, type, notnull, dflt_value, pk)
+                if slide_id_col and slide_id_col[3]:  # notnull == 1
+                    print("[DB Migration] Removing NOT NULL constraint from analysis_jobs.slide_id")
+                    col_names = [c[1] for c in table_info]
+                    col_names_str = ', '.join(col_names)
+
+                    # Build column definitions with slide_id as nullable
+                    col_defs = []
+                    for c in table_info:
+                        cid, name, ctype, notnull, dflt, pk = c
+                        if pk:
+                            col_defs.append(f"{name} INTEGER PRIMARY KEY")
+                        elif name == 'slide_id':
+                            col_defs.append(f"{name} INTEGER")  # drop NOT NULL
+                        else:
+                            parts = [name, ctype or 'TEXT']
+                            if notnull:
+                                parts.append("NOT NULL")
+                            if dflt is not None:
+                                parts.append(f"DEFAULT {dflt}")
+                            col_defs.append(' '.join(parts))
+
+                    conn.execute(text("PRAGMA foreign_keys=OFF"))
+                    conn.execute(text(f"CREATE TABLE analysis_jobs_new ({', '.join(col_defs)})"))
+                    conn.execute(text(f"INSERT INTO analysis_jobs_new ({col_names_str}) SELECT {col_names_str} FROM analysis_jobs"))
+                    conn.execute(text("DROP TABLE analysis_jobs"))
+                    conn.execute(text("ALTER TABLE analysis_jobs_new RENAME TO analysis_jobs"))
+                    conn.execute(text("PRAGMA foreign_keys=ON"))
+                    conn.commit()
+                    print("[DB Migration] analysis_jobs.slide_id is now nullable")
+    except Exception as e:
+        print(f"[DB Migration] Skipping slide_id constraint fix: {e}")
+
     # Migrate analyses table (container_image → script-based fields)
     try:
         if insp.has_table('analyses'):

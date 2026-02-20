@@ -259,6 +259,8 @@ class ClusterService:
 
         if analysis.gpu_required:
             parts.append(f"export CUDA_VISIBLE_DEVICES={gpu_index}")
+        # Clean old output (handles reruns where resume scripts would skip)
+        parts.append(f"rm -rf {remote_output_dir}")
         parts.append(f"mkdir -p {remote_output_dir}")
         parts.append(f"{command} 2>&1 | tee {remote_output_dir}/run.log")
 
@@ -430,54 +432,78 @@ class JobStatusPoller:
 
     def _transfer_results(self, js: JobSlide) -> Optional[str]:
         """Rsync results from cluster back to network drive for a completed slide."""
-        if not self.indexer or not self.analyses_path or not js.remote_output_path:
+        if not self.analyses_path:
+            print(f"[Transfer] No analyses_path configured")
+            return None
+        if not js.remote_output_path:
+            print(f"[Transfer] JobSlide {js.id} has no remote_output_path")
             return None
 
         slide = js.slide
         if not slide:
+            print(f"[Transfer] JobSlide {js.id} has no slide relationship loaded")
             return None
 
-        # Get original filename stem for filtering per-slide files
-        filepath = self.indexer.get_filepath(slide.slide_hash)
-        if not filepath:
-            print(f"[Poller] No filepath for slide {slide.slide_hash[:12]}, skipping transfer")
+        if not self.cluster.is_connected:
+            print(f"[Transfer] Cluster not connected")
             return None
 
-        filename_stem = filepath.stem
         analysis_name = js.job.model_name if js.job else "unknown"
         local_dir = self.analyses_path / slide.slide_hash / analysis_name
         local_dir.mkdir(parents=True, exist_ok=True)
 
         remote_path = js.remote_output_path.rstrip("/") + "/"
+        print(f"[Transfer] Slide {slide.slide_hash[:12]}: {remote_path} -> {local_dir}")
 
-        # Rsync per-slide files (matching filename stem) + shared log files
-        if not (shutil.which("sshpass") and shutil.which("rsync")):
-            print(f"[Poller] sshpass/rsync not available, skipping transfer for {slide.slide_hash[:12]}")
-            return None
+        # Try rsync+sshpass first, fall back to paramiko SFTP
+        remote_dir = js.remote_output_path.rstrip("/")
 
+        if shutil.which("sshpass") and shutil.which("rsync"):
+            try:
+                cmd = [
+                    "sshpass", "-p", self.cluster._password,
+                    "rsync", "-avz", "--no-perms",
+                    "-e", f"ssh -p {self.cluster._port} -o StrictHostKeyChecking=no",
+                    f"{self.cluster._username}@{self.cluster._host}:{remote_path}",
+                    str(local_dir) + "/",
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                if result.returncode == 0:
+                    print(f"[Transfer] rsync OK for {slide.slide_hash[:12]} -> {local_dir}")
+                    return str(local_dir)
+                else:
+                    print(f"[Transfer] rsync failed for {slide.slide_hash[:12]}: rc={result.returncode} stderr={result.stderr[:300]}")
+            except Exception as e:
+                print(f"[Transfer] rsync error for {slide.slide_hash[:12]}: {e}")
+
+        # Fallback: paramiko SFTP
+        print(f"[Transfer] Using SFTP fallback for {slide.slide_hash[:12]}")
         try:
-            cmd = [
-                "sshpass", "-p", self.cluster._password,
-                "rsync", "-avz", "--no-perms",
-                "-e", f"ssh -p {self.cluster._port} -o StrictHostKeyChecking=no",
-                "--include", f"{filename_stem}*",
-                "--include", "run.log",
-                "--include", "filelist.csv",
-                "--include", "processed.log",
-                "--include", "progress.log",
-                "--exclude", "*",
-                f"{self.cluster._username}@{self.cluster._host}:{remote_path}",
-                str(local_dir) + "/",
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-            if result.returncode == 0:
-                print(f"[Poller] Transferred results for {slide.slide_hash[:12]} -> {local_dir}")
+            client = self.cluster._get_client()
+            sftp = client.open_sftp()
+            try:
+                remote_files = sftp.listdir(remote_dir)
+                transferred_count = 0
+                for fname in remote_files:
+                    remote_file = f"{remote_dir}/{fname}"
+                    try:
+                        stat = sftp.stat(remote_file)
+                        # Skip directories (mode check: S_ISDIR)
+                        import stat as stat_module
+                        if stat_module.S_ISDIR(stat.st_mode):
+                            continue
+                    except Exception:
+                        continue
+                    local_file = local_dir / fname
+                    print(f"[Transfer]   SFTP get: {fname} ({stat.st_size / 1024:.0f} KB)")
+                    sftp.get(remote_file, str(local_file))
+                    transferred_count += 1
+                print(f"[Transfer] SFTP OK for {slide.slide_hash[:12]}: {transferred_count} files -> {local_dir}")
                 return str(local_dir)
-            else:
-                print(f"[Poller] Rsync failed for {slide.slide_hash[:12]}: {result.stderr[:200]}")
-                return None
+            finally:
+                sftp.close()
         except Exception as e:
-            print(f"[Poller] Transfer error for {slide.slide_hash[:12]}: {e}")
+            print(f"[Transfer] SFTP error for {slide.slide_hash[:12]}: {e}")
             return None
 
     @staticmethod
