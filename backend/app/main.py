@@ -2147,16 +2147,27 @@ def list_jobs(
     db: Session = Depends(get_db),
     status: Optional[str] = Query(None),
     analysis_id: Optional[int] = Query(None),
+    slide_hashes: Optional[str] = Query(None, description="Comma-separated slide hashes to filter jobs containing these slides"),
     limit: int = Query(200, le=1000),
 ):
     """List analysis jobs with slide progress counts."""
-    query = db.query(AnalysisJob).options(joinedload(AnalysisJob.slides))
+    query = db.query(AnalysisJob).options(
+        joinedload(AnalysisJob.slides).joinedload(JobSlide.slide)
+    )
     if status:
         query = query.filter(AnalysisJob.status == status)
     if analysis_id:
         query = query.filter(AnalysisJob.analysis_id == analysis_id)
 
     jobs = query.order_by(AnalysisJob.submitted_at.desc()).limit(limit).all()
+
+    # Filter to only jobs that contain at least one of the requested slides
+    if slide_hashes:
+        wanted = set(h.strip() for h in slide_hashes.split(",") if h.strip())
+        jobs = [
+            j for j in jobs
+            if any(js.slide and js.slide.slide_hash in wanted for js in j.slides)
+        ]
 
     def _job_dict(j):
         slide_count = len(j.slides)
@@ -2905,6 +2916,132 @@ def download_cart(data: CartDownloadRequest, db: Session = Depends(get_db)):
         media_type="application/zip",
         headers={
             "Content-Disposition": 'attachment; filename="selected_results.zip"',
+        },
+    )
+
+
+@app.get("/jobs/{job_id}/output-filenames")
+def get_job_output_filenames(
+    job_id: int,
+    slide_hashes: Optional[str] = Query(None, description="Comma-separated slide hashes to restrict to"),
+    db: Session = Depends(get_db),
+):
+    """Return the unique set of output filenames for specific slides in a job."""
+    job = db.query(AnalysisJob).options(
+        joinedload(AnalysisJob.slides).joinedload(JobSlide.slide)
+    ).filter_by(id=job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    wanted = None
+    if slide_hashes:
+        wanted = set(h.strip() for h in slide_hashes.split(",") if h.strip())
+
+    filenames: set[str] = set()
+    for js in job.slides:
+        if wanted and (not js.slide or js.slide.slide_hash not in wanted):
+            continue
+        output_dir = _resolve_job_slide_output(js)
+        if not output_dir:
+            continue
+        for f in output_dir.iterdir():
+            if f.is_file():
+                filenames.add(f.name)
+
+    return sorted(filenames)
+
+
+class DownloadBundleRequest(BaseModel):
+    slide_hashes: List[str]
+    job_id: int
+    include_filenames: List[str]
+    include_wsi: bool = False
+
+
+@app.post("/download-bundle")
+def download_bundle(data: DownloadBundleRequest, db: Session = Depends(get_db)):
+    """
+    Stream a ZIP with selected output files (decompressed) and optionally the
+    original WSI for each requested slide.
+
+    ZIP structure: {accession_or_hash}/{filename}
+    """
+    job = db.query(AnalysisJob).options(
+        joinedload(AnalysisJob.slides).joinedload(JobSlide.slide).joinedload(Slide.case)
+    ).filter_by(id=data.job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    requested = set(data.slide_hashes)
+    include_set = set(data.include_filenames)
+
+    # Resolve per-slide: (folder_name, output_dir, [wsi_path])
+    items: list[tuple[str, Optional[Path], Optional[Path]]] = []
+    for js in job.slides:
+        if not js.slide or js.slide.slide_hash not in requested:
+            continue
+
+        slide_hash = js.slide.slide_hash
+        output_dir = _resolve_job_slide_output(js)
+
+        # Resolve folder name (accession if possible, else hash prefix)
+        wsi_path = None
+        folder = slide_hash[:12]
+        if indexer:
+            fp = indexer.get_filepath(slide_hash)
+            if fp:
+                parsed = indexer.parser.parse(fp.name)
+                if parsed:
+                    folder = parsed.accession
+                if data.include_wsi and fp.exists():
+                    wsi_path = fp
+
+        items.append((folder, output_dir, wsi_path))
+
+    if not items:
+        raise HTTPException(status_code=404, detail="No matching slides found")
+
+    def generate():
+        q: queue.Queue = queue.Queue(maxsize=32)
+
+        def writer():
+            try:
+                stream = _ZipStreamWriter(q)
+                with zipfile.ZipFile(stream, 'w', zipfile.ZIP_STORED, allowZip64=True) as zf:
+                    for folder, output_dir, wsi_path in items:
+                        # Add selected output files
+                        if output_dir:
+                            for f in sorted(output_dir.iterdir()):
+                                if not f.is_file() or f.name not in include_set:
+                                    continue
+                                if f.name.endswith(".snappy"):
+                                    content, dl_name = _decompress_snappy_file(f)
+                                    zf.writestr(f"{folder}/{dl_name}", content)
+                                else:
+                                    zf.write(str(f), f"{folder}/{f.name}")
+                        # Add WSI
+                        if wsi_path:
+                            zf.write(str(wsi_path), f"{folder}/{wsi_path.name}")
+                stream.flush()
+            except Exception as e:
+                print(f"Bundle ZIP error: {e}")
+            finally:
+                q.put(None)
+
+        t = threading.Thread(target=writer, daemon=True)
+        t.start()
+        while True:
+            chunk = q.get()
+            if chunk is None:
+                break
+            yield chunk
+        t.join(timeout=5)
+
+    return StreamingResponse(
+        generate(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="job_{data.job_id}_bundle.zip"',
         },
     )
 

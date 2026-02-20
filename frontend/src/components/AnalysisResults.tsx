@@ -17,6 +17,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
 import { Checkbox } from '@/components/ui/checkbox'
+import { DownloadModal } from '@/components/DownloadModal'
 
 const API_BASE = 'http://localhost:8000'
 
@@ -128,6 +129,16 @@ export function AnalysisResults() {
 
   // Cart state
   const [cart, setCart] = useState<Set<string>>(new Set()) // "jobId:slideHash:filename"
+
+  // Slide selection within expanded jobs (for bundle download)
+  const [selectedJobSlides, setSelectedJobSlides] = useState<Record<number, Set<string>>>({}) // jobId -> Set<slideHash>
+
+  // Bundle modal state
+  const [bundleModal, setBundleModal] = useState<{ open: boolean; jobId: number; slideHashes: string[] }>({
+    open: false,
+    jobId: 0,
+    slideHashes: [],
+  })
 
   // Preview
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
@@ -424,6 +435,43 @@ export function AnalysisResults() {
     }
   }
 
+  // ---------- Slide selection for bundle download ----------
+
+  const toggleJobSlide = (jobId: number, slideHash: string) => {
+    setSelectedJobSlides((prev) => {
+      const current = prev[jobId] ?? new Set<string>()
+      const next = new Set(current)
+      if (next.has(slideHash)) next.delete(slideHash)
+      else next.add(slideHash)
+      return { ...prev, [jobId]: next }
+    })
+  }
+
+  const selectAllJobSlides = (jobId: number) => {
+    const detail = jobDetails[jobId]
+    if (!detail) return
+    const all = new Set(detail.slides.filter((s) => s.slide_hash).map((s) => s.slide_hash!))
+    setSelectedJobSlides((prev) => ({ ...prev, [jobId]: all }))
+  }
+
+  const clearJobSlideSelection = (jobId: number) => {
+    setSelectedJobSlides((prev) => ({ ...prev, [jobId]: new Set() }))
+  }
+
+  const openBundleModal = (jobId: number, slideHashes?: string[]) => {
+    const hashes = slideHashes ?? Array.from(selectedJobSlides[jobId] ?? new Set())
+    if (hashes.length === 0) {
+      // Default to all slides in the job
+      const detail = jobDetails[jobId]
+      if (detail) {
+        const all = detail.slides.filter((s) => s.slide_hash).map((s) => s.slide_hash!)
+        setBundleModal({ open: true, jobId, slideHashes: all })
+        return
+      }
+    }
+    setBundleModal({ open: true, jobId, slideHashes: hashes })
+  }
+
   // ---------- Status badge helper ----------
 
   const statusBadge = (status: string) => {
@@ -551,7 +599,7 @@ export function AnalysisResults() {
             {isExpanded && (
               <div className="border-t">
                 {/* Job-level buttons */}
-                <div className="flex gap-2 px-4 py-2 bg-muted/20">
+                <div className="flex items-center gap-2 px-4 py-2 bg-muted/20 flex-wrap">
                   <Button
                     variant="outline"
                     size="sm"
@@ -577,6 +625,42 @@ export function AnalysisResults() {
                     <Package className="mr-1 h-3.5 w-3.5" />
                     Download ZIP
                   </Button>
+                  <Button
+                    size="sm"
+                    className="h-7 text-xs"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      openBundleModal(job.id)
+                    }}
+                  >
+                    <FileDown className="mr-1 h-3.5 w-3.5" />
+                    Download Bundle
+                    {(selectedJobSlides[job.id]?.size ?? 0) > 0 &&
+                      ` (${selectedJobSlides[job.id].size})`}
+                  </Button>
+                  {detail && (
+                    <div className="flex items-center gap-1 ml-auto text-xs">
+                      <button
+                        className="text-primary hover:underline"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          selectAllJobSlides(job.id)
+                        }}
+                      >
+                        Select all
+                      </button>
+                      <span className="text-muted-foreground">|</span>
+                      <button
+                        className="text-muted-foreground hover:underline"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          clearJobSlideSelection(job.id)
+                        }}
+                      >
+                        Clear
+                      </button>
+                    </div>
+                  )}
                 </div>
 
                 {!detail ? (
@@ -601,7 +685,15 @@ export function AnalysisResults() {
                             }`}
                             onClick={() => toggleSlide(job.id, js.slide_hash!)}
                           >
-                            <span className="text-muted-foreground ml-2">
+                            <Checkbox
+                              checked={selectedJobSlides[job.id]?.has(js.slide_hash!) ?? false}
+                              onCheckedChange={(e) => {
+                                // Don't toggle expansion when clicking checkbox
+                                toggleJobSlide(job.id, js.slide_hash!)
+                              }}
+                              onClick={(e) => e.stopPropagation()}
+                            />
+                            <span className="text-muted-foreground">
                               {isSlideExpanded ? '└' : '├'}
                             </span>
                             {isSlideExpanded ? (
@@ -814,6 +906,14 @@ export function AnalysisResults() {
           </div>
         </div>
       )}
+
+      {/* Bundle download modal */}
+      <DownloadModal
+        open={bundleModal.open}
+        onOpenChange={(open) => setBundleModal((prev) => ({ ...prev, open }))}
+        slideHashes={bundleModal.slideHashes}
+        jobId={bundleModal.jobId}
+      />
     </div>
   )
 }

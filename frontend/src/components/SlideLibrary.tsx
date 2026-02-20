@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { Search, Filter, Tag as TagIcon, Eye, Tags, X, Plus, Settings, Trash2, ChevronDown } from 'lucide-react'
+import { Search, Filter, Tag as TagIcon, Eye, Tags, X, Plus, Settings, Trash2, ChevronDown, FileDown } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { SlideViewer } from '@/components/SlideViewer'
 import { TagInput } from '@/components/TagInput'
@@ -29,6 +29,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import type { Slide, Tag } from '@/types/slide'
+import { DownloadModal } from '@/components/DownloadModal'
 
 const API_BASE = 'http://localhost:8000'
 
@@ -87,6 +88,16 @@ export function SlideLibrary() {
   const [isCreatingTag, setIsCreatingTag] = useState(false)
   const [isDeletingTag, setIsDeletingTag] = useState<number | null>(null)
   const [expandedSlideTags, setExpandedSlideTags] = useState<Set<string>>(new Set())
+
+  // Download with analysis state
+  const [isJobPickerOpen, setIsJobPickerOpen] = useState(false)
+  const [jobsList, setJobsList] = useState<{ id: number; model_name: string; model_version: string | null; status: string; completed_count: number; slide_count: number; completed_at: string | null }[]>([])
+  const [loadingJobs, setLoadingJobs] = useState(false)
+  const [bundleModal, setBundleModal] = useState<{ open: boolean; jobId: number; slideHashes: string[] }>({
+    open: false,
+    jobId: 0,
+    slideHashes: [],
+  })
 
   useEffect(() => {
     fetchStats()
@@ -310,6 +321,32 @@ export function SlideLibrary() {
 
   const clearSelection = () => {
     setSelectedSlides(new Set())
+  }
+
+  const openDownloadWithAnalysis = async () => {
+    setIsJobPickerOpen(true)
+    setLoadingJobs(true)
+    try {
+      const hashParam = Array.from(selectedSlides).join(',')
+      const res = await fetch(`${API_BASE}/jobs?limit=50&slide_hashes=${encodeURIComponent(hashParam)}`)
+      if (res.ok) {
+        const data = await res.json()
+        setJobsList(data.filter((j: any) => j.completed_count > 0))
+      }
+    } catch (e) {
+      console.error(e)
+    } finally {
+      setLoadingJobs(false)
+    }
+  }
+
+  const pickJobForBundle = (jobId: number) => {
+    setIsJobPickerOpen(false)
+    setBundleModal({
+      open: true,
+      jobId,
+      slideHashes: Array.from(selectedSlides),
+    })
   }
 
   const handleBulkAddTag = async (tagName?: string, tagColor?: string) => {
@@ -665,6 +702,14 @@ export function SlideLibrary() {
             >
               <X className="mr-1 h-4 w-4" />
               Remove Tag
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={openDownloadWithAnalysis}
+            >
+              <FileDown className="mr-1 h-4 w-4" />
+              Download with Analysis
             </Button>
             <Button
               variant="ghost"
@@ -1221,6 +1266,55 @@ export function SlideLibrary() {
           onClose={() => setIsViewerOpen(false)}
         />
       )}
+
+      {/* Job picker for Download with Analysis */}
+      <Dialog open={isJobPickerOpen} onOpenChange={setIsJobPickerOpen}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Select Analysis Job</DialogTitle>
+            <DialogDescription>
+              Choose which analysis job's outputs to include with the {selectedSlides.size} selected slide{selectedSlides.size !== 1 ? 's' : ''}.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-1 max-h-72 overflow-y-auto">
+            {loadingJobs ? (
+              <p className="text-sm text-muted-foreground py-4 text-center">Loading jobs...</p>
+            ) : jobsList.length === 0 ? (
+              <p className="text-sm text-muted-foreground py-4 text-center">No completed jobs found.</p>
+            ) : (
+              jobsList.map((j) => (
+                <button
+                  key={j.id}
+                  className="w-full text-left rounded-md border px-3 py-2 hover:bg-muted/50 transition-colors"
+                  onClick={() => pickJobForBundle(j.id)}
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm font-medium">
+                      Job #{j.id} — {j.model_name} {j.model_version || ''}
+                    </span>
+                    <Badge variant="outline" className="text-xs">
+                      {j.completed_count}/{j.slide_count}
+                    </Badge>
+                  </div>
+                  {j.completed_at && (
+                    <p className="text-xs text-muted-foreground mt-0.5">
+                      {new Date(j.completed_at).toLocaleDateString()}
+                    </p>
+                  )}
+                </button>
+              ))
+            )}
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Bundle download modal */}
+      <DownloadModal
+        open={bundleModal.open}
+        onOpenChange={(open) => setBundleModal((prev) => ({ ...prev, open }))}
+        slideHashes={bundleModal.slideHashes}
+        jobId={bundleModal.jobId}
+      />
     </div>
   )
 }
