@@ -1,6 +1,6 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, Query, Depends
+from fastapi import FastAPI, HTTPException, Query, Depends, UploadFile, File
 from fastapi.responses import Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -981,6 +981,85 @@ def add_case_to_project(project_id: int, case_hash: str, db: Session = Depends(g
 
 
 # ============================================================
+# Annotation Endpoints (filesystem-based, no DB table)
+# ============================================================
+
+def _annotations_dir(slide_hash: str) -> Path:
+    """Return the annotations directory for a slide, creating it if needed."""
+    d = settings.annotations_path / slide_hash
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+@app.get("/slides/{slide_hash}/annotations")
+def list_annotations(slide_hash: str):
+    """List annotation files for a slide."""
+    ann_dir = settings.annotations_path / slide_hash
+    if not ann_dir.is_dir():
+        return []
+
+    return [
+        {
+            "name": f.name,
+            "size": f.stat().st_size,
+        }
+        for f in sorted(ann_dir.iterdir())
+        if f.is_file()
+    ]
+
+
+@app.post("/slides/{slide_hash}/annotations")
+async def upload_annotation(slide_hash: str, file: UploadFile = File(...)):
+    """Upload an annotation file for a slide."""
+    # Validate the slide exists
+    db = get_session()
+    try:
+        slide = db.query(Slide).filter_by(slide_hash=slide_hash).first()
+        if not slide:
+            raise HTTPException(status_code=404, detail="Slide not found")
+    finally:
+        db.close()
+
+    # Validate filename
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No filename provided")
+    safe_name = Path(file.filename).name
+    if '..' in safe_name or '/' in safe_name:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    ann_dir = _annotations_dir(slide_hash)
+    dest = ann_dir / safe_name
+
+    content = await file.read()
+    dest.write_bytes(content)
+
+    return {"status": "ok", "filename": safe_name, "size": len(content)}
+
+
+@app.delete("/slides/{slide_hash}/annotations/{filename}")
+def delete_annotation(slide_hash: str, filename: str):
+    """Delete a single annotation file."""
+    safe_name = Path(filename).name
+    file_path = settings.annotations_path / slide_hash / safe_name
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Annotation file not found")
+
+    file_path.unlink()
+    return {"status": "ok"}
+
+
+@app.get("/slides/{slide_hash}/annotations/{filename}")
+def get_annotation_file(slide_hash: str, filename: str):
+    """Download a single annotation file."""
+    safe_name = Path(filename).name
+    file_path = settings.annotations_path / slide_hash / safe_name
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Annotation file not found")
+
+    return FileResponse(str(file_path), filename=safe_name)
+
+
+# ============================================================
 # Cohort Endpoints
 # ============================================================
 
@@ -1398,9 +1477,6 @@ def create_cohort_from_tag(data: CohortFromTag, db: Session = Depends(get_db)):
         "slide_count": cohort.slide_count,
         "case_count": cohort.case_count
     }
-
-
-from fastapi import UploadFile, File
 
 
 @app.post("/cohorts/from-file")
@@ -2762,6 +2838,41 @@ def get_result_file(
     return FileResponse(str(file_path), filename=safe_name)
 
 
+@app.delete("/results/{job_id}/file/{filename}")
+def delete_result_file(
+    job_id: int,
+    filename: str,
+    slide_hash: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    """Delete a specific output file from disk for a job slide."""
+    job = db.query(AnalysisJob).options(
+        joinedload(AnalysisJob.slides).joinedload(JobSlide.slide)
+    ).filter_by(id=job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    output_dir = None
+    if slide_hash:
+        js = next((js for js in job.slides if js.slide and js.slide.slide_hash == slide_hash), None)
+        if js:
+            output_dir = _resolve_job_slide_output(js)
+    elif job.output_path:
+        output_dir = Path(job.output_path)
+
+    if not output_dir:
+        raise HTTPException(status_code=404, detail="No output path for this job")
+
+    safe_name = Path(filename).name
+    file_path = output_dir / safe_name
+
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    file_path.unlink()
+    return {"status": "ok", "deleted": safe_name}
+
+
 def _resolve_job_slide_output(js) -> Optional[Path]:
     """Get the output directory for a JobSlide, if it exists locally."""
     for attr in ("local_output_path", "remote_output_path"):
@@ -2926,9 +3037,9 @@ def get_job_output_filenames(
     slide_hashes: Optional[str] = Query(None, description="Comma-separated slide hashes to restrict to"),
     db: Session = Depends(get_db),
 ):
-    """Return the unique set of output filenames for specific slides in a job."""
+    """Return output filenames grouped by slide, with annotation counts."""
     job = db.query(AnalysisJob).options(
-        joinedload(AnalysisJob.slides).joinedload(JobSlide.slide)
+        joinedload(AnalysisJob.slides).joinedload(JobSlide.slide).joinedload(Slide.case)
     ).filter_by(id=job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -2937,18 +3048,45 @@ def get_job_output_filenames(
     if slide_hashes:
         wanted = set(h.strip() for h in slide_hashes.split(",") if h.strip())
 
-    filenames: set[str] = set()
+    groups: list[dict] = []
     for js in job.slides:
-        if wanted and (not js.slide or js.slide.slide_hash not in wanted):
+        if not js.slide:
             continue
-        output_dir = _resolve_job_slide_output(js)
-        if not output_dir:
+        sh = js.slide.slide_hash
+        if wanted and sh not in wanted:
             continue
-        for f in output_dir.iterdir():
-            if f.is_file():
-                filenames.add(f.name)
 
-    return sorted(filenames)
+        # Resolve a human-readable label
+        label = sh[:12] + "..."
+        if indexer:
+            fp = indexer.get_filepath(sh)
+            if fp:
+                parsed = indexer.parser.parse(fp.name)
+                if parsed:
+                    label = parsed.accession
+
+        # Output files
+        files: list[str] = []
+        output_dir = _resolve_job_slide_output(js)
+        if output_dir:
+            for f in sorted(output_dir.iterdir()):
+                if f.is_file():
+                    files.append(f.name)
+
+        # Annotation count
+        ann_dir = settings.annotations_path / sh
+        annotation_count = 0
+        if ann_dir.is_dir():
+            annotation_count = sum(1 for f in ann_dir.iterdir() if f.is_file())
+
+        groups.append({
+            "slide_hash": sh,
+            "label": label,
+            "files": files,
+            "annotation_count": annotation_count,
+        })
+
+    return groups
 
 
 class DownloadBundleRequest(BaseModel):
@@ -2956,6 +3094,7 @@ class DownloadBundleRequest(BaseModel):
     job_id: int
     include_filenames: List[str]
     include_wsi: bool = False
+    include_annotations: bool = False
 
 
 @app.post("/download-bundle")
@@ -2975,8 +3114,8 @@ def download_bundle(data: DownloadBundleRequest, db: Session = Depends(get_db)):
     requested = set(data.slide_hashes)
     include_set = set(data.include_filenames)
 
-    # Resolve per-slide: (folder_name, output_dir, [wsi_path])
-    items: list[tuple[str, Optional[Path], Optional[Path]]] = []
+    # Resolve per-slide: (folder_name, slide_hash, output_dir, wsi_path)
+    items: list[tuple[str, str, Optional[Path], Optional[Path]]] = []
     for js in job.slides:
         if not js.slide or js.slide.slide_hash not in requested:
             continue
@@ -2996,7 +3135,7 @@ def download_bundle(data: DownloadBundleRequest, db: Session = Depends(get_db)):
                 if data.include_wsi and fp.exists():
                     wsi_path = fp
 
-        items.append((folder, output_dir, wsi_path))
+        items.append((folder, slide_hash, output_dir, wsi_path))
 
     if not items:
         raise HTTPException(status_code=404, detail="No matching slides found")
@@ -3008,7 +3147,7 @@ def download_bundle(data: DownloadBundleRequest, db: Session = Depends(get_db)):
             try:
                 stream = _ZipStreamWriter(q)
                 with zipfile.ZipFile(stream, 'w', zipfile.ZIP_STORED, allowZip64=True) as zf:
-                    for folder, output_dir, wsi_path in items:
+                    for folder, slide_hash, output_dir, wsi_path in items:
                         # Add selected output files
                         if output_dir:
                             for f in sorted(output_dir.iterdir()):
@@ -3019,6 +3158,13 @@ def download_bundle(data: DownloadBundleRequest, db: Session = Depends(get_db)):
                                     zf.writestr(f"{folder}/{dl_name}", content)
                                 else:
                                     zf.write(str(f), f"{folder}/{f.name}")
+                        # Add annotations
+                        if data.include_annotations:
+                            ann_dir = settings.annotations_path / slide_hash
+                            if ann_dir.is_dir():
+                                for f in sorted(ann_dir.iterdir()):
+                                    if f.is_file():
+                                        zf.write(str(f), f"{folder}/annotations/{f.name}")
                         # Add WSI
                         if wsi_path:
                             zf.write(str(wsi_path), f"{folder}/{wsi_path.name}")

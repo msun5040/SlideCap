@@ -1,5 +1,5 @@
-import { useState, useEffect, useRef } from 'react'
-import { Search, Filter, Tag as TagIcon, Eye, Tags, X, Plus, Settings, Trash2, ChevronDown, FileDown } from 'lucide-react'
+import { useState, useEffect, useRef, useCallback } from 'react'
+import { Search, Filter, Tag as TagIcon, Eye, Tags, X, Plus, Settings, Trash2, ChevronDown, FileDown, Upload, Pencil, Check } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { SlideViewer } from '@/components/SlideViewer'
 import { TagInput } from '@/components/TagInput'
@@ -25,6 +25,7 @@ import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
@@ -98,6 +99,12 @@ export function SlideLibrary() {
     jobId: 0,
     slideHashes: [],
   })
+
+  // Annotation state for detail dialog
+  const [annotations, setAnnotations] = useState<{ name: string; size: number }[]>([])
+  const [loadingAnnotations, setLoadingAnnotations] = useState(false)
+  const [uploadingAnnotation, setUploadingAnnotation] = useState(false)
+  const annotationInputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
     fetchStats()
@@ -349,6 +356,74 @@ export function SlideLibrary() {
     })
   }
 
+  // --- Annotation helpers ---
+
+  const fetchAnnotations = useCallback(async (slideHash: string) => {
+    setLoadingAnnotations(true)
+    try {
+      const res = await fetch(`${API_BASE}/slides/${slideHash}/annotations`)
+      if (res.ok) setAnnotations(await res.json())
+      else setAnnotations([])
+    } catch {
+      setAnnotations([])
+    } finally {
+      setLoadingAnnotations(false)
+    }
+  }, [])
+
+  const uploadAnnotation = async (slideHash: string, file: File) => {
+    setUploadingAnnotation(true)
+    try {
+      const form = new FormData()
+      form.append('file', file)
+      const res = await fetch(`${API_BASE}/slides/${slideHash}/annotations`, {
+        method: 'POST',
+        body: form,
+      })
+      if (res.ok) {
+        await fetchAnnotations(slideHash)
+      } else {
+        const err = await res.json().catch(() => ({ detail: 'Upload failed' }))
+        alert(err.detail || 'Upload failed')
+      }
+    } catch {
+      alert('Upload failed')
+    } finally {
+      setUploadingAnnotation(false)
+    }
+  }
+
+  const [deleteAnnotationConfirm, setDeleteAnnotationConfirm] = useState<{
+    open: boolean; slideHash: string; filename: string
+  }>({ open: false, slideHash: '', filename: '' })
+
+  const confirmDeleteAnnotation = (slideHash: string, filename: string) => {
+    setDeleteAnnotationConfirm({ open: true, slideHash, filename })
+  }
+
+  const doDeleteAnnotation = async () => {
+    const { slideHash, filename } = deleteAnnotationConfirm
+    try {
+      const res = await fetch(
+        `${API_BASE}/slides/${slideHash}/annotations/${encodeURIComponent(filename)}`,
+        { method: 'DELETE' }
+      )
+      if (res.ok) {
+        setAnnotations((prev) => prev.filter((a) => a.name !== filename))
+      }
+    } catch {
+      alert('Delete failed')
+    }
+    setDeleteAnnotationConfirm({ open: false, slideHash: '', filename: '' })
+  }
+
+  // Load annotations when detail dialog opens
+  useEffect(() => {
+    if (isDetailsDialogOpen && selectedSlide) {
+      fetchAnnotations(selectedSlide.slide_hash)
+    }
+  }, [isDetailsDialogOpen, selectedSlide, fetchAnnotations])
+
   const handleBulkAddTag = async (tagName?: string, tagColor?: string) => {
     const name = tagName || bulkTagInput.trim()
     const color = tagColor || bulkTagColor
@@ -548,6 +623,57 @@ export function SlideLibrary() {
       alert('Failed to delete tag')
     } finally {
       setIsDeletingTag(null)
+    }
+  }
+
+  // Tag rename state
+  const [editingTagId, setEditingTagId] = useState<number | null>(null)
+  const [editingTagName, setEditingTagName] = useState('')
+  const [savingTagName, setSavingTagName] = useState(false)
+
+  const startEditTag = (tag: { id: number; name: string }) => {
+    setEditingTagId(tag.id)
+    setEditingTagName(tag.name)
+  }
+
+  const cancelEditTag = () => {
+    setEditingTagId(null)
+    setEditingTagName('')
+  }
+
+  const saveTagName = async (tagId: number, oldName: string) => {
+    const newName = editingTagName.trim()
+    if (!newName || newName === oldName) {
+      cancelEditTag()
+      return
+    }
+    setSavingTagName(true)
+    try {
+      const res = await fetch(`${API_BASE}/tags/${tagId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: newName }),
+      })
+      if (res.ok) {
+        fetchAvailableTags()
+        // Update local slides state
+        setSlides((prev) =>
+          prev.map((s) => ({
+            ...s,
+            slide_tags: (s.slide_tags || []).map((t) => (t === oldName ? newName : t)),
+          }))
+        )
+        // Update tag filter if active
+        if (tagFilter === oldName) setTagFilter(newName)
+        cancelEditTag()
+      } else {
+        const err = await res.json()
+        alert(err.detail || 'Failed to rename tag')
+      }
+    } catch {
+      alert('Failed to rename tag')
+    } finally {
+      setSavingTagName(false)
     }
   }
 
@@ -963,6 +1089,66 @@ export function SlideLibrary() {
                   </div>
                 </div>
               )}
+              {/* Annotations section */}
+              <div className="col-span-2 pt-4 border-t">
+                <div className="flex items-center justify-between mb-2">
+                  <label className="text-sm font-medium">Annotations</label>
+                  <div>
+                    <input
+                      ref={annotationInputRef}
+                      type="file"
+                      accept=".geojson,.json"
+                      multiple
+                      className="hidden"
+                      onChange={(e) => {
+                        const files = e.target.files
+                        if (!files || !selectedSlide) return
+                        for (const file of Array.from(files)) {
+                          uploadAnnotation(selectedSlide.slide_hash, file)
+                        }
+                        e.target.value = ''
+                      }}
+                    />
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-7 text-xs"
+                      disabled={uploadingAnnotation}
+                      onClick={() => annotationInputRef.current?.click()}
+                    >
+                      <Upload className="mr-1 h-3.5 w-3.5" />
+                      {uploadingAnnotation ? 'Uploading...' : 'Upload'}
+                    </Button>
+                  </div>
+                </div>
+
+                {loadingAnnotations ? (
+                  <p className="text-xs text-muted-foreground">Loading...</p>
+                ) : annotations.length === 0 ? (
+                  <p className="text-xs text-muted-foreground">No annotations uploaded yet.</p>
+                ) : (
+                  <div className="space-y-1">
+                    {annotations.map((ann) => (
+                      <div key={ann.name} className="flex items-center justify-between text-sm py-1 px-2 rounded hover:bg-muted/50">
+                        <div className="flex items-center gap-2 min-w-0">
+                          <FileDown className="h-3.5 w-3.5 text-orange-500 shrink-0" />
+                          <span className="font-mono text-xs truncate" title={ann.name}>{ann.name}</span>
+                          <span className="text-xs text-muted-foreground shrink-0">
+                            {ann.size < 1024 ? `${ann.size} B` : ann.size < 1024 * 1024 ? `${(ann.size / 1024).toFixed(1)} KB` : `${(ann.size / (1024 * 1024)).toFixed(1)} MB`}
+                          </span>
+                        </div>
+                        <button
+                          className="p-1 rounded hover:bg-destructive/10 text-muted-foreground hover:text-destructive transition-colors shrink-0"
+                          onClick={() => selectedSlide && confirmDeleteAnnotation(selectedSlide.slide_hash, ann.name)}
+                        >
+                          <Trash2 className="h-3 w-3" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
               <div className="col-span-2 pt-4 border-t">
                 <Button
                   onClick={() => setIsViewerOpen(true)}
@@ -1220,29 +1406,71 @@ export function SlideLibrary() {
                       key={tag.id}
                       className="flex items-center justify-between p-2 rounded-lg hover:bg-muted/50 group"
                     >
-                      <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-2 flex-1 min-w-0">
                         <span
-                          className="w-3 h-3 rounded-full"
+                          className="w-3 h-3 rounded-full shrink-0"
                           style={{ backgroundColor: tag.color || '#6B7280' }}
                         />
-                        <span className="font-medium">{tag.name}</span>
-                        <span className="text-sm text-muted-foreground">
-                          ({tag.slide_count ?? 0} slide{(tag.slide_count ?? 0) !== 1 ? 's' : ''})
-                        </span>
-                      </div>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        className="opacity-0 group-hover:opacity-100 text-destructive hover:text-destructive hover:bg-destructive/10"
-                        onClick={() => handleDeleteTag(tag.id, tag.name)}
-                        disabled={isDeletingTag === tag.id}
-                      >
-                        {isDeletingTag === tag.id ? (
-                          '...'
+                        {editingTagId === tag.id ? (
+                          <div className="flex items-center gap-1 flex-1">
+                            <Input
+                              value={editingTagName}
+                              onChange={(e) => setEditingTagName(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') saveTagName(tag.id, tag.name)
+                                if (e.key === 'Escape') cancelEditTag()
+                              }}
+                              className="h-7 text-sm"
+                              autoFocus
+                            />
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="h-7 px-2 text-green-600 hover:text-green-700"
+                              onClick={() => saveTagName(tag.id, tag.name)}
+                              disabled={savingTagName}
+                            >
+                              <Check className="h-3.5 w-3.5" />
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="h-7 px-2"
+                              onClick={cancelEditTag}
+                            >
+                              <X className="h-3.5 w-3.5" />
+                            </Button>
+                          </div>
                         ) : (
-                          <Trash2 className="h-4 w-4" />
+                          <>
+                            <span className="font-medium">{tag.name}</span>
+                            <span className="text-sm text-muted-foreground">
+                              ({tag.slide_count ?? 0} slide{(tag.slide_count ?? 0) !== 1 ? 's' : ''})
+                            </span>
+                          </>
                         )}
-                      </Button>
+                      </div>
+                      {editingTagId !== tag.id && (
+                        <div className="flex gap-1 opacity-0 group-hover:opacity-100">
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-7 px-2 text-muted-foreground hover:text-foreground"
+                            onClick={() => startEditTag(tag)}
+                          >
+                            <Pencil className="h-3.5 w-3.5" />
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-7 px-2 text-destructive hover:text-destructive hover:bg-destructive/10"
+                            onClick={() => handleDeleteTag(tag.id, tag.name)}
+                            disabled={isDeletingTag === tag.id}
+                          >
+                            {isDeletingTag === tag.id ? '...' : <Trash2 className="h-3.5 w-3.5" />}
+                          </Button>
+                        </div>
+                      )}
                     </div>
                   ))
                 )}
@@ -1315,6 +1543,34 @@ export function SlideLibrary() {
         slideHashes={bundleModal.slideHashes}
         jobId={bundleModal.jobId}
       />
+
+      {/* Annotation delete confirmation */}
+      <Dialog
+        open={deleteAnnotationConfirm.open}
+        onOpenChange={(open) => setDeleteAnnotationConfirm((prev) => ({ ...prev, open }))}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Delete Annotation</DialogTitle>
+            <DialogDescription>
+              Are you sure you want to permanently delete{' '}
+              <span className="font-medium text-foreground">{deleteAnnotationConfirm.filename}</span>?
+              This will remove the file from the network drive.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setDeleteAnnotationConfirm((prev) => ({ ...prev, open: false }))}
+            >
+              Cancel
+            </Button>
+            <Button variant="destructive" onClick={doDeleteAnnotation}>
+              Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

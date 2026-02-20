@@ -17,6 +17,14 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
 import { Checkbox } from '@/components/ui/checkbox'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { DownloadModal } from '@/components/DownloadModal'
 
 const API_BASE = 'http://localhost:8000'
@@ -142,6 +150,14 @@ export function AnalysisResults() {
 
   // Preview
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
+
+  // Delete confirmation
+  const [deleteConfirm, setDeleteConfirm] = useState<{
+    open: boolean
+    type: 'file' | 'job'
+    label: string
+    onConfirm: () => Promise<void>
+  }>({ open: false, type: 'file', label: '', onConfirm: async () => {} })
 
   // ---------- Fetch jobs ----------
 
@@ -343,24 +359,71 @@ export function AnalysisResults() {
 
   // ---------- Delete job ----------
 
-  const deleteJob = async (jobId: number) => {
-    if (!confirm('Delete this job and all its records?')) return
-    try {
-      const res = await fetch(`${API_BASE}/jobs/${jobId}`, { method: 'DELETE' })
-      if (res.ok) {
-        setJobs((prev) => prev.filter((j) => j.id !== jobId))
-        setExpandedJobs((prev) => {
-          const s = new Set(prev)
-          s.delete(jobId)
-          return s
-        })
-      } else {
-        const err = await res.json()
-        alert(err.detail || 'Failed to delete')
-      }
-    } catch (e) {
-      console.error('Delete failed:', e)
-    }
+  const confirmDeleteJob = (jobId: number) => {
+    setDeleteConfirm({
+      open: true,
+      type: 'job',
+      label: `Job #${jobId} and all its records`,
+      onConfirm: async () => {
+        try {
+          const res = await fetch(`${API_BASE}/jobs/${jobId}`, { method: 'DELETE' })
+          if (res.ok) {
+            setJobs((prev) => prev.filter((j) => j.id !== jobId))
+            setExpandedJobs((prev) => {
+              const s = new Set(prev)
+              s.delete(jobId)
+              return s
+            })
+          } else {
+            const err = await res.json()
+            alert(err.detail || 'Failed to delete')
+          }
+        } catch (e) {
+          console.error('Delete failed:', e)
+        }
+      },
+    })
+  }
+
+  const confirmDeleteFile = (jobId: number, slideHash: string, filename: string) => {
+    setDeleteConfirm({
+      open: true,
+      type: 'file',
+      label: filename,
+      onConfirm: async () => {
+        try {
+          const res = await fetch(
+            `${API_BASE}/results/${jobId}/file/${encodeURIComponent(filename)}?slide_hash=${encodeURIComponent(slideHash)}`,
+            { method: 'DELETE' }
+          )
+          if (res.ok) {
+            // Remove from cached file list
+            const key = slideKey(jobId, slideHash)
+            setSlideFiles((prev) => ({
+              ...prev,
+              [key]: (prev[key] || []).filter((f) => f.name !== filename),
+            }))
+            // Also remove from search file cache
+            setSearchSlideFiles((prev) => ({
+              ...prev,
+              [key]: (prev[key] || []).filter((f) => f.name !== filename),
+            }))
+            // Remove from cart
+            const ck = cartKey(jobId, slideHash, filename)
+            setCart((prev) => {
+              const next = new Set(prev)
+              next.delete(ck)
+              return next
+            })
+          } else {
+            const err = await res.json()
+            alert(err.detail || 'Failed to delete file')
+          }
+        } catch (e) {
+          console.error('Delete file failed:', e)
+        }
+      },
+    })
   }
 
   // ---------- File download ----------
@@ -534,6 +597,13 @@ export function AnalysisResults() {
           >
             <FileDown className="h-3.5 w-3.5" />
           </Button>
+          <button
+            className="p-1 rounded hover:bg-destructive/10 text-muted-foreground hover:text-destructive transition-colors"
+            title="Delete file from disk"
+            onClick={() => confirmDeleteFile(jobId, slideHash, file.name)}
+          >
+            <Trash2 className="h-3 w-3" />
+          </button>
         </div>
       </div>
     )
@@ -587,7 +657,7 @@ export function AnalysisResults() {
                   title="Delete this job"
                   onClick={(e) => {
                     e.stopPropagation()
-                    deleteJob(job.id)
+                    confirmDeleteJob(job.id)
                   }}
                 >
                   <Trash2 className="h-3.5 w-3.5" />
@@ -914,6 +984,36 @@ export function AnalysisResults() {
         slideHashes={bundleModal.slideHashes}
         jobId={bundleModal.jobId}
       />
+
+      {/* Delete confirmation dialog */}
+      <Dialog open={deleteConfirm.open} onOpenChange={(open) => setDeleteConfirm((prev) => ({ ...prev, open }))}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Confirm Deletion</DialogTitle>
+            <DialogDescription>
+              Are you sure you want to permanently delete{' '}
+              <span className="font-medium text-foreground">{deleteConfirm.label}</span>?
+              {deleteConfirm.type === 'file'
+                ? ' This will remove the file from the network drive.'
+                : ' This will remove the job record and all associated data.'}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDeleteConfirm((prev) => ({ ...prev, open: false }))}>
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={async () => {
+                await deleteConfirm.onConfirm()
+                setDeleteConfirm((prev) => ({ ...prev, open: false }))
+              }}
+            >
+              Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

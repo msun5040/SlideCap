@@ -55,6 +55,10 @@ class Settings(BaseSettings):
         return Path(self.NETWORK_ROOT) / "analyses"
 
     @property
+    def annotations_path(self) -> Path:
+        return Path(self.NETWORK_ROOT) / "annotations"
+
+    @property
     def ssh_configured(self) -> bool:
         return bool(self.CLUSTER_HOST)
 
