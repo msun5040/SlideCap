@@ -8,6 +8,7 @@ import {
   X,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { Dashboard } from '@/components/Dashboard'
 import { SlideLibrary } from '@/components/SlideLibrary'
 import { CohortDashboard } from '@/components/CohortDashboard'
 import { AnalysisDashboard } from '@/components/AnalysisDashboard'
@@ -28,12 +29,7 @@ export default function App() {
   const renderContent = () => {
     switch (currentView) {
       case 'dashboard':
-        return (
-          <div className="space-y-6">
-            <h1 className="text-2xl font-semibold">Dashboard</h1>
-            <p className="text-muted-foreground">Welcome to SlideCap</p>
-          </div>
-        )
+        return <Dashboard />
       case 'slides':
         return <SlideLibrary />
       case 'cohorts':

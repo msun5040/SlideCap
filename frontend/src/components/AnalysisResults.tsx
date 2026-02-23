@@ -12,6 +12,7 @@ import {
   Package,
   ShoppingCart,
   X,
+  Hash,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -26,6 +27,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { DownloadModal } from '@/components/DownloadModal'
+import { CopyableText } from '@/components/CopyableText'
 
 const API_BASE = 'http://localhost:8000'
 
@@ -52,6 +54,7 @@ interface JobSummary {
 interface JobSlideDetail {
   id: number
   slide_hash: string | null
+  filename: string | null
   cluster_job_id: string | null
   status: string
   started_at: string | null
@@ -59,6 +62,7 @@ interface JobSlideDetail {
   error_message: string | null
   log_tail: string | null
   remote_output_path: string | null
+  cell_stats: Record<string, number> | null
 }
 
 interface JobDetail extends JobSummary {
@@ -79,6 +83,7 @@ interface SlideResult {
   status: string
   completed_at?: string
   output_path?: string
+  cell_stats?: Record<string, number> | null
 }
 
 interface SlideWithResults {
@@ -104,6 +109,25 @@ function formatDate(iso: string | null) {
   return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
 }
 
+function formatCount(n: number) {
+  return n.toLocaleString()
+}
+
+function CellStats({ stats }: { stats: Record<string, number> }) {
+  const entries = Object.entries(stats)
+  if (entries.length === 0) return null
+  return (
+    <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-muted-foreground pl-12 pb-1">
+      {entries.map(([name, count]) => (
+        <span key={name}>
+          <span className="font-medium text-foreground/70">{name}:</span>{' '}
+          {formatCount(count)}
+        </span>
+      ))}
+    </div>
+  )
+}
+
 // ---------- Component ----------
 
 export function AnalysisResults() {
@@ -115,6 +139,9 @@ export function AnalysisResults() {
   const [loadingJobs, setLoadingJobs] = useState(false)
   const [expandedJobs, setExpandedJobs] = useState<Set<number>>(new Set())
   const [jobDetails, setJobDetails] = useState<Record<number, JobDetail>>({})
+
+  // Slide display options
+  const [showHashes, setShowHashes] = useState(false)
 
   // Slide expansion within jobs
   const [expandedSlides, setExpandedSlides] = useState<Set<string>>(new Set()) // key: "jobId:slideHash"
@@ -156,7 +183,8 @@ export function AnalysisResults() {
     open: boolean
     type: 'file' | 'job'
     label: string
-    onConfirm: () => Promise<void>
+    jobId?: number
+    onConfirm: (deleteFiles?: boolean) => Promise<void>
   }>({ open: false, type: 'file', label: '', onConfirm: async () => {} })
 
   // ---------- Fetch jobs ----------
@@ -363,10 +391,14 @@ export function AnalysisResults() {
     setDeleteConfirm({
       open: true,
       type: 'job',
-      label: `Job #${jobId} and all its records`,
-      onConfirm: async () => {
+      label: `Job #${jobId}`,
+      jobId,
+      onConfirm: async (deleteFiles?: boolean) => {
         try {
-          const res = await fetch(`${API_BASE}/jobs/${jobId}`, { method: 'DELETE' })
+          const url = deleteFiles
+            ? `${API_BASE}/jobs/${jobId}?delete_files=true`
+            : `${API_BASE}/jobs/${jobId}`
+          const res = await fetch(url, { method: 'DELETE' })
           if (res.ok) {
             setJobs((prev) => prev.filter((j) => j.id !== jobId))
             setExpandedJobs((prev) => {
@@ -771,9 +803,13 @@ export function AnalysisResults() {
                             ) : (
                               <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />
                             )}
-                            <span className="text-sm font-mono">
-                              {js.slide_hash!.substring(0, 12)}...
-                            </span>
+                            <CopyableText
+                              className="text-sm max-w-[300px]"
+                              text={showHashes
+                                ? `${js.slide_hash!.substring(0, 12)}...`
+                                : js.filename || `${js.slide_hash!.substring(0, 12)}...`}
+                              copyValue={showHashes ? js.slide_hash! : (js.filename || js.slide_hash!)}
+                            />
                             {statusBadge(js.status)}
                             {js.error_message && (
                               <span className="text-xs text-red-500 truncate max-w-[200px]">
@@ -781,6 +817,11 @@ export function AnalysisResults() {
                               </span>
                             )}
                           </div>
+
+                          {/* Cell stats (shown even when not expanded) */}
+                          {js.cell_stats && (
+                            <CellStats stats={js.cell_stats} />
+                          )}
 
                           {/* Expanded: file list */}
                           {isSlideExpanded && (
@@ -847,9 +888,11 @@ export function AnalysisResults() {
                       <span className="text-xs text-muted-foreground">{slide.year}</span>
                     )}
                   </div>
-                  <p className="text-xs text-muted-foreground mt-0.5 font-mono">
-                    {slide.slide_hash.substring(0, 16)}...
-                  </p>
+                  <CopyableText
+                    className="text-xs text-muted-foreground mt-0.5"
+                    text={`${slide.slide_hash.substring(0, 16)}...`}
+                    copyValue={slide.slide_hash}
+                  />
                 </div>
                 <Badge variant="secondary">{slide.results.length} analyses</Badge>
               </div>
@@ -890,6 +933,11 @@ export function AnalysisResults() {
                         </div>
                       </div>
 
+                      {/* Cell stats */}
+                      {r.cell_stats && (
+                        <CellStats stats={r.cell_stats} />
+                      )}
+
                       {isExpanded && (
                         <div className="bg-muted/10 border-t py-1">
                           {isLoading ? (
@@ -923,7 +971,7 @@ export function AnalysisResults() {
   return (
     <div className="space-y-4">
       {/* Search bar — always visible */}
-      <div className="flex gap-2">
+      <div className="flex gap-2 items-center">
         <Input
           placeholder="Search by accession number (e.g. S24-12345)..."
           value={query}
@@ -934,6 +982,16 @@ export function AnalysisResults() {
         <Button onClick={doSearch} disabled={searchLoading}>
           <Search className="mr-2 h-4 w-4" />
           {searchLoading ? 'Searching...' : 'Search'}
+        </Button>
+        <Button
+          variant={showHashes ? 'secondary' : 'ghost'}
+          size="sm"
+          className="h-9 text-xs gap-1"
+          onClick={() => setShowHashes((v) => !v)}
+          title={showHashes ? 'Showing slide hashes — click to show filenames' : 'Showing filenames — click to show slide hashes'}
+        >
+          <Hash className="h-3.5 w-3.5" />
+          {showHashes ? 'Hashes' : 'Filenames'}
         </Button>
       </div>
 
@@ -991,26 +1049,56 @@ export function AnalysisResults() {
           <DialogHeader>
             <DialogTitle>Confirm Deletion</DialogTitle>
             <DialogDescription>
-              Are you sure you want to permanently delete{' '}
-              <span className="font-medium text-foreground">{deleteConfirm.label}</span>?
-              {deleteConfirm.type === 'file'
-                ? ' This will remove the file from the network drive.'
-                : ' This will remove the job record and all associated data.'}
+              {deleteConfirm.type === 'file' ? (
+                <>
+                  Are you sure you want to permanently delete{' '}
+                  <span className="font-medium text-foreground">{deleteConfirm.label}</span>?
+                  This will remove the file from the network drive.
+                </>
+              ) : (
+                <>
+                  How would you like to delete{' '}
+                  <span className="font-medium text-foreground">{deleteConfirm.label}</span>?
+                </>
+              )}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
             <Button variant="outline" onClick={() => setDeleteConfirm((prev) => ({ ...prev, open: false }))}>
               Cancel
             </Button>
-            <Button
-              variant="destructive"
-              onClick={async () => {
-                await deleteConfirm.onConfirm()
-                setDeleteConfirm((prev) => ({ ...prev, open: false }))
-              }}
-            >
-              Delete
-            </Button>
+            {deleteConfirm.type === 'job' ? (
+              <>
+                <Button
+                  variant="secondary"
+                  onClick={async () => {
+                    await deleteConfirm.onConfirm(false)
+                    setDeleteConfirm((prev) => ({ ...prev, open: false }))
+                  }}
+                >
+                  Record Only
+                </Button>
+                <Button
+                  variant="destructive"
+                  onClick={async () => {
+                    await deleteConfirm.onConfirm(true)
+                    setDeleteConfirm((prev) => ({ ...prev, open: false }))
+                  }}
+                >
+                  Delete Everything
+                </Button>
+              </>
+            ) : (
+              <Button
+                variant="destructive"
+                onClick={async () => {
+                  await deleteConfirm.onConfirm()
+                  setDeleteConfirm((prev) => ({ ...prev, open: false }))
+                }}
+              >
+                Delete
+              </Button>
+            )}
           </DialogFooter>
         </DialogContent>
       </Dialog>

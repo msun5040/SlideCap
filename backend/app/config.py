@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     CLUSTER_PORT: int = 22
 
     @property
+    def staging_path(self) -> Path:
+        return Path(self.NETWORK_ROOT) / "slide_staging"
+
+    @property
     def slides_path(self) -> Path:
         return Path(self.NETWORK_ROOT) / "slides"
 

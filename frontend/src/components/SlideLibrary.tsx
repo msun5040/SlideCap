@@ -31,6 +31,7 @@ import {
 } from '@/components/ui/dialog'
 import type { Slide, Tag } from '@/types/slide'
 import { DownloadModal } from '@/components/DownloadModal'
+import { CopyableText } from '@/components/CopyableText'
 
 const API_BASE = 'http://localhost:8000'
 
@@ -99,6 +100,10 @@ export function SlideLibrary() {
     jobId: 0,
     slideHashes: [],
   })
+
+  // Slide results (cell stats) state for detail dialog
+  const [slideResults, setSlideResults] = useState<{ job_id: number; analysis_name: string; version: string; status: string; cell_stats?: Record<string, number> | null }[]>([])
+  const [loadingResults, setLoadingResults] = useState(false)
 
   // Annotation state for detail dialog
   const [annotations, setAnnotations] = useState<{ name: string; size: number }[]>([])
@@ -417,10 +422,17 @@ export function SlideLibrary() {
     setDeleteAnnotationConfirm({ open: false, slideHash: '', filename: '' })
   }
 
-  // Load annotations when detail dialog opens
+  // Load annotations and results when detail dialog opens
   useEffect(() => {
     if (isDetailsDialogOpen && selectedSlide) {
       fetchAnnotations(selectedSlide.slide_hash)
+      // Fetch cell stats
+      setLoadingResults(true)
+      fetch(`${API_BASE}/slides/${selectedSlide.slide_hash}/results`)
+        .then((res) => (res.ok ? res.json() : []))
+        .then((data) => setSlideResults(data))
+        .catch(() => setSlideResults([]))
+        .finally(() => setLoadingResults(false))
     }
   }, [isDetailsDialogOpen, selectedSlide, fetchAnnotations])
 
@@ -890,7 +902,9 @@ export function SlideLibrary() {
                       onCheckedChange={() => toggleSlideSelection(slide.slide_hash)}
                     />
                   </TableCell>
-                  <TableCell className="font-medium">{slide.accession_number}</TableCell>
+                  <TableCell>
+                    <CopyableText className="font-medium text-sm" mono={false} text={slide.accession_number} />
+                  </TableCell>
                   <TableCell className="text-sm">{slide.block_id}</TableCell>
                   <TableCell className="text-sm">{slide.slide_number}</TableCell>
                   <TableCell>
@@ -1027,7 +1041,11 @@ export function SlideLibrary() {
             <div className="grid grid-cols-2 gap-4 py-4">
               <div>
                 <label className="text-sm text-muted-foreground">Accession #</label>
-                <p className="font-medium">{selectedSlide.accession_number}</p>
+                <CopyableText className="font-medium text-sm" text={selectedSlide.accession_number} />
+              </div>
+              <div>
+                <label className="text-sm text-muted-foreground">Slide Hash</label>
+                <CopyableText className="text-sm" text={`${selectedSlide.slide_hash.substring(0, 16)}...`} copyValue={selectedSlide.slide_hash} />
               </div>
               <div>
                 <label className="text-sm text-muted-foreground">Slide #</label>
@@ -1056,7 +1074,7 @@ export function SlideLibrary() {
               {selectedSlide.file_path && (
                 <div className="col-span-2">
                   <label className="text-sm text-muted-foreground">File Path</label>
-                  <p className="font-mono text-sm break-all">{selectedSlide.file_path}</p>
+                  <CopyableText className="text-sm break-all" text={selectedSlide.file_path} />
                 </div>
               )}
               {selectedSlide.slide_tags && selectedSlide.slide_tags.length > 0 && (
@@ -1072,27 +1090,61 @@ export function SlideLibrary() {
               {selectedSlide.completed_analyses && selectedSlide.completed_analyses.length > 0 && (
                 <div className="col-span-2">
                   <label className="text-sm text-muted-foreground">Completed Analyses</label>
-                  <div className="flex flex-wrap gap-2 mt-1">
-                    {selectedSlide.completed_analyses.map((name: string) => (
-                      <Badge
-                        key={name}
-                        variant="secondary"
-                        style={{
-                          backgroundColor: '#3B82F620',
-                          color: '#3B82F6',
-                          borderColor: '#3B82F6',
-                        }}
-                      >
-                        {name}
-                      </Badge>
-                    ))}
+                  <div className="space-y-2 mt-1">
+                    {loadingResults ? (
+                      <p className="text-xs text-muted-foreground">Loading results...</p>
+                    ) : slideResults.length > 0 ? (
+                      slideResults.map((r) => (
+                        <div key={`${r.job_id}-${r.analysis_name}`} className="rounded border p-2">
+                          <div className="flex items-center gap-2">
+                            <Badge
+                              variant="secondary"
+                              style={{
+                                backgroundColor: '#3B82F620',
+                                color: '#3B82F6',
+                                borderColor: '#3B82F6',
+                              }}
+                            >
+                              {r.analysis_name} v{r.version}
+                            </Badge>
+                            <span className="text-xs text-muted-foreground">Job #{r.job_id}</span>
+                          </div>
+                          {r.cell_stats && (
+                            <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-muted-foreground mt-1.5">
+                              {Object.entries(r.cell_stats).map(([name, count]) => (
+                                <span key={name}>
+                                  <span className="font-medium text-foreground/70">{name}:</span>{' '}
+                                  {count.toLocaleString()}
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      ))
+                    ) : (
+                      <div className="flex flex-wrap gap-2">
+                        {selectedSlide.completed_analyses.map((name: string) => (
+                          <Badge
+                            key={name}
+                            variant="secondary"
+                            style={{
+                              backgroundColor: '#3B82F620',
+                              color: '#3B82F6',
+                              borderColor: '#3B82F6',
+                            }}
+                          >
+                            {name}
+                          </Badge>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 </div>
               )}
               {/* Annotations section */}
               <div className="col-span-2 pt-4 border-t">
                 <div className="flex items-center justify-between mb-2">
-                  <label className="text-sm font-medium">Annotations</label>
+                  <label className="text-sm font-medium">Imported Annotations</label>
                   <div>
                     <input
                       ref={annotationInputRef}

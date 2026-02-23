@@ -8,6 +8,7 @@ from typing import Optional, List
 from io import BytesIO
 import os
 import json
+import shutil
 import zipfile
 import queue
 import threading
@@ -2303,6 +2304,7 @@ def get_job(job_id: int, db: Session = Depends(get_db)):
             {
                 "id": js.id,
                 "slide_hash": js.slide.slide_hash if js.slide else None,
+                "filename": (indexer.get_filepath(js.slide.slide_hash).name if indexer and js.slide and indexer.get_filepath(js.slide.slide_hash) else None),
                 "cluster_job_id": js.cluster_job_id,
                 "status": js.status,
                 "started_at": js.started_at.isoformat() if js.started_at else None,
@@ -2310,6 +2312,7 @@ def get_job(job_id: int, db: Session = Depends(get_db)):
                 "error_message": js.error_message,
                 "log_tail": js.log_tail,
                 "remote_output_path": js.remote_output_path,
+                "cell_stats": _parse_cell_stats(js.log_tail),
             }
             for js in job.slides
         ],
@@ -2409,8 +2412,11 @@ def cancel_jobs(data: JobCancelRequest, db: Session = Depends(get_db)):
 
 
 @app.delete("/jobs/{job_id}")
-def delete_job(job_id: int, db: Session = Depends(get_db)):
-    """Hard-delete a job and all its JobSlide records from the database."""
+def delete_job(job_id: int, delete_files: bool = False, db: Session = Depends(get_db)):
+    """Hard-delete a job and all its JobSlide records from the database.
+    If delete_files=true, also removes output directories from disk."""
+    import shutil
+
     job = db.query(AnalysisJob).options(
         joinedload(AnalysisJob.slides)
     ).filter_by(id=job_id).first()
@@ -2420,14 +2426,22 @@ def delete_job(job_id: int, db: Session = Depends(get_db)):
     if job.status in ("running", "transferring"):
         raise HTTPException(status_code=400, detail="Cannot delete a running job. Cancel it first.")
 
+    files_deleted = 0
+    if delete_files:
+        for js in job.slides:
+            if js.local_output_path:
+                p = Path(js.local_output_path)
+                if p.is_dir():
+                    shutil.rmtree(p, ignore_errors=True)
+                    files_deleted += 1
+
     with get_lock().write_lock():
-        # Delete child JobSlides first (cascade should handle this, but be explicit)
         for js in job.slides:
             db.delete(js)
         db.delete(job)
         db.commit()
 
-    return {"status": "ok", "deleted_job_id": job_id}
+    return {"status": "ok", "deleted_job_id": job_id, "directories_removed": files_deleted}
 
 
 class JobDeleteBulkRequest(BaseModel):
@@ -2615,6 +2629,30 @@ def seed_cellvit(db: Session = Depends(get_db)):
 
 # ============================================================
 # Results Endpoints
+# ------------------------------------------------------------------
+
+
+def _parse_cell_stats(log_tail: Optional[str]) -> Optional[dict]:
+    """Extract cell count stats from a CellViT log tail.
+
+    Looks for a line like: {'Connective': 10550, 'Inflammatory': 5058, ...}
+    """
+    if not log_tail:
+        return None
+    import ast
+    for line in reversed(log_tail.splitlines()):
+        line = line.strip()
+        # Strip the log prefix if present (everything up to " - ")
+        if " - " in line:
+            line = line.split(" - ", 2)[-1].strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                parsed = ast.literal_eval(line)
+                if isinstance(parsed, dict) and all(isinstance(v, (int, float)) for v in parsed.values()):
+                    return parsed
+            except Exception:
+                continue
+    return None
 # ============================================================
 
 @app.get("/results/search")
@@ -2679,6 +2717,7 @@ def search_results(
                     "status": js.status,
                     "completed_at": js.completed_at.isoformat() if js.completed_at else None,
                     "output_path": js.local_output_path or js.remote_output_path,
+                    "cell_stats": _parse_cell_stats(js.log_tail),
                 }
                 for js in completed
             ],
@@ -2714,6 +2753,7 @@ def get_slide_results(slide_hash: str, db: Session = Depends(get_db)):
             "status": js.status,
             "completed_at": js.completed_at.isoformat() if js.completed_at else None,
             "output_path": js.local_output_path or js.remote_output_path,
+            "cell_stats": _parse_cell_stats(js.log_tail),
         }
         for js in completed_job_slides
     ]
@@ -3190,6 +3230,198 @@ def download_bundle(data: DownloadBundleRequest, db: Session = Depends(get_db)):
             "Content-Disposition": f'attachment; filename="job_{data.job_id}_bundle.zip"',
         },
     )
+
+
+# ============================================================
+# Dashboard & Staging Endpoints
+# ============================================================
+
+
+class SortRequest(BaseModel):
+    filenames: List[str] = []
+
+
+@app.get("/staging/scan")
+def staging_scan():
+    """Scan staging folder for .svs files and parse their filenames."""
+    if not indexer:
+        raise HTTPException(status_code=503, detail="Indexer not initialized")
+
+    staging = settings.staging_path
+    if not staging.exists():
+        return []
+
+    results = []
+    for f in sorted(staging.iterdir()):
+        if not f.is_file() or not f.name.lower().endswith('.svs'):
+            continue
+
+        entry = {
+            "filename": f.name,
+            "size_bytes": f.stat().st_size,
+            "parsed": False,
+            "accession": None,
+            "block_id": None,
+            "slide_number": None,
+            "stain_type": None,
+            "year": None,
+            "destination": None,
+            "conflict": False,
+        }
+
+        parsed = indexer.parser.parse(f.name)
+        if parsed:
+            dest = settings.slides_path / str(parsed.year) / f.name
+            entry.update({
+                "parsed": True,
+                "accession": parsed.accession,
+                "block_id": parsed.block_id,
+                "slide_number": parsed.slide_number,
+                "stain_type": parsed.stain_type,
+                "year": parsed.year,
+                "destination": f"slides/{parsed.year}/{f.name}",
+                "conflict": dest.exists(),
+            })
+
+        results.append(entry)
+
+    return results
+
+
+@app.post("/staging/sort")
+def staging_sort(req: SortRequest, db: Session = Depends(get_db)):
+    """Move parsed staging files into slides/{year}/ and index them."""
+    if not indexer:
+        raise HTTPException(status_code=503, detail="Indexer not initialized")
+
+    staging = settings.staging_path
+    if not staging.exists():
+        return {"sorted": 0, "skipped": 0, "errors": []}
+
+    # Determine which files to process
+    if req.filenames:
+        files = [staging / fn for fn in req.filenames if (staging / fn).is_file()]
+    else:
+        files = [f for f in staging.iterdir() if f.is_file() and f.name.lower().endswith('.svs')]
+
+    sorted_count = 0
+    skipped = 0
+    errors = []
+
+    for f in files:
+        parsed = indexer.parser.parse(f.name)
+        if not parsed:
+            skipped += 1
+            errors.append(f"{f.name}: cannot parse filename")
+            continue
+
+        year_dir = settings.slides_path / str(parsed.year)
+        dest = year_dir / f.name
+
+        if dest.exists():
+            skipped += 1
+            errors.append(f"{f.name}: already exists in destination")
+            continue
+
+        try:
+            year_dir.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(f), str(dest))
+            result = indexer.index_file(db, dest)
+            if result:
+                # Update path cache
+                _, slide = result
+                indexer.slide_hash_to_path[slide.slide_hash] = dest
+            db.commit()
+            sorted_count += 1
+        except Exception as e:
+            db.rollback()
+            errors.append(f"{f.name}: {str(e)}")
+            skipped += 1
+
+    return {"sorted": sorted_count, "skipped": skipped, "errors": errors}
+
+
+@app.get("/dashboard/summary")
+def dashboard_summary(db: Session = Depends(get_db)):
+    """Aggregated dashboard data: library stats, staging, recent jobs, storage."""
+    if not indexer:
+        raise HTTPException(status_code=503, detail="Indexer not initialized")
+
+    # Library stats
+    stats = indexer.get_stats(db)
+
+    # Year breakdown from DB
+    year_counts = {}
+    for case in db.query(Case).all():
+        yr = case.year
+        if yr:
+            slide_count = len(case.slides)
+            year_counts[yr] = year_counts.get(yr, 0) + slide_count
+
+    # Staging info
+    staging = settings.staging_path
+    staging_count = 0
+    staging_size = 0
+    if staging.exists():
+        for f in staging.iterdir():
+            if f.is_file() and f.name.lower().endswith('.svs'):
+                staging_count += 1
+                staging_size += f.stat().st_size
+
+    # Recent jobs
+    recent_jobs = (
+        db.query(AnalysisJob)
+        .options(joinedload(AnalysisJob.slides))
+        .order_by(AnalysisJob.submitted_at.desc())
+        .limit(5)
+        .all()
+    )
+    jobs_data = [
+        {
+            "id": j.id,
+            "model_name": j.model_name,
+            "status": j.status,
+            "slide_count": len(j.slides),
+            "submitted_at": j.submitted_at.isoformat() if j.submitted_at else None,
+            "completed_at": j.completed_at.isoformat() if j.completed_at else None,
+        }
+        for j in recent_jobs
+    ]
+
+    # Storage sizes (lightweight: just sum file sizes)
+    def dir_size_mb(path: Path) -> int:
+        if not path.exists():
+            return 0
+        total = 0
+        try:
+            for dirpath, _, filenames in os.walk(path):
+                for fn in filenames:
+                    try:
+                        total += os.path.getsize(os.path.join(dirpath, fn))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        return total // (1024 * 1024)
+
+    return {
+        "library": {
+            "total_slides": stats['total_slides'],
+            "total_cases": stats['total_cases'],
+            "years": year_counts,
+        },
+        "staging": {
+            "count": staging_count,
+            "total_size_bytes": staging_size,
+        },
+        "recent_jobs": jobs_data,
+        "storage": {
+            "network_root": settings.NETWORK_ROOT,
+            "slides_size_mb": dir_size_mb(settings.slides_path),
+            "analyses_size_mb": dir_size_mb(settings.analyses_path),
+            "staging_size_mb": dir_size_mb(settings.staging_path),
+        },
+    }
 
 
 # ============================================================

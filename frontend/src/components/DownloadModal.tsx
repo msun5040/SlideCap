@@ -296,7 +296,7 @@ export function DownloadModal({ open, onOpenChange, slideHashes, jobId }: Downlo
                 />
                 <FileText className="h-4 w-4 text-orange-500 shrink-0" />
                 <div className="min-w-0">
-                  <p className="text-sm font-medium">Annotations</p>
+                  <p className="text-sm font-medium">Imported Annotations</p>
                   <p className="text-xs text-muted-foreground">{totalAnnotations} file{totalAnnotations !== 1 ? 's' : ''}</p>
                 </div>
               </label>
