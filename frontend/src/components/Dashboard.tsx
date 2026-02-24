@@ -14,6 +14,7 @@ import {
   XCircle,
   Clock,
   Loader2,
+  Trash2,
 } from 'lucide-react'
 
 const API = 'http://127.0.0.1:8000'
@@ -29,6 +30,17 @@ interface StagingFile {
   year: number | null
   destination: string | null
   conflict: boolean
+}
+
+interface SortStatus {
+  running: boolean
+  done: boolean
+  total: number
+  current: number
+  current_file: string
+  sorted: number
+  skipped: number
+  errors: string[]
 }
 
 interface DashboardSummary {
@@ -97,13 +109,17 @@ function StatusBadge({ status }: { status: string }) {
   )
 }
 
-export function Dashboard() {
+interface DashboardProps {
+  onSortStarted: () => void
+  sortStatus: SortStatus | null
+}
+
+export function Dashboard({ onSortStarted, sortStatus }: DashboardProps) {
   const [summary, setSummary] = useState<DashboardSummary | null>(null)
   const [stagingFiles, setStagingFiles] = useState<StagingFile[] | null>(null)
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [scanning, setScanning] = useState(false)
   const [sorting, setSorting] = useState(false)
-  const [sortResult, setSortResult] = useState<{ sorted: number; skipped: number; errors: string[] } | null>(null)
 
   const fetchSummary = useCallback(async () => {
     try {
@@ -118,7 +134,6 @@ export function Dashboard() {
 
   const handleScan = async () => {
     setScanning(true)
-    setSortResult(null)
     try {
       const res = await fetch(`${API}/staging/scan`)
       if (res.ok) {
@@ -132,7 +147,6 @@ export function Dashboard() {
 
   const handleSort = async (filenames?: string[]) => {
     setSorting(true)
-    setSortResult(null)
     try {
       const body = filenames ? { filenames } : { filenames: [] }
       const res = await fetch(`${API}/staging/sort`, {
@@ -141,15 +155,31 @@ export function Dashboard() {
         body: JSON.stringify(body),
       })
       if (res.ok) {
-        const result = await res.json()
-        setSortResult(result)
-        // Re-scan and refresh summary
-        await handleScan()
-        await fetchSummary()
+        onSortStarted()
       }
     } catch { /* ignore */ }
     setSorting(false)
   }
+
+  const handleDeleteStaging = async (filename: string) => {
+    try {
+      await fetch(`${API}/staging/file/${encodeURIComponent(filename)}`, { method: 'DELETE' })
+      setStagingFiles(prev => prev?.filter(f => f.filename !== filename) ?? null)
+    } catch { /* ignore */ }
+  }
+
+  const handleDeleteAllConflicts = async () => {
+    const conflicts = stagingFiles?.filter(f => f.conflict) ?? []
+    await Promise.all(conflicts.map(f => handleDeleteStaging(f.filename)))
+  }
+
+  // Re-scan and refresh when sort completes
+  useEffect(() => {
+    if (sortStatus?.done && !sortStatus.running) {
+      handleScan()
+      fetchSummary()
+    }
+  }, [sortStatus?.done, sortStatus?.running])
 
   const selectableFiles = stagingFiles?.filter(f => f.parsed && !f.conflict) || []
   const allSelected = selectableFiles.length > 0 && selectableFiles.every(f => selected.has(f.filename))
@@ -236,11 +266,17 @@ export function Dashboard() {
               {scanning ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <ScanSearch className="h-4 w-4 mr-1" />}
               Scan Staging Folder
             </Button>
+            {stagingFiles && stagingFiles.some(f => f.conflict) && (
+              <Button variant="outline" size="sm" onClick={handleDeleteAllConflicts} className="text-red-600 hover:text-red-700">
+                <Trash2 className="h-4 w-4 mr-1" />
+                Remove Conflicts ({stagingFiles.filter(f => f.conflict).length})
+              </Button>
+            )}
             {stagingFiles && selectableFiles.length > 0 && (
               <Button
                 size="sm"
                 onClick={() => handleSort()}
-                disabled={sorting}
+                disabled={sorting || sortStatus?.running}
               >
                 {sorting ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <ArrowRightLeft className="h-4 w-4 mr-1" />}
                 Sort All ({selectableFiles.length})
@@ -248,20 +284,6 @@ export function Dashboard() {
             )}
           </div>
         </div>
-
-        {sortResult && (
-          <div className={`mx-4 mt-3 rounded-md p-3 text-sm ${sortResult.errors.length > 0 ? 'bg-yellow-50 border border-yellow-200' : 'bg-green-50 border border-green-200'}`}>
-            <p className="font-medium">
-              {sortResult.sorted > 0 && <span className="text-green-700">Sorted {sortResult.sorted} file{sortResult.sorted !== 1 ? 's' : ''}. </span>}
-              {sortResult.skipped > 0 && <span className="text-yellow-700">Skipped {sortResult.skipped}.</span>}
-            </p>
-            {sortResult.errors.length > 0 && (
-              <ul className="mt-1 text-yellow-700 text-xs space-y-0.5">
-                {sortResult.errors.map((e, i) => <li key={i}>{e}</li>)}
-              </ul>
-            )}
-          </div>
-        )}
 
         {stagingFiles === null ? (
           <div className="p-8 text-center text-muted-foreground text-sm">
@@ -314,7 +336,16 @@ export function Dashboard() {
                       <td className="py-2 pr-3 text-right text-muted-foreground">{formatBytes(f.size_bytes)}</td>
                       <td className="py-2 text-xs text-muted-foreground">
                         {f.conflict ? (
-                          <span className="text-red-500">Conflict: file exists</span>
+                          <div className="flex items-center gap-2">
+                            <span className="text-red-500">Conflict: file exists</span>
+                            <button
+                              className="p-0.5 rounded text-muted-foreground hover:text-red-600 hover:bg-red-50 transition-colors"
+                              title="Remove from staging"
+                              onClick={() => handleDeleteStaging(f.filename)}
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
                         ) : f.destination ? (
                           <span>&rarr; {f.destination}</span>
                         ) : (
@@ -329,7 +360,7 @@ export function Dashboard() {
 
             {selected.size > 0 && (
               <div className="mt-3 flex justify-end">
-                <Button size="sm" onClick={() => handleSort([...selected])} disabled={sorting}>
+                <Button size="sm" onClick={() => handleSort([...selected])} disabled={sorting || sortStatus?.running}>
                   {sorting ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <ArrowRightLeft className="h-4 w-4 mr-1" />}
                   Sort Selected ({selected.size})
                 </Button>

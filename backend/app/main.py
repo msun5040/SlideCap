@@ -3241,6 +3241,112 @@ class SortRequest(BaseModel):
     filenames: List[str] = []
 
 
+# ── Sort background job state ────────────────────────────────────────────────
+_sort_state: dict = {
+    "running": False,
+    "done": False,
+    "total": 0,
+    "current": 0,
+    "current_file": "",
+    "sorted": 0,
+    "skipped": 0,
+    "errors": [],
+}
+
+
+def _run_sort_background(filenames: list) -> None:
+    """
+    Two-phase background sort for maximum speed:
+      Phase 1 – OS rename every file (atomic, instant on same filesystem)
+      Phase 2 – Batch-index all moved files in a single DB transaction
+    """
+    global _sort_state
+    _sort_state.update({
+        "running": True,
+        "done": False,
+        "total": len(filenames),
+        "current": 0,
+        "current_file": "",
+        "sorted": 0,
+        "skipped": 0,
+        "errors": [],
+    })
+
+    staging = settings.staging_path
+    moved: list = []  # (dest_path, parsed)
+
+    # Phase 1: rename/move (no data copy on same-FS network volume)
+    for i, fn in enumerate(filenames):
+        _sort_state["current"] = i + 1
+        _sort_state["current_file"] = fn
+
+        f = staging / fn
+        if not f.is_file():
+            _sort_state["skipped"] += 1
+            _sort_state["errors"].append(f"{fn}: file not found")
+            continue
+
+        parsed = indexer.parser.parse(fn)
+        if not parsed:
+            _sort_state["skipped"] += 1
+            _sort_state["errors"].append(f"{fn}: cannot parse filename")
+            continue
+
+        year_dir = settings.slides_path / str(parsed.year)
+        canonical_name = parsed.full_stem + ".svs"
+        dest = year_dir / canonical_name
+
+        if dest.exists():
+            _sort_state["skipped"] += 1
+            _sort_state["errors"].append(f"{fn}: already exists in destination")
+            continue
+
+        try:
+            year_dir.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(f), str(dest))
+            moved.append((dest, parsed))
+            _sort_state["sorted"] += 1
+        except Exception as e:
+            _sort_state["errors"].append(f"{fn}: {str(e)}")
+            _sort_state["skipped"] += 1
+
+    # Phase 2: single batch DB commit
+    if moved:
+        _sort_state["current_file"] = "Indexing…"
+        db = get_session()
+        try:
+            for dest, _parsed in moved:
+                result = indexer.index_file(db, dest)
+                if result:
+                    _, slide = result
+                    indexer.slide_hash_to_path[slide.slide_hash] = dest
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            _sort_state["errors"].append(f"Indexing error: {str(e)}")
+        finally:
+            db.close()
+
+    _sort_state.update({"running": False, "done": True, "current_file": ""})
+
+
+@app.get("/staging/sort/status")
+def staging_sort_status():
+    """Poll current sort job progress."""
+    return _sort_state
+
+
+@app.delete("/staging/file/{filename}")
+def staging_delete_file(filename: str):
+    """Delete a single file from the staging folder."""
+    safe_name = Path(filename).name  # strip any path components
+    f = settings.staging_path / safe_name
+    if not f.exists():
+        raise HTTPException(status_code=404, detail="File not found in staging")
+    f.unlink()
+    return {"deleted": safe_name}
+
+
 @app.get("/staging/scan")
 def staging_scan():
     """Scan staging folder for .svs files and parse their filenames."""
@@ -3252,13 +3358,23 @@ def staging_scan():
         return []
 
     results = []
-    for f in sorted(staging.iterdir()):
-        if not f.is_file() or not f.name.lower().endswith('.svs'):
+    # os.scandir caches DirEntry.stat() from the directory listing on SMB,
+    # avoiding a separate stat() network call per file.
+    with os.scandir(staging) as it:
+        entries = sorted(it, key=lambda e: e.name)
+
+    for entry in entries:
+        if not entry.is_file(follow_symlinks=False) or not entry.name.lower().endswith('.svs'):
             continue
 
-        entry = {
-            "filename": f.name,
-            "size_bytes": f.stat().st_size,
+        try:
+            size = entry.stat(follow_symlinks=False).st_size
+        except OSError:
+            size = 0
+
+        result_entry = {
+            "filename": entry.name,
+            "size_bytes": size,
             "parsed": False,
             "accession": None,
             "block_id": None,
@@ -3269,76 +3385,52 @@ def staging_scan():
             "conflict": False,
         }
 
-        parsed = indexer.parser.parse(f.name)
+        parsed = indexer.parser.parse(entry.name)
         if parsed:
-            dest = settings.slides_path / str(parsed.year) / f.name
-            entry.update({
+            canonical_name = parsed.full_stem + ".svs"
+            slide_hash = indexer.hasher.hash_slide_stem(parsed.full_stem)
+            result_entry.update({
                 "parsed": True,
                 "accession": parsed.accession,
                 "block_id": parsed.block_id,
                 "slide_number": parsed.slide_number,
                 "stain_type": parsed.stain_type,
                 "year": parsed.year,
-                "destination": f"slides/{parsed.year}/{f.name}",
-                "conflict": dest.exists(),
+                "destination": f"slides/{parsed.year}/{canonical_name}",
+                "conflict": slide_hash in indexer.slide_hash_to_path,
             })
 
-        results.append(entry)
+        results.append(result_entry)
 
     return results
 
 
 @app.post("/staging/sort")
-def staging_sort(req: SortRequest, db: Session = Depends(get_db)):
-    """Move parsed staging files into slides/{year}/ and index them."""
+def staging_sort(req: SortRequest):
+    """Start sort in background. Returns immediately — poll /staging/sort/status for progress."""
     if not indexer:
         raise HTTPException(status_code=503, detail="Indexer not initialized")
 
+    if _sort_state.get("running"):
+        raise HTTPException(status_code=409, detail="Sort already in progress")
+
     staging = settings.staging_path
     if not staging.exists():
-        return {"sorted": 0, "skipped": 0, "errors": []}
+        return {"started": False, "total": 0, "message": "Staging folder not found"}
 
-    # Determine which files to process
     if req.filenames:
-        files = [staging / fn for fn in req.filenames if (staging / fn).is_file()]
+        filenames = [fn for fn in req.filenames if (staging / fn).is_file()]
     else:
-        files = [f for f in staging.iterdir() if f.is_file() and f.name.lower().endswith('.svs')]
+        filenames = [
+            f.name for f in staging.iterdir()
+            if f.is_file() and f.name.lower().endswith('.svs')
+        ]
 
-    sorted_count = 0
-    skipped = 0
-    errors = []
+    if not filenames:
+        return {"started": False, "total": 0, "message": "No files to sort"}
 
-    for f in files:
-        parsed = indexer.parser.parse(f.name)
-        if not parsed:
-            skipped += 1
-            errors.append(f"{f.name}: cannot parse filename")
-            continue
-
-        year_dir = settings.slides_path / str(parsed.year)
-        dest = year_dir / f.name
-
-        if dest.exists():
-            skipped += 1
-            errors.append(f"{f.name}: already exists in destination")
-            continue
-
-        try:
-            year_dir.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(f), str(dest))
-            result = indexer.index_file(db, dest)
-            if result:
-                # Update path cache
-                _, slide = result
-                indexer.slide_hash_to_path[slide.slide_hash] = dest
-            db.commit()
-            sorted_count += 1
-        except Exception as e:
-            db.rollback()
-            errors.append(f"{f.name}: {str(e)}")
-            skipped += 1
-
-    return {"sorted": sorted_count, "skipped": skipped, "errors": errors}
+    threading.Thread(target=_run_sort_background, args=(filenames,), daemon=True).start()
+    return {"started": True, "total": len(filenames)}
 
 
 @app.get("/dashboard/summary")

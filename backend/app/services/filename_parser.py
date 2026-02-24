@@ -74,8 +74,11 @@ class FilenameParser:
         year_short = int(year_str)
         year = 2000 + year_short if year_short < 50 else 1900 + year_short
 
+        # Normalize accession: BS-22-W29575 → BS22-W29575 (drop the dash between BS and year digits)
+        accession_norm = re.sub(r'^BS-(\d{2})-', r'BS\1-', accession.upper())
+
         return ParsedFilename(
-            accession=accession.upper(),
+            accession=accession_norm,
             block_id=block_id.upper(),
             slide_number=slide_number or '',  # May be None if no dash in block-slide
             stain_type=stain_type,

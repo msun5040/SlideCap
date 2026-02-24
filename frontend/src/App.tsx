@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import {
   LayoutDashboard,
   Microscope,
@@ -13,11 +13,59 @@ import { SlideLibrary } from '@/components/SlideLibrary'
 import { CohortDashboard } from '@/components/CohortDashboard'
 import { AnalysisDashboard } from '@/components/AnalysisDashboard'
 
+const API = 'http://127.0.0.1:8000'
+
+interface SortStatus {
+  running: boolean
+  done: boolean
+  total: number
+  current: number
+  current_file: string
+  sorted: number
+  skipped: number
+  errors: string[]
+}
+
 type View = 'dashboard' | 'slides' | 'cohorts' | 'analysis'
 
 export default function App() {
   const [currentView, setCurrentView] = useState<View>('slides')
   const [isSidebarOpen, setIsSidebarOpen] = useState(true)
+  const [sortStatus, setSortStatus] = useState<SortStatus | null>(null)
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
+  const startPolling = useCallback(() => {
+    if (pollRef.current) return
+    pollRef.current = setInterval(async () => {
+      try {
+        const res = await fetch(`${API}/staging/sort/status`)
+        if (!res.ok) return
+        const status: SortStatus = await res.json()
+        setSortStatus(status)
+        if (!status.running) {
+          clearInterval(pollRef.current!)
+          pollRef.current = null
+        }
+      } catch { /* network error, keep polling */ }
+    }, 800)
+  }, [])
+
+  // On mount: check if a sort is already running (e.g. page reload mid-sort)
+  useEffect(() => {
+    fetch(`${API}/staging/sort/status`)
+      .then(r => r.ok ? r.json() : null)
+      .then((status: SortStatus | null) => {
+        if (status) {
+          setSortStatus(status)
+          if (status.running) startPolling()
+        }
+      })
+      .catch(() => {})
+  }, [startPolling])
+
+  const handleSortStarted = useCallback(() => {
+    startPolling()
+  }, [startPolling])
 
   const navigationItems = [
     { id: 'dashboard' as View, label: 'Dashboard', icon: LayoutDashboard },
@@ -29,7 +77,7 @@ export default function App() {
   const renderContent = () => {
     switch (currentView) {
       case 'dashboard':
-        return <Dashboard />
+        return <Dashboard onSortStarted={handleSortStarted} sortStatus={sortStatus} />
       case 'slides':
         return <SlideLibrary />
       case 'cohorts':
@@ -119,6 +167,42 @@ export default function App() {
             </p>
           </div>
         </header>
+
+        {/* Sort progress banner — persists across navigation */}
+        {sortStatus && (sortStatus.running || sortStatus.done) && (
+          <div className="border-b bg-muted/40 px-6 py-2">
+            {sortStatus.running ? (
+              <div className="space-y-1">
+                <div className="flex items-center justify-between text-xs text-muted-foreground">
+                  <span className="font-medium text-foreground">Sorting slides…</span>
+                  <span>{sortStatus.current} / {sortStatus.total}</span>
+                </div>
+                <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+                  <div
+                    className="h-full bg-primary transition-all duration-300"
+                    style={{ width: sortStatus.total > 0 ? `${(sortStatus.current / sortStatus.total) * 100}%` : '0%' }}
+                  />
+                </div>
+                {sortStatus.current_file && (
+                  <p className="truncate text-xs text-muted-foreground">{sortStatus.current_file}</p>
+                )}
+              </div>
+            ) : (
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-green-700 font-medium">
+                  Sort complete — {sortStatus.sorted} moved
+                  {sortStatus.skipped > 0 && `, ${sortStatus.skipped} skipped`}
+                </span>
+                <button
+                  className="text-muted-foreground hover:text-foreground"
+                  onClick={() => setSortStatus(null)}
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Content Area */}
         <main className="flex-1 overflow-y-auto p-6">

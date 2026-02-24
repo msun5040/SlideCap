@@ -740,6 +740,19 @@ export function AnalysisResults() {
                     {(selectedJobSlides[job.id]?.size ?? 0) > 0 &&
                       ` (${selectedJobSlides[job.id].size})`}
                   </Button>
+                  <Button
+                    variant={showHashes ? 'secondary' : 'ghost'}
+                    size="sm"
+                    className="h-7 text-xs gap-1"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      setShowHashes((v) => !v)
+                    }}
+                    title={showHashes ? 'Showing slide hashes — click to show filenames' : 'Showing filenames — click to show slide hashes'}
+                  >
+                    <Hash className="h-3.5 w-3.5" />
+                    {showHashes ? 'Hashes' : 'Filenames'}
+                  </Button>
                   {detail && (
                     <div className="flex items-center gap-1 ml-auto text-xs">
                       <button
