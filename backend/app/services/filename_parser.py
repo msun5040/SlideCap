@@ -50,7 +50,7 @@ class FilenameParser:
     # ([A-Za-z0-9-]+)              - Stain type: alphanumeric with possible dashes
     # ([A-Za-z0-9]+)               - Random ID: alphanumeric string
     PATTERN = re.compile(
-        r'^(BS-?(\d{2})-[A-Z]?\d{5,6})_([A-Z]\d*)(?:-(\d+))?_([A-Za-z0-9-]+)_([A-Za-z0-9]+)\.svs$',
+        r'^(BS-?(\d{2})-[A-Z]?\d{5,6})_(?:([A-Z](?:\d+)?)(?:-(\d+))?|(\d+))_([A-Za-z0-9-]+)_([A-Za-z0-9]+)\.svs$',
         re.IGNORECASE
     )
 
@@ -68,7 +68,7 @@ class FilenameParser:
         if not match:
             return None
 
-        accession, year_str, block_id, slide_number, stain_type, random_id = match.groups()
+        accession, year_str, block_id, slide_from_block, slide_only, stain_type, random_id = match.groups()
 
         # Year is captured directly by the regex group
         year_short = int(year_str)
@@ -76,10 +76,13 @@ class FilenameParser:
 
         # Normalize accession: BS-22-W29575 → BS22-W29575 (drop the dash between BS and year digits)
         accession_norm = re.sub(r'^BS-(\d{2})-', r'BS\1-', accession.upper())
-
+        
+        slide_number = slide_from_block or slide_only or ''
+        block_id = block_id or '' 
+        
         return ParsedFilename(
             accession=accession_norm,
-            block_id=block_id.upper(),
+            block_id=block_id.upper() if block_id else '',
             slide_number=slide_number or '',  # May be None if no dash in block-slide
             stain_type=stain_type,
             random_id=random_id.lower(),

@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, XCircle, ChevronDown, ChevronRight } from 'lucide-react'
+import { RefreshCw, XCircle, ChevronDown, ChevronRight, RotateCcw } from 'lucide-react'
+import { signalClusterDisconnected } from '@/components/ClusterConnect'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import {
@@ -28,6 +29,7 @@ export function AnalysisJobs() {
   const [loading, setLoading] = useState(true)
   const [statusFilter, setStatusFilter] = useState<string>('')
   const [isRefreshing, setIsRefreshing] = useState(false)
+  const [retryingJobs, setRetryingJobs] = useState<Set<number>>(new Set())
   const [expandedJobId, setExpandedJobId] = useState<number | null>(null)
   const [expandedSlides, setExpandedSlides] = useState<JobSlide[]>([])
   const [loadingSlides, setLoadingSlides] = useState(false)
@@ -87,13 +89,32 @@ export function AnalysisJobs() {
   const handleRefresh = async () => {
     setIsRefreshing(true)
     try {
-      await fetch(`${API_BASE}/jobs/refresh`, { method: 'POST' })
+      const res = await fetch(`${API_BASE}/jobs/refresh`, { method: 'POST' })
+      if (res.status === 503) { signalClusterDisconnected(); return }
       await fetchJobs()
       if (expandedJobId) await fetchJobDetail(expandedJobId)
     } catch (e) {
       console.error('Refresh failed:', e)
     } finally {
       setIsRefreshing(false)
+    }
+  }
+
+  const handleRetry = async (jobId: number) => {
+    setRetryingJobs((prev) => new Set(prev).add(jobId))
+    try {
+      const res = await fetch(`${API_BASE}/jobs/${jobId}/retry`, { method: 'POST' })
+      if (res.status === 503) { signalClusterDisconnected(); return }
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        alert(err.detail || 'Retry failed')
+      }
+      await fetchJobs()
+      if (expandedJobId === jobId) await fetchJobDetail(jobId)
+    } catch (e) {
+      console.error('Retry failed:', e)
+    } finally {
+      setRetryingJobs((prev) => { const s = new Set(prev); s.delete(jobId); return s })
     }
   }
 
@@ -250,19 +271,29 @@ export function AnalysisJobs() {
                     </TableCell>
                     <TableCell className="text-sm">{formatDuration(job)}</TableCell>
                     <TableCell>
-                      {(job.status === 'running' || job.status === 'transferring' || job.status === 'pending') && (
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            handleCancel(job.id)
-                          }}
-                          title="Cancel job"
-                        >
-                          <XCircle className="h-4 w-4 text-destructive" />
-                        </Button>
-                      )}
+                      <div className="flex items-center gap-1">
+                        {(job.status === 'running' || job.status === 'transferring' || job.status === 'pending') && (
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            onClick={(e) => { e.stopPropagation(); handleCancel(job.id) }}
+                            title="Cancel job"
+                          >
+                            <XCircle className="h-4 w-4 text-destructive" />
+                          </Button>
+                        )}
+                        {job.failed_count > 0 && job.status !== 'running' && job.status !== 'transferring' && (
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            disabled={retryingJobs.has(job.id)}
+                            onClick={(e) => { e.stopPropagation(); handleRetry(job.id) }}
+                            title={`Retry ${job.failed_count} failed slide(s) — skips already-uploaded files`}
+                          >
+                            <RotateCcw className={`h-4 w-4 text-amber-600 ${retryingJobs.has(job.id) ? 'animate-spin' : ''}`} />
+                          </Button>
+                        )}
+                      </div>
                     </TableCell>
                   </TableRow>
                   {expandedJobId === job.id && (

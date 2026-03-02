@@ -13,6 +13,8 @@ import {
   ShoppingCart,
   X,
   Hash,
+  Folder,
+  Archive,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -28,6 +30,8 @@ import {
 } from '@/components/ui/dialog'
 import { DownloadModal } from '@/components/DownloadModal'
 import { CopyableText } from '@/components/CopyableText'
+import type { Analysis } from '@/types/slide'
+import { signalClusterDisconnected } from '@/components/ClusterConnect'
 
 const API_BASE = 'http://localhost:8000'
 
@@ -55,6 +59,9 @@ interface JobSlideDetail {
   id: number
   slide_hash: string | null
   filename: string | null
+  accession_number: string | null
+  block_id: string | null
+  stain_type: string | null
   cluster_job_id: string | null
   status: string
   started_at: string | null
@@ -69,10 +76,13 @@ interface JobDetail extends JobSummary {
   slides: JobSlideDetail[]
 }
 
-interface ResultFile {
+interface FileTreeNode {
   name: string
-  size: number
-  is_image: boolean
+  type: 'file' | 'dir'
+  path: string        // relative path from slide output dir (posix)
+  size?: number       // files only
+  is_image?: boolean  // files only
+  children?: FileTreeNode[]  // dirs only
 }
 
 interface SlideResult {
@@ -145,8 +155,11 @@ export function AnalysisResults() {
 
   // Slide expansion within jobs
   const [expandedSlides, setExpandedSlides] = useState<Set<string>>(new Set()) // key: "jobId:slideHash"
-  const [slideFiles, setSlideFiles] = useState<Record<string, ResultFile[]>>({}) // key: "jobId:slideHash"
+  const [slideFiles, setSlideFiles] = useState<Record<string, FileTreeNode[]>>({}) // key: "jobId:slideHash"
   const [loadingSlideFiles, setLoadingSlideFiles] = useState<Set<string>>(new Set())
+
+  // Folder expansion within slide file trees
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set()) // key: "jobId:slideHash::folderPath"
 
   // Search state
   const [query, setQuery] = useState('')
@@ -156,11 +169,12 @@ export function AnalysisResults() {
 
   // Search mode: slide expansion for file browsing
   const [searchExpandedSlides, setSearchExpandedSlides] = useState<Set<string>>(new Set())
-  const [searchSlideFiles, setSearchSlideFiles] = useState<Record<string, ResultFile[]>>({})
+  const [searchSlideFiles, setSearchSlideFiles] = useState<Record<string, FileTreeNode[]>>({})
   const [searchLoadingFiles, setSearchLoadingFiles] = useState<Set<string>>(new Set())
 
   // Transfer state
   const [transferringJobs, setTransferringJobs] = useState<Set<number>>(new Set())
+
 
   // Cart state
   const [cart, setCart] = useState<Set<string>>(new Set()) // "jobId:slideHash:filename"
@@ -345,6 +359,7 @@ export function AnalysisResults() {
     setTransferringJobs((prev) => new Set(prev).add(jobId))
     try {
       const res = await fetch(`${API_BASE}/jobs/${jobId}/transfer-results`, { method: 'POST' })
+      if (res.status === 503) { signalClusterDisconnected(); return }
       if (res.ok) {
         const data = await res.json()
         if (data.transferred > 0) {
@@ -417,31 +432,28 @@ export function AnalysisResults() {
     })
   }
 
-  const confirmDeleteFile = (jobId: number, slideHash: string, filename: string) => {
+  const confirmDeleteFile = (jobId: number, slideHash: string, filePath: string, displayName: string) => {
     setDeleteConfirm({
       open: true,
       type: 'file',
-      label: filename,
+      label: displayName,
       onConfirm: async () => {
         try {
           const res = await fetch(
-            `${API_BASE}/results/${jobId}/file/${encodeURIComponent(filename)}?slide_hash=${encodeURIComponent(slideHash)}`,
+            `${API_BASE}/results/${jobId}/file/${encodeFilePath(filePath)}?slide_hash=${encodeURIComponent(slideHash)}`,
             { method: 'DELETE' }
           )
           if (res.ok) {
-            // Remove from cached file list
             const key = slideKey(jobId, slideHash)
             setSlideFiles((prev) => ({
               ...prev,
-              [key]: (prev[key] || []).filter((f) => f.name !== filename),
+              [key]: removeFileFromTree(prev[key] || [], filePath),
             }))
-            // Also remove from search file cache
             setSearchSlideFiles((prev) => ({
               ...prev,
-              [key]: (prev[key] || []).filter((f) => f.name !== filename),
+              [key]: removeFileFromTree(prev[key] || [], filePath),
             }))
-            // Remove from cart
-            const ck = cartKey(jobId, slideHash, filename)
+            const ck = cartKey(jobId, slideHash, filePath)
             setCart((prev) => {
               const next = new Set(prev)
               next.delete(ck)
@@ -458,13 +470,45 @@ export function AnalysisResults() {
     })
   }
 
+  // ---------- File tree helpers ----------
+
+  // Encode a relative path for use in a URL (encode each segment, preserve slashes)
+  const encodeFilePath = (path: string) =>
+    path.split('/').map(encodeURIComponent).join('/')
+
+  const removeFileFromTree = (nodes: FileTreeNode[], path: string): FileTreeNode[] =>
+    nodes
+      .filter((n) => n.path !== path)
+      .map((n) =>
+        n.type === 'dir' && n.children
+          ? { ...n, children: removeFileFromTree(n.children, path) }
+          : n
+      )
+
+  const toggleFolder = (fKey: string) => {
+    setExpandedFolders((prev) => {
+      const next = new Set(prev)
+      if (next.has(fKey)) next.delete(fKey)
+      else next.add(fKey)
+      return next
+    })
+  }
+
   // ---------- File download ----------
 
-  const downloadFile = (jobId: number, slideHash: string, filename: string) => {
-    const url = `${API_BASE}/results/${jobId}/file/${encodeURIComponent(filename)}?slide_hash=${encodeURIComponent(slideHash)}`
+  const downloadFile = (jobId: number, slideHash: string, filePath: string) => {
+    const url = `${API_BASE}/results/${jobId}/file/${encodeFilePath(filePath)}?slide_hash=${encodeURIComponent(slideHash)}`
     const a = document.createElement('a')
     a.href = url
-    a.download = filename.replace(/\.snappy$/, '')
+    a.download = filePath.split('/').pop()!.replace(/\.snappy$/, '')
+    a.click()
+  }
+
+  const downloadFolder = (jobId: number, slideHash: string, folderPath: string) => {
+    const url = `${API_BASE}/results/${jobId}/download-folder?slide_hash=${encodeURIComponent(slideHash)}&folder_path=${encodeURIComponent(folderPath)}`
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `${folderPath.split('/').pop()}.zip`
     a.click()
   }
 
@@ -475,9 +519,9 @@ export function AnalysisResults() {
     a.click()
   }
 
-  const previewFile = (jobId: number, slideHash: string, filename: string) => {
+  const previewFile = (jobId: number, slideHash: string, filePath: string) => {
     setPreviewUrl(
-      `${API_BASE}/results/${jobId}/file/${encodeURIComponent(filename)}?slide_hash=${encodeURIComponent(slideHash)}`
+      `${API_BASE}/results/${jobId}/file/${encodeFilePath(filePath)}?slide_hash=${encodeURIComponent(slideHash)}`
     )
   }
 
@@ -542,15 +586,16 @@ export function AnalysisResults() {
     })
   }
 
-  const selectAllJobSlides = (jobId: number) => {
+  const toggleAllJobSlides = (jobId: number) => {
     const detail = jobDetails[jobId]
     if (!detail) return
-    const all = new Set(detail.slides.filter((s) => s.slide_hash).map((s) => s.slide_hash!))
-    setSelectedJobSlides((prev) => ({ ...prev, [jobId]: all }))
-  }
-
-  const clearJobSlideSelection = (jobId: number) => {
-    setSelectedJobSlides((prev) => ({ ...prev, [jobId]: new Set() }))
+    const all = detail.slides.filter((s) => s.slide_hash).map((s) => s.slide_hash!)
+    const current = selectedJobSlides[jobId] ?? new Set()
+    if (current.size >= all.length) {
+      setSelectedJobSlides((prev) => ({ ...prev, [jobId]: new Set() }))
+    } else {
+      setSelectedJobSlides((prev) => ({ ...prev, [jobId]: new Set(all) }))
+    }
   }
 
   const openBundleModal = (jobId: number, slideHashes?: string[]) => {
@@ -585,60 +630,106 @@ export function AnalysisResults() {
     )
   }
 
-  // ---------- Render file row ----------
+  // ---------- Render file tree (recursive) ----------
 
-  const renderFileRow = (
-    file: ResultFile,
+  const renderFileTree = (
+    nodes: FileTreeNode[],
     jobId: number,
     slideHash: string,
-  ) => {
-    const key = cartKey(jobId, slideHash, file.name)
-    const inCart = cart.has(key)
+    depth: number = 0,
+  ): React.ReactNode => {
+    const basePl = 48  // pl-12 equivalent in px
+    const indentPx = basePl + depth * 16
 
-    return (
-      <div key={file.name} className="flex items-center justify-between py-1 pl-12 pr-3">
-        <div className="flex items-center gap-2">
-          <Checkbox
-            checked={inCart}
-            onCheckedChange={() => toggleCart(jobId, slideHash, file.name)}
-          />
-          {file.is_image ? (
-            <Image className="h-3.5 w-3.5 text-blue-500" />
-          ) : (
-            <FileText className="h-3.5 w-3.5 text-muted-foreground" />
-          )}
-          <span className="text-sm font-mono">{file.name}</span>
-          <span className="text-xs text-muted-foreground">{formatSize(file.size)}</span>
-        </div>
-        <div className="flex gap-1">
-          {file.is_image && (
+    return nodes.map((node) => {
+      if (node.type === 'dir') {
+        const fKey = `${slideKey(jobId, slideHash)}::${node.path}`
+        const isOpen = expandedFolders.has(fKey)
+
+        return (
+          <div key={node.path}>
+            <div
+              className="flex items-center justify-between py-1 pr-3 hover:bg-muted/20"
+              style={{ paddingLeft: `${indentPx}px` }}
+            >
+              <button
+                className="flex items-center gap-2 text-sm text-left"
+                onClick={() => toggleFolder(fKey)}
+              >
+                {isOpen
+                  ? <ChevronDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                  : <ChevronRight className="h-3.5 w-3.5 text-muted-foreground shrink-0" />}
+                <Folder className="h-3.5 w-3.5 text-amber-500 shrink-0" />
+                <span className="font-mono">{node.name}/</span>
+              </button>
+              <button
+                className="p-1 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
+                title="Download folder as ZIP"
+                onClick={() => downloadFolder(jobId, slideHash, node.path)}
+              >
+                <Archive className="h-3.5 w-3.5" />
+              </button>
+            </div>
+            {isOpen && node.children && node.children.length > 0 &&
+              renderFileTree(node.children, jobId, slideHash, depth + 1)
+            }
+          </div>
+        )
+      }
+
+      // File node
+      const ck = cartKey(jobId, slideHash, node.path)
+      const inCart = cart.has(ck)
+
+      return (
+        <div
+          key={node.path}
+          className="flex items-center justify-between py-1 pr-3"
+          style={{ paddingLeft: `${indentPx}px` }}
+        >
+          <div className="flex items-center gap-2">
+            <Checkbox
+              checked={inCart}
+              onCheckedChange={() => toggleCart(jobId, slideHash, node.path)}
+            />
+            {node.is_image
+              ? <Image className="h-3.5 w-3.5 text-blue-500" />
+              : <FileText className="h-3.5 w-3.5 text-muted-foreground" />}
+            <span className="text-sm font-mono">{node.name}</span>
+            {node.size !== undefined && (
+              <span className="text-xs text-muted-foreground">{formatSize(node.size)}</span>
+            )}
+          </div>
+          <div className="flex gap-1">
+            {node.is_image && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 text-xs"
+                onClick={() => previewFile(jobId, slideHash, node.path)}
+              >
+                Preview
+              </Button>
+            )}
             <Button
               variant="ghost"
               size="sm"
-              className="h-7 text-xs"
-              onClick={() => previewFile(jobId, slideHash, file.name)}
+              className="h-7"
+              onClick={() => downloadFile(jobId, slideHash, node.path)}
             >
-              Preview
+              <FileDown className="h-3.5 w-3.5" />
             </Button>
-          )}
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-7"
-            onClick={() => downloadFile(jobId, slideHash, file.name)}
-          >
-            <FileDown className="h-3.5 w-3.5" />
-          </Button>
-          <button
-            className="p-1 rounded hover:bg-destructive/10 text-muted-foreground hover:text-destructive transition-colors"
-            title="Delete file from disk"
-            onClick={() => confirmDeleteFile(jobId, slideHash, file.name)}
-          >
-            <Trash2 className="h-3 w-3" />
-          </button>
+            <button
+              className="p-1 rounded hover:bg-destructive/10 text-muted-foreground hover:text-destructive transition-colors"
+              title="Delete file from disk"
+              onClick={() => confirmDeleteFile(jobId, slideHash, node.path, node.name)}
+            >
+              <Trash2 className="h-3 w-3" />
+            </button>
+          </div>
         </div>
-      </div>
-    )
+      )
+    })
   }
 
   // ---------- Render: Job list mode ----------
@@ -753,29 +844,22 @@ export function AnalysisResults() {
                     <Hash className="h-3.5 w-3.5" />
                     {showHashes ? 'Hashes' : 'Filenames'}
                   </Button>
-                  {detail && (
-                    <div className="flex items-center gap-1 ml-auto text-xs">
+                  {detail && (() => {
+                    const allCount = detail.slides.filter(s => s.slide_hash).length
+                    const selCount = selectedJobSlides[job.id]?.size ?? 0
+                    const allSelected = selCount >= allCount && allCount > 0
+                    return (
                       <button
-                        className="text-primary hover:underline"
+                        className="text-xs ml-auto text-primary hover:underline"
                         onClick={(e) => {
                           e.stopPropagation()
-                          selectAllJobSlides(job.id)
+                          toggleAllJobSlides(job.id)
                         }}
                       >
-                        Select all
+                        {allSelected ? `Deselect all (${selCount})` : `Select all (${allCount})`}
                       </button>
-                      <span className="text-muted-foreground">|</span>
-                      <button
-                        className="text-muted-foreground hover:underline"
-                        onClick={(e) => {
-                          e.stopPropagation()
-                          clearJobSlideSelection(job.id)
-                        }}
-                      >
-                        Clear
-                      </button>
-                    </div>
-                  )}
+                    )
+                  })()}
                 </div>
 
                 {!detail ? (
@@ -802,7 +886,7 @@ export function AnalysisResults() {
                           >
                             <Checkbox
                               checked={selectedJobSlides[job.id]?.has(js.slide_hash!) ?? false}
-                              onCheckedChange={(e) => {
+                              onCheckedChange={() => {
                                 // Don't toggle expansion when clicking checkbox
                                 toggleJobSlide(job.id, js.slide_hash!)
                               }}
@@ -817,15 +901,17 @@ export function AnalysisResults() {
                               <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />
                             )}
                             <CopyableText
-                              className="text-sm max-w-[300px]"
+                              className="text-sm max-w-75"
                               text={showHashes
-                                ? `${js.slide_hash!.substring(0, 12)}...`
-                                : js.filename || `${js.slide_hash!.substring(0, 12)}...`}
-                              copyValue={showHashes ? js.slide_hash! : (js.filename || js.slide_hash!)}
+                                ? `${js.slide_hash!.substring(0, 12)}…`
+                                : js.accession_number
+                                  ? `${js.accession_number}${js.block_id ? ` ${js.block_id}` : ''}${js.stain_type ? ` ${js.stain_type}` : ''}`
+                                  : js.filename || `${js.slide_hash!.substring(0, 12)}…`}
+                              copyValue={showHashes ? js.slide_hash! : (js.accession_number || js.filename || js.slide_hash!)}
                             />
                             {statusBadge(js.status)}
                             {js.error_message && (
-                              <span className="text-xs text-red-500 truncate max-w-[200px]">
+                              <span className="text-xs text-red-500 truncate max-w-50">
                                 {js.error_message}
                               </span>
                             )}
@@ -848,9 +934,7 @@ export function AnalysisResults() {
                                   No output files found locally. Use "Transfer All" above.
                                 </p>
                               ) : (
-                                files.map((f) =>
-                                  renderFileRow(f, job.id, js.slide_hash!)
-                                )
+                                renderFileTree(files, job.id, js.slide_hash!)
                               )}
                             </div>
                           )}
@@ -871,11 +955,6 @@ export function AnalysisResults() {
 
   const renderSearchResults = () => (
     <div className="space-y-3">
-      <Button variant="ghost" size="sm" onClick={backToJobs} className="mb-2">
-        <ArrowLeft className="mr-1 h-4 w-4" />
-        Back to all jobs
-      </Button>
-
       {searchDone && searchResults.length === 0 && (
         <p className="text-sm text-muted-foreground">
           No slides with completed analyses found for this query.
@@ -962,9 +1041,7 @@ export function AnalysisResults() {
                               No output files found locally.
                             </p>
                           ) : (
-                            files.map((f) =>
-                              renderFileRow(f, r.job_id, slide.slide_hash)
-                            )
+                            renderFileTree(files, r.job_id, slide.slide_hash)
                           )}
                         </div>
                       )}
@@ -983,8 +1060,8 @@ export function AnalysisResults() {
 
   return (
     <div className="space-y-4">
-      {/* Search bar — always visible */}
-      <div className="flex gap-2 items-center">
+      {/* Top bar: search + view tabs */}
+      <div className="flex gap-2 items-center flex-wrap">
         <Input
           placeholder="Search by accession number (e.g. S24-12345)..."
           value={query}
@@ -1006,6 +1083,14 @@ export function AnalysisResults() {
           <Hash className="h-3.5 w-3.5" />
           {showHashes ? 'Hashes' : 'Filenames'}
         </Button>
+        <div className="ml-auto flex gap-1">
+          {view === 'search' && (
+            <Button variant="ghost" size="sm" className="h-9" onClick={backToJobs}>
+              <ArrowLeft className="mr-1 h-4 w-4" />
+              Jobs
+            </Button>
+          )}
+        </div>
       </div>
 
       {/* Content */}
@@ -1023,7 +1108,7 @@ export function AnalysisResults() {
           <img
             src={previewUrl}
             alt="Result preview"
-            className="max-w-full max-h-[500px] rounded"
+            className="max-w-full max-h-125 rounded"
           />
         </div>
       )}
@@ -1115,6 +1200,7 @@ export function AnalysisResults() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
     </div>
   )
 }

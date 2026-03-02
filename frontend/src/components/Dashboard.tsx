@@ -15,6 +15,11 @@ import {
   Clock,
   Loader2,
   Trash2,
+  FileSpreadsheet,
+  Upload,
+  Download,
+  Tags,
+  RefreshCw,
 } from 'lucide-react'
 
 const API = 'http://127.0.0.1:8000'
@@ -121,6 +126,14 @@ export function Dashboard({ onSortStarted, sortStatus }: DashboardProps) {
   const [scanning, setScanning] = useState(false)
   const [sorting, setSorting] = useState(false)
 
+  // CSV import state
+  const [importFile, setImportFile] = useState<File | null>(null)
+  const [importMode, setImportMode] = useState<'merge' | 'replace'>('merge')
+  const [importPreview, setImportPreview] = useState<{ headers: string[]; rows: string[][]; totalRows: number } | null>(null)
+  const [importing, setImporting] = useState(false)
+  const [importResult, setImportResult] = useState<{ matched: number; unmatched: number; tags_added: number; mode: string } | null>(null)
+  const [dragOver, setDragOver] = useState(false)
+
   const fetchSummary = useCallback(async () => {
     try {
       const res = await fetch(`${API}/dashboard/summary`)
@@ -171,6 +184,48 @@ export function Dashboard({ onSortStarted, sortStatus }: DashboardProps) {
   const handleDeleteAllConflicts = async () => {
     const conflicts = stagingFiles?.filter(f => f.conflict) ?? []
     await Promise.all(conflicts.map(f => handleDeleteStaging(f.filename)))
+  }
+
+  const parseCSVPreview = (file: File) => {
+    const reader = new FileReader()
+    reader.onload = (e) => {
+      const text = (e.target?.result as string).replace(/^\uFEFF/, '') // strip BOM
+      const lines = text.split('\n').map(l => l.trim()).filter(Boolean)
+      if (lines.length < 2) return
+      const headers = lines[0].split(',').map(h => h.replace(/^"|"$/g, '').trim())
+      const rows = lines.slice(1, 6).map(l =>
+        l.split(',').map(c => c.replace(/^"|"$/g, '').trim())
+      )
+      setImportPreview({ headers, rows, totalRows: lines.length - 1 })
+    }
+    reader.readAsText(file)
+  }
+
+  const handleImportFile = (file: File) => {
+    setImportFile(file)
+    setImportResult(null)
+    parseCSVPreview(file)
+  }
+
+  const handleImportApply = async () => {
+    if (!importFile) return
+    setImporting(true)
+    setImportResult(null)
+    try {
+      const form = new FormData()
+      form.append('file', importFile)
+      const res = await fetch(`${API}/import/slides-csv?mode=${importMode}`, {
+        method: 'POST',
+        body: form,
+      })
+      if (res.ok) {
+        const result = await res.json()
+        setImportResult(result)
+        setImportFile(null)
+        setImportPreview(null)
+      }
+    } catch { /* ignore */ }
+    setImporting(false)
   }
 
   // Re-scan and refresh when sort completes
@@ -324,7 +379,7 @@ export function Dashboard({ onSortStarted, sortStatus }: DashboardProps) {
                           disabled={disabled}
                         />
                       </td>
-                      <td className="py-2 pr-3 font-mono text-xs truncate max-w-[300px]">
+                      <td className="py-2 pr-3 font-mono text-xs truncate max-w-75">
                         {!f.parsed && <AlertTriangle className="h-3.5 w-3.5 text-yellow-500 inline mr-1" />}
                         {f.conflict && <AlertTriangle className="h-3.5 w-3.5 text-red-500 inline mr-1" />}
                         {f.filename}
@@ -418,6 +473,192 @@ export function Dashboard({ onSortStarted, sortStatus }: DashboardProps) {
               ))}
             </div>
           )}
+        </div>
+      </div>
+
+      {/* Data Management */}
+      <div className="rounded-lg border bg-card">
+        <div className="flex items-center gap-2 p-4 border-b">
+          <FileSpreadsheet className="h-5 w-5 text-muted-foreground" />
+          <h2 className="text-lg font-semibold">Data Management</h2>
+        </div>
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-0 divide-y lg:divide-y-0 lg:divide-x">
+
+          {/* Export */}
+          <div className="p-6 flex flex-col gap-4">
+            <div className="flex items-start gap-3">
+              <div className="rounded-md bg-green-100 p-2 shrink-0">
+                <Download className="h-5 w-5 text-green-600" />
+              </div>
+              <div>
+                <h3 className="font-medium">Export Slide Data</h3>
+                <p className="text-sm text-muted-foreground mt-0.5">
+                  Download a CSV with all slides, metadata, and tags. Use it as a template for bulk edits.
+                </p>
+              </div>
+            </div>
+            {summary && (
+              <p className="text-xs text-muted-foreground">
+                {summary.library.total_slides.toLocaleString()} slides across {summary.library.total_cases.toLocaleString()} cases
+              </p>
+            )}
+            <a
+              href={`${API}/export/slides.csv`}
+              download="slides_export.csv"
+              className="inline-flex items-center gap-2 rounded-md bg-green-600 hover:bg-green-700 text-white px-4 py-2 text-sm font-medium transition-colors w-fit"
+            >
+              <Download className="h-4 w-4" />
+              Download CSV
+            </a>
+          </div>
+
+          {/* Import */}
+          <div className="p-6 flex flex-col gap-4">
+            <div className="flex items-start gap-3">
+              <div className="rounded-md bg-blue-100 p-2 shrink-0">
+                <Upload className="h-5 w-5 text-blue-600" />
+              </div>
+              <div>
+                <h3 className="font-medium">Import / Bulk Tag</h3>
+                <p className="text-sm text-muted-foreground mt-0.5">
+                  Upload a modified CSV to bulk-apply tags. Slides are matched by <code className="text-xs bg-muted px-1 rounded">slide_hash</code>. Tags use semicolons as separators.
+                </p>
+              </div>
+            </div>
+
+            {/* Drag-and-drop zone */}
+            {!importFile && (
+              <div
+                onDragOver={e => { e.preventDefault(); setDragOver(true) }}
+                onDragLeave={() => setDragOver(false)}
+                onDrop={e => {
+                  e.preventDefault()
+                  setDragOver(false)
+                  const f = e.dataTransfer.files[0]
+                  if (f && f.name.endsWith('.csv')) handleImportFile(f)
+                }}
+                className={`relative flex flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed p-8 text-center transition-colors cursor-pointer ${
+                  dragOver ? 'border-blue-400 bg-blue-50' : 'border-muted hover:border-muted-foreground/40'
+                }`}
+                onClick={() => document.getElementById('csv-file-input')?.click()}
+              >
+                <Upload className="h-8 w-8 text-muted-foreground" />
+                <p className="text-sm text-muted-foreground">Drop a CSV here or <span className="text-blue-600 underline">browse</span></p>
+                <input
+                  id="csv-file-input"
+                  type="file"
+                  accept=".csv"
+                  className="sr-only"
+                  onChange={e => {
+                    const f = e.target.files?.[0]
+                    if (f) handleImportFile(f)
+                    e.target.value = ''
+                  }}
+                />
+              </div>
+            )}
+
+            {/* Preview */}
+            {importFile && importPreview && (
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2 text-sm">
+                    <FileSpreadsheet className="h-4 w-4 text-muted-foreground" />
+                    <span className="font-medium truncate max-w-50">{importFile.name}</span>
+                    <span className="text-muted-foreground">({importPreview.totalRows.toLocaleString()} rows)</span>
+                  </div>
+                  <button
+                    className="text-xs text-muted-foreground hover:text-foreground underline"
+                    onClick={() => { setImportFile(null); setImportPreview(null); setImportResult(null) }}
+                  >
+                    Clear
+                  </button>
+                </div>
+
+                {/* Preview table */}
+                <div className="overflow-x-auto rounded-md border text-xs">
+                  <table className="w-full">
+                    <thead className="bg-muted">
+                      <tr>
+                        {importPreview.headers.map(h => (
+                          <th key={h} className="px-2 py-1.5 text-left font-medium text-muted-foreground whitespace-nowrap">{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {importPreview.rows.map((row, i) => (
+                        <tr key={i} className="border-t">
+                          {row.map((cell, j) => (
+                            <td key={j} className="px-2 py-1.5 max-w-40 truncate text-muted-foreground">{cell}</td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {importPreview.totalRows > 5 && (
+                    <p className="text-center py-1.5 text-muted-foreground text-xs border-t">
+                      +{(importPreview.totalRows - 5).toLocaleString()} more rows
+                    </p>
+                  )}
+                </div>
+
+                {/* Mode toggle */}
+                <div className="flex items-center gap-1 rounded-lg bg-muted p-1 w-fit">
+                  <button
+                    className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${importMode === 'merge' ? 'bg-background shadow text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+                    onClick={() => setImportMode('merge')}
+                  >
+                    <Tags className="h-3 w-3 inline mr-1" />
+                    Merge tags
+                  </button>
+                  <button
+                    className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${importMode === 'replace' ? 'bg-background shadow text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+                    onClick={() => setImportMode('replace')}
+                  >
+                    <RefreshCw className="h-3 w-3 inline mr-1" />
+                    Replace tags
+                  </button>
+                </div>
+                <p className="text-xs text-muted-foreground -mt-1">
+                  {importMode === 'merge'
+                    ? 'Adds new tags without removing existing ones.'
+                    : 'Clears all existing tags and sets exactly what is in the CSV.'}
+                </p>
+
+                <Button size="sm" onClick={handleImportApply} disabled={importing}>
+                  {importing ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <Upload className="h-4 w-4 mr-1" />}
+                  Apply Import
+                </Button>
+              </div>
+            )}
+
+            {/* Result */}
+            {importResult && (
+              <div className="rounded-lg border border-green-200 bg-green-50 p-4 space-y-1">
+                <p className="text-sm font-medium text-green-800 flex items-center gap-1.5">
+                  <CheckCircle className="h-4 w-4" /> Import complete
+                </p>
+                <div className="grid grid-cols-3 gap-2 pt-1">
+                  <div className="text-center">
+                    <p className="text-xl font-bold text-green-700">{importResult.matched}</p>
+                    <p className="text-xs text-green-600">matched</p>
+                  </div>
+                  <div className="text-center">
+                    <p className="text-xl font-bold text-green-700">{importResult.tags_added}</p>
+                    <p className="text-xs text-green-600">tags applied</p>
+                  </div>
+                  <div className="text-center">
+                    <p className={`text-xl font-bold ${importResult.unmatched > 0 ? 'text-yellow-600' : 'text-green-700'}`}>
+                      {importResult.unmatched}
+                    </p>
+                    <p className={`text-xs ${importResult.unmatched > 0 ? 'text-yellow-600' : 'text-green-600'}`}>unmatched</p>
+                  </div>
+                </div>
+                <p className="text-xs text-green-600 pt-1">Mode: {importResult.mode}</p>
+              </div>
+            )}
+          </div>
+
         </div>
       </div>
     </div>

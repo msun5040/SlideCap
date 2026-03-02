@@ -6,12 +6,18 @@ import type { ClusterStatus, GpuInfo } from '@/types/slide'
 
 const API_BASE = 'http://localhost:8000'
 
+/** Call this from any component that receives a 503 from the backend. */
+export function signalClusterDisconnected() {
+  window.dispatchEvent(new CustomEvent('cluster:disconnected'))
+}
+
 interface ClusterConnectProps {
   onStatusChange?: (connected: boolean) => void
 }
 
 export function ClusterConnect({ onStatusChange }: ClusterConnectProps) {
   const [status, setStatus] = useState<ClusterStatus>({ connected: false })
+  const [lostConnection, setLostConnection] = useState(false)
   const [host, setHost] = useState('cetus.dfci.harvard.edu')
   const [port, setPort] = useState('22')
   const [username, setUsername] = useState('')
@@ -25,16 +31,35 @@ export function ClusterConnect({ onStatusChange }: ClusterConnectProps) {
       const res = await fetch(`${API_BASE}/cluster/status`)
       if (res.ok) {
         const data = await res.json()
+        const wasConnected = status.connected
         setStatus(data)
         onStatusChange?.(data.connected)
+        if (wasConnected && !data.connected) {
+          setLostConnection(true)
+        } else if (data.connected) {
+          setLostConnection(false)
+        }
       }
     } catch {
       // ignore
     }
-  }, [onStatusChange])
+  }, [onStatusChange, status.connected])
 
   useEffect(() => {
     fetchStatus()
+  }, [fetchStatus])
+
+  // Poll every 20s to detect dropped connections
+  useEffect(() => {
+    const id = setInterval(fetchStatus, 20000)
+    return () => clearInterval(id)
+  }, [fetchStatus])
+
+  // Listen for signals from other components that got a 503
+  useEffect(() => {
+    const handler = () => fetchStatus()
+    window.addEventListener('cluster:disconnected', handler)
+    return () => window.removeEventListener('cluster:disconnected', handler)
   }, [fetchStatus])
 
   const handleConnect = async () => {
@@ -57,6 +82,7 @@ export function ClusterConnect({ onStatusChange }: ClusterConnectProps) {
       if (res.ok) {
         const data = await res.json()
         setStatus({ connected: true, host, username, gpus: data.gpus })
+        setLostConnection(false)
         onStatusChange?.(true)
         setShowForm(false)
         setPassword('')
@@ -75,6 +101,7 @@ export function ClusterConnect({ onStatusChange }: ClusterConnectProps) {
     try {
       await fetch(`${API_BASE}/cluster/disconnect`, { method: 'POST' })
       setStatus({ connected: false })
+      setLostConnection(false)
       onStatusChange?.(false)
     } catch {
       // ignore
@@ -127,11 +154,13 @@ export function ClusterConnect({ onStatusChange }: ClusterConnectProps) {
   }
 
   return (
-    <div className="rounded-lg border bg-card p-4 space-y-3">
+    <div className={`rounded-lg border bg-card p-4 space-y-3 ${lostConnection ? 'border-amber-400' : ''}`}>
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <div className="h-2.5 w-2.5 rounded-full bg-gray-400" />
-          <span className="text-sm text-muted-foreground">Not connected to cluster</span>
+          <div className={`h-2.5 w-2.5 rounded-full ${lostConnection ? 'bg-amber-500' : 'bg-gray-400'}`} />
+          <span className={`text-sm ${lostConnection ? 'text-amber-700 font-medium' : 'text-muted-foreground'}`}>
+            {lostConnection ? 'Connection lost — reconnect to continue' : 'Not connected to cluster'}
+          </span>
         </div>
         {!showForm && (
           <Button size="sm" onClick={() => setShowForm(true)}>

@@ -20,6 +20,7 @@ from sqlalchemy import (
     Index,
     Boolean,
     Text,
+    UniqueConstraint,
     event,
     inspect,
 )
@@ -209,6 +210,8 @@ class Cohort(Base):
 
     # Relationships
     slides = relationship('Slide', secondary=cohort_slides, backref='cohorts')
+    patients = relationship('CohortPatient', back_populates='cohort', cascade='all, delete-orphan')
+    flags = relationship('CohortFlag', back_populates='cohort', cascade='all, delete-orphan')
 
     @property
     def slide_count(self) -> int:
@@ -220,6 +223,80 @@ class Cohort(Base):
 
     def __repr__(self):
         return f"<Cohort(name={self.name}, slides={self.slide_count})>"
+
+
+class CohortPatient(Base):
+    """
+    A de-identified patient within a cohort.
+    Groups multiple surgical cases (accessions) belonging to the same person.
+    """
+    __tablename__ = 'cohort_patients'
+
+    id = Column(Integer, primary_key=True)
+    cohort_id = Column(Integer, ForeignKey('cohorts.id', ondelete='CASCADE'), nullable=False, index=True)
+    label = Column(String(100), nullable=False)   # user-defined, e.g. "P001"
+    note = Column(String(500))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    cohort = relationship('Cohort', back_populates='patients')
+    surgeries = relationship(
+        'CohortPatientCase',
+        back_populates='patient',
+        cascade='all, delete-orphan',
+        order_by='CohortPatientCase.surgery_label',
+    )
+
+
+class CohortPatientCase(Base):
+    """
+    Links a surgical case to a patient within a cohort.
+    surgery_label (S1, S2, S3…) identifies the surgery order for that patient.
+    A case can be assigned to at most one patient per cohort (enforced in API).
+    """
+    __tablename__ = 'cohort_patient_cases'
+
+    id = Column(Integer, primary_key=True)
+    patient_id = Column(Integer, ForeignKey('cohort_patients.id', ondelete='CASCADE'), nullable=False)
+    case_id = Column(Integer, ForeignKey('cases.id', ondelete='CASCADE'), nullable=False)
+    surgery_label = Column(String(20), nullable=False)   # "S1", "S2", "S3"
+    note = Column(String(500))
+
+    patient = relationship('CohortPatient', back_populates='surgeries')
+    case = relationship('Case')
+
+    __table_args__ = (
+        UniqueConstraint('patient_id', 'case_id', name='uq_patient_case'),
+    )
+
+
+class CohortFlag(Base):
+    """
+    A named selection subset within a cohort, used to mark cases for targeted analysis.
+
+    Stores the set of case_hashes (accession_hashes) belonging to this flag.
+    Flags are cohort-scoped and independent of the global slide-library tag system.
+    """
+    __tablename__ = 'cohort_flags'
+
+    id = Column(Integer, primary_key=True)
+    cohort_id = Column(Integer, ForeignKey('cohorts.id', ondelete='CASCADE'), nullable=False, index=True)
+    name = Column(String(200), nullable=False)
+    # JSON array of case accession_hashes: ["abc123", "def456", ...]
+    case_hashes_json = Column(Text, default='[]')
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    cohort = relationship('Cohort', back_populates='flags')
+
+    def get_case_hashes(self) -> list:
+        import json
+        try:
+            return json.loads(self.case_hashes_json or '[]')
+        except Exception:
+            return []
+
+    def set_case_hashes(self, hashes: list):
+        import json
+        self.case_hashes_json = json.dumps(list(set(hashes)))
 
 
 class Analysis(Base):
@@ -315,11 +392,13 @@ class JobSlide(Base):
     slide_id = Column(Integer, ForeignKey('slides.id', ondelete='CASCADE'), nullable=False)
 
     # Cluster execution
-    cluster_job_id = Column(String(100))      # tmux session name
+    cluster_job_id = Column(String(100))      # tmux session name (shared across all slides in a batch job)
     remote_wsi_path = Column(String(500))     # Where the slide was rsynced to
-    remote_output_path = Column(String(500))  # Output directory for this slide
-    local_output_path = Column(String(500))   # Local path after rsync back from cluster
+    remote_output_path = Column(String(500))  # Shared batch output directory on cluster
+    local_output_path = Column(String(500))   # Per-slide path on network drive after distribution
+    filename = Column(String(500))            # Original slide filename, used to match output files
     log_tail = Column(Text)                   # Last ~50 lines of progress log
+    cell_stats = Column(Text)                 # Cached JSON of parsed cell statistics
 
     # Status tracking
     status = Column(String(20), default='pending')  # pending, transferring, running, completed, failed
@@ -491,6 +570,8 @@ def _migrate_analysis_jobs(engine):
             existing_cols = {col['name'] for col in insp.get_columns('job_slides')}
             js_migrations = {
                 'local_output_path': "ALTER TABLE job_slides ADD COLUMN local_output_path VARCHAR(500)",
+                'filename': "ALTER TABLE job_slides ADD COLUMN filename VARCHAR(500)",
+                'cell_stats': "ALTER TABLE job_slides ADD COLUMN cell_stats TEXT",
             }
 
             with engine.connect() as conn:

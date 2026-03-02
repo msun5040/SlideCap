@@ -6,6 +6,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
 from io import BytesIO
+import csv
+import io
 import os
 import json
 import shutil
@@ -17,7 +19,7 @@ from datetime import datetime
 from sqlalchemy.orm import Session, joinedload
 
 from .config import settings
-from .db import init_db, get_db, get_session, Case, Slide, Tag, Project, Cohort, Analysis, AnalysisJob, JobSlide, init_lock, get_lock
+from .db import init_db, get_db, get_session, Case, Slide, Tag, Project, Cohort, CohortFlag, CohortPatient, CohortPatientCase, Analysis, AnalysisJob, JobSlide, init_lock, get_lock
 from .services import SlideHasher, SlideIndexer, ClusterService, JobStatusPoller
 
 
@@ -95,6 +97,42 @@ async def lifespan(app: FastAPI):
         raise
     finally:
         startup_db.close()
+
+    # Reset any slides that were left in 'transferring' with no cluster_job_id —
+    # these are orphans from a previous backend crash mid-rsync. The tmux session
+    # was never started so they can never self-recover; mark them failed so the
+    # user can resubmit.
+    orphan_db = get_session()
+    try:
+        orphaned = (
+            orphan_db.query(JobSlide)
+            .filter(
+                JobSlide.status == "transferring",
+                JobSlide.cluster_job_id.is_(None),
+            )
+            .all()
+        )
+        if orphaned:
+            affected_jobs = set()
+            for js in orphaned:
+                js.status = "failed"
+                js.error_message = "Transfer interrupted by server restart"
+                js.completed_at = datetime.utcnow()
+                affected_jobs.add(js.job_id)
+            orphan_db.flush()
+            for jid in affected_jobs:
+                job = orphan_db.query(AnalysisJob).options(
+                    joinedload(AnalysisJob.slides)
+                ).filter_by(id=jid).first()
+                if job:
+                    _recompute_job_status(job)
+            orphan_db.commit()
+            print(f"[Startup] Reset {len(orphaned)} orphaned 'transferring' slide(s) to failed")
+    except Exception as e:
+        orphan_db.rollback()
+        print(f"[Startup] Failed to reset orphaned slides: {e}")
+    finally:
+        orphan_db.close()
 
     # Initialize cluster service (connection is per-session via UI)
     cluster_service = ClusterService(
@@ -1081,6 +1119,16 @@ class CohortAddSlides(BaseModel):
     slide_hashes: List[str]
 
 
+class CohortFlagCreate(BaseModel):
+    name: str
+    case_hashes: List[str] = []
+
+
+class CohortFlagPatch(BaseModel):
+    add_case_hashes: List[str] = []
+    remove_case_hashes: List[str] = []
+
+
 @app.get("/cohorts")
 def list_cohorts(db: Session = Depends(get_db)):
     """List all cohorts."""
@@ -1271,6 +1319,251 @@ class _ZipStreamWriter:
 
     def close(self):
         self.flush()
+
+
+# ── Patient tracking ──────────────────────────────────────────────────────
+
+class PatientCreate(BaseModel):
+    label: str
+    note: Optional[str] = None
+
+class PatientUpdate(BaseModel):
+    label: Optional[str] = None
+    note: Optional[str] = None
+
+class PatientCaseAssign(BaseModel):
+    case_hash: str
+    surgery_label: str
+    note: Optional[str] = None
+
+class PatientCaseUpdate(BaseModel):
+    surgery_label: Optional[str] = None
+    note: Optional[str] = None
+
+
+def _enrich_surgery(surgery: "CohortPatientCase") -> dict:
+    """Build the serialised surgery dict, resolving accession number from indexer cache."""
+    case = surgery.case
+    accession_number = None
+    if indexer:
+        for slide in case.slides:
+            fp = indexer.get_filepath(slide.slide_hash)
+            if fp:
+                parsed = indexer.parser.parse(fp.name)
+                if parsed:
+                    accession_number = parsed.accession
+                    break
+    return {
+        "id": surgery.id,
+        "surgery_label": surgery.surgery_label,
+        "case_hash": case.accession_hash,
+        "accession_number": accession_number,
+        "year": case.year,
+        "slide_count": len(case.slides),
+        "note": surgery.note,
+    }
+
+
+@app.get("/cohorts/{cohort_id}/patients")
+def list_cohort_patients(cohort_id: int, db: Session = Depends(get_db)):
+    """List all patients (and their surgery assignments) for a cohort."""
+    cohort = db.query(Cohort).filter_by(id=cohort_id).first()
+    if not cohort:
+        raise HTTPException(status_code=404, detail="Cohort not found")
+
+    patients = (
+        db.query(CohortPatient)
+        .options(joinedload(CohortPatient.surgeries).joinedload(CohortPatientCase.case).joinedload(Case.slides))
+        .filter_by(cohort_id=cohort_id)
+        .order_by(CohortPatient.label)
+        .all()
+    )
+    return [
+        {
+            "id": p.id,
+            "label": p.label,
+            "note": p.note,
+            "surgeries": [_enrich_surgery(s) for s in p.surgeries],
+        }
+        for p in patients
+    ]
+
+
+@app.post("/cohorts/{cohort_id}/patients")
+def create_cohort_patient(cohort_id: int, data: PatientCreate, db: Session = Depends(get_db)):
+    """Create a new patient in a cohort."""
+    if not db.query(Cohort).filter_by(id=cohort_id).first():
+        raise HTTPException(status_code=404, detail="Cohort not found")
+    with get_lock().write_lock():
+        patient = CohortPatient(cohort_id=cohort_id, label=data.label, note=data.note)
+        db.add(patient)
+        db.commit()
+        db.refresh(patient)
+    return {"id": patient.id, "label": patient.label, "note": patient.note, "surgeries": []}
+
+
+@app.patch("/cohorts/{cohort_id}/patients/{patient_id}")
+def update_cohort_patient(cohort_id: int, patient_id: int, data: PatientUpdate, db: Session = Depends(get_db)):
+    """Rename a patient or update their note."""
+    patient = db.query(CohortPatient).filter_by(id=patient_id, cohort_id=cohort_id).first()
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+    with get_lock().write_lock():
+        if data.label is not None:
+            patient.label = data.label
+        if data.note is not None:
+            patient.note = data.note
+        db.commit()
+    return {"id": patient.id, "label": patient.label, "note": patient.note}
+
+
+@app.delete("/cohorts/{cohort_id}/patients/{patient_id}")
+def delete_cohort_patient(cohort_id: int, patient_id: int, db: Session = Depends(get_db)):
+    """Delete a patient and all their surgery assignments."""
+    patient = db.query(CohortPatient).filter_by(id=patient_id, cohort_id=cohort_id).first()
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+    with get_lock().write_lock():
+        db.delete(patient)
+        db.commit()
+    return {"status": "ok"}
+
+
+@app.post("/cohorts/{cohort_id}/patients/{patient_id}/cases")
+def assign_patient_case(cohort_id: int, patient_id: int, data: PatientCaseAssign, db: Session = Depends(get_db)):
+    """Assign a case (surgery) to a patient. Moves it if already assigned to another patient."""
+    patient = db.query(CohortPatient).filter_by(id=patient_id, cohort_id=cohort_id).first()
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
+    case = db.query(Case).filter_by(accession_hash=data.case_hash).first()
+    if not case:
+        raise HTTPException(status_code=404, detail="Case not found")
+
+    with get_lock().write_lock():
+        # Remove any existing assignment for this case within the same cohort
+        existing = (
+            db.query(CohortPatientCase)
+            .join(CohortPatient)
+            .filter(CohortPatient.cohort_id == cohort_id, CohortPatientCase.case_id == case.id)
+            .first()
+        )
+        if existing:
+            if existing.patient_id == patient_id:
+                existing.surgery_label = data.surgery_label
+                if data.note is not None:
+                    existing.note = data.note
+                db.commit()
+                return {"status": "ok", "surgery_label": data.surgery_label}
+            db.delete(existing)
+
+        assignment = CohortPatientCase(
+            patient_id=patient_id,
+            case_id=case.id,
+            surgery_label=data.surgery_label,
+            note=data.note,
+        )
+        db.add(assignment)
+        db.commit()
+    return {"status": "ok", "surgery_label": data.surgery_label}
+
+
+@app.patch("/cohorts/{cohort_id}/patients/{patient_id}/cases/{case_hash}")
+def update_patient_case(cohort_id: int, patient_id: int, case_hash: str, data: PatientCaseUpdate, db: Session = Depends(get_db)):
+    """Update surgery label or note for a case assignment."""
+    patient = db.query(CohortPatient).filter_by(id=patient_id, cohort_id=cohort_id).first()
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+    case = db.query(Case).filter_by(accession_hash=case_hash).first()
+    if not case:
+        raise HTTPException(status_code=404, detail="Case not found")
+    assignment = db.query(CohortPatientCase).filter_by(patient_id=patient_id, case_id=case.id).first()
+    if not assignment:
+        raise HTTPException(status_code=404, detail="Case not assigned to this patient")
+    with get_lock().write_lock():
+        if data.surgery_label is not None:
+            assignment.surgery_label = data.surgery_label
+        if data.note is not None:
+            assignment.note = data.note
+        db.commit()
+    return {"status": "ok"}
+
+
+@app.delete("/cohorts/{cohort_id}/patients/{patient_id}/cases/{case_hash}")
+def remove_patient_case(cohort_id: int, patient_id: int, case_hash: str, db: Session = Depends(get_db)):
+    """Remove a case from a patient's surgery list."""
+    patient = db.query(CohortPatient).filter_by(id=patient_id, cohort_id=cohort_id).first()
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+    case = db.query(Case).filter_by(accession_hash=case_hash).first()
+    if not case:
+        raise HTTPException(status_code=404, detail="Case not found")
+    assignment = db.query(CohortPatientCase).filter_by(patient_id=patient_id, case_id=case.id).first()
+    if not assignment:
+        raise HTTPException(status_code=404, detail="Assignment not found")
+    with get_lock().write_lock():
+        db.delete(assignment)
+        db.commit()
+    return {"status": "ok"}
+
+
+@app.get("/cohorts/{cohort_id}/export.csv")
+def export_cohort_csv(cohort_id: int, db: Session = Depends(get_db)):
+    """Export cohort slides as CSV, including patient_label and surgery_label columns."""
+    cohort = db.query(Cohort).options(
+        joinedload(Cohort.slides).joinedload(Slide.case).joinedload(Case.tags),
+        joinedload(Cohort.slides).joinedload(Slide.tags),
+        joinedload(Cohort.patients).joinedload(CohortPatient.surgeries).joinedload(CohortPatientCase.case),
+    ).filter_by(id=cohort_id).first()
+    if not cohort:
+        raise HTTPException(status_code=404, detail="Cohort not found")
+
+    # Build case_hash → (patient_label, surgery_label)
+    patient_map: dict[str, tuple[str, str]] = {}
+    for patient in cohort.patients:
+        for surgery in patient.surgeries:
+            patient_map[surgery.case.accession_hash] = (patient.label, surgery.surgery_label)
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow([
+        "slide_hash", "filename", "accession", "year", "block_id",
+        "slide_number", "stain_type", "random_id", "file_size_bytes",
+        "slide_tags", "case_tags", "patient_label", "surgery_label",
+    ])
+    for slide in cohort.slides:
+        filepath = indexer.get_filepath(slide.slide_hash) if indexer else None
+        filename = filepath.name if filepath else ""
+        if filepath and indexer:
+            parsed = indexer.parser.parse(filepath.name)
+            accession = parsed.accession if parsed else ""
+            slide_number = parsed.slide_number if parsed else ""
+        else:
+            accession = ""
+            slide_number = ""
+        case_hash = slide.case.accession_hash if slide.case else ""
+        patient_label, surgery_label = patient_map.get(case_hash, ("", ""))
+        writer.writerow([
+            slide.slide_hash,
+            filename,
+            accession,
+            slide.case.year if slide.case else "",
+            slide.block_id or "",
+            slide_number,
+            slide.stain_type or "",
+            slide.random_id or "",
+            slide.file_size_bytes or "",
+            ";".join(t.name for t in slide.tags),
+            ";".join(t.name for t in slide.case.tags) if slide.case else "",
+            patient_label,
+            surgery_label,
+        ])
+    safe_name = re.sub(r'[^\w\s-]', '', cohort.name).strip().replace(' ', '_')
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}_cohort.csv"'},
+    )
 
 
 @app.get("/cohorts/{cohort_id}/export")
@@ -1941,6 +2234,7 @@ class CohortJobSubmitRequest(BaseModel):
     remote_output_dir: str = "/tmp/slidecap_output"
     parameters: Optional[str] = None
     submitted_by: Optional[str] = None
+    case_hashes: Optional[List[str]] = None  # If set, only submit slides from these cases
 
 
 class JobCancelRequest(BaseModel):
@@ -2037,136 +2331,148 @@ def submit_jobs(data: JobSubmitRequest, db: Session = Depends(get_db)):
                 if old_job:
                     db.delete(old_job)
 
-        remote_wsi_path = f"{data.remote_wsi_dir}/{slide.slide_hash}/{slide_path.name}"
-        remote_out = f"{data.remote_output_dir}/{slide.slide_hash}/{analysis.name}_v{analysis.version}"
+        # Batch dirs: all slides share one WSI dir and one output dir per job
+        remote_wsi_batch_dir = f"{data.remote_wsi_dir}/{job.id}"
+        remote_output_batch_dir = f"{data.remote_output_dir}/{job.id}"
+
+        remote_wsi_path = f"{remote_wsi_batch_dir}/{slide_path.name}"
 
         job_slide = JobSlide(
             job_id=job.id,
             slide_id=slide.id,
             remote_wsi_path=remote_wsi_path,
-            remote_output_path=remote_out,
+            remote_output_path=remote_output_batch_dir,
+            filename=slide_path.name,
             status="pending",
         )
         db.add(job_slide)
         db.flush()
 
-        slides_to_process.append((job_slide.id, slide_hash, str(slide_path), remote_wsi_path, remote_out))
+        slides_to_process.append((job_slide.id, slide_hash, str(slide_path), remote_wsi_path))
         slides_created += 1
 
     db.commit()  # Commit and release DB immediately
 
-    # --- Phase 2: Background thread for rsync + tmux start ---
+    # --- Phase 2: Background thread for rsync + single tmux session ---
     job_id = job.id
     gpu_index = data.gpu_index
-    remote_wsi_dir = data.remote_wsi_dir
+    remote_wsi_batch_dir = f"{data.remote_wsi_dir}/{job_id}"
+    remote_output_batch_dir = f"{data.remote_output_dir}/{job_id}"
 
     def _run_submissions():
-        # --- Phase A: Transfer ALL slides first ---
-        transfer_ok: list[tuple[int, str, str, str]] = []  # (js_id, slide_hash, remote_wsi_path, remote_out)
+        n = len(slides_to_process)
 
-        for i, (js_id, slide_hash, local_path_str, remote_wsi_path, remote_out) in enumerate(slides_to_process):
-            bg_db = get_session()
-            try:
+        # --- Phase A: Mark all as transferring, then rsync each slide ---
+        # Set all to 'transferring' upfront in one commit so the UI reflects progress.
+        bg_db = get_session()
+        try:
+            for (js_id, _hash, _path, _remote) in slides_to_process:
                 js = bg_db.query(JobSlide).filter_by(id=js_id).first()
-                if not js:
-                    continue
+                if js:
+                    js.status = "transferring"
+            bg_db.commit()
+        except Exception:
+            bg_db.rollback()
+        finally:
+            bg_db.close()
 
-                local_path = Path(local_path_str)
-                if not local_path.exists():
-                    js.status = "failed"
-                    js.error_message = f"Local file not found: {local_path}"
-                    bg_db.commit()
-                    continue
+        # Rsync each slide — no DB session held during transfer
+        transfer_ok: list[int] = []   # js_ids that rsynced successfully
+        transfer_errors: dict[int, str] = {}  # js_id -> error message
 
-                js.status = "transferring"
-                bg_db.commit()
-
-                # rsync to per-slide subdirectory so CellViT only sees this one slide
-                per_slide_wsi_dir = str(Path(remote_wsi_path).parent)
-                print(f"[Job {job_id}/Transfer {i+1}/{len(slides_to_process)}] Rsyncing {local_path.name} ({local_path.stat().st_size / 1e6:.0f} MB)")
-                cluster_service.rsync_slide(local_path, per_slide_wsi_dir)
-                print(f"[Job {job_id}/Transfer {i+1}/{len(slides_to_process)}] Done: {local_path.name}")
-                transfer_ok.append((js_id, slide_hash, remote_wsi_path, remote_out))
-
+        for i, (js_id, _slide_hash, local_path_str, _remote_wsi_path) in enumerate(slides_to_process):
+            local_path = Path(local_path_str)
+            if not local_path.exists():
+                transfer_errors[js_id] = f"Local file not found: {local_path}"
+                continue
+            try:
+                mb = local_path.stat().st_size / 1e6
+                print(f"[Job {job_id}/Transfer {i+1}/{n}] Rsyncing {local_path.name} ({mb:.0f} MB)")
+                cluster_service.rsync_slide(local_path, remote_wsi_batch_dir)
+                print(f"[Job {job_id}/Transfer {i+1}/{n}] Done: {local_path.name}")
+                transfer_ok.append(js_id)
             except Exception as e:
                 import traceback
                 traceback.print_exc()
-                try:
+                transfer_errors[js_id] = f"Transfer failed: {e}"
+
+        # Commit rsync failures immediately so they show up
+        if transfer_errors:
+            bg_db = get_session()
+            try:
+                for js_id, msg in transfer_errors.items():
                     js = bg_db.query(JobSlide).filter_by(id=js_id).first()
                     if js:
                         js.status = "failed"
-                        js.error_message = f"Transfer failed: {e}"
-                        bg_db.commit()
-                except Exception:
-                    bg_db.rollback()
+                        js.error_message = msg
+                bg_db.commit()
+            except Exception:
+                bg_db.rollback()
             finally:
                 bg_db.close()
-
-        def _recompute_and_commit():
-            _db = get_session()
-            try:
-                parent = _db.query(AnalysisJob).options(
-                    joinedload(AnalysisJob.slides)
-                ).filter_by(id=job_id).first()
-                if parent:
-                    _recompute_job_status(parent)
-                    _db.commit()
-            except Exception:
-                _db.rollback()
-            finally:
-                _db.close()
 
         if not transfer_ok:
             print(f"[Job {job_id}] All transfers failed.")
-            _recompute_and_commit()
+            _recompute_job_status_standalone(job_id)
             return
 
-        print(f"[Job {job_id}] All transfers complete ({len(transfer_ok)}/{len(slides_to_process)}). Starting analysis...")
+        print(f"[Job {job_id}] Transfers complete ({len(transfer_ok)}/{n}). Starting batch analysis...")
 
-        # --- Phase B: Start all jobs (now that all slides are on the cluster) ---
-        for js_id, slide_hash, remote_wsi_path, remote_out in transfer_ok:
-            bg_db = get_session()
-            try:
-                js = bg_db.query(JobSlide).filter_by(id=js_id).first()
-                if not js:
-                    continue
-
-                _analysis = bg_db.query(Analysis).filter_by(id=analysis_snapshot["id"]).first()
-                if not _analysis:
-                    js.status = "failed"
-                    js.error_message = "Analysis not found"
-                    bg_db.commit()
-                    continue
-
-                session_name = cluster_service.start_job(
-                    analysis=_analysis,
-                    slide_hash=slide_hash,
-                    remote_wsi_path=remote_wsi_path,
-                    remote_output_dir=remote_out,
-                    gpu_index=gpu_index,
-                    parameters=params,
-                )
-                js.cluster_job_id = session_name
-                js.status = "running"
-                js.started_at = datetime.utcnow()
-                bg_db.commit()
-                print(f"[Job {job_id}/Slide {js_id}] Started tmux session: {session_name}")
-
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                try:
+        # --- Phase B: Start tmux session then mark all successful slides as running ---
+        # Both the tmux launch and the DB update happen in one block so they stay in sync.
+        bg_db = get_session()
+        try:
+            _analysis = bg_db.query(Analysis).filter_by(id=analysis_snapshot["id"]).first()
+            if not _analysis:
+                for js_id in transfer_ok:
                     js = bg_db.query(JobSlide).filter_by(id=js_id).first()
                     if js:
                         js.status = "failed"
-                        js.error_message = f"Job start failed: {e}"
-                        bg_db.commit()
-                except Exception:
-                    bg_db.rollback()
-            finally:
-                bg_db.close()
+                        js.error_message = "Analysis not found"
+                bg_db.commit()
+                _recompute_job_status_standalone(job_id)
+                return
 
-        _recompute_and_commit()
+            session_name = cluster_service.start_job(
+                analysis=_analysis,
+                job_id=job_id,
+                remote_wsi_dir=remote_wsi_batch_dir,
+                remote_output_dir=remote_output_batch_dir,
+                gpu_index=gpu_index,
+                parameters=params,
+            )
+
+            started_at = datetime.utcnow()
+            for js_id in transfer_ok:
+                js = bg_db.query(JobSlide).filter_by(id=js_id).first()
+                if js:
+                    js.cluster_job_id = session_name
+                    js.status = "running"
+                    js.started_at = started_at
+            bg_db.commit()
+            print(f"[Job {job_id}] Started tmux session '{session_name}' for {len(transfer_ok)} slides")
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            bg_db.rollback()
+            # Try once more with a fresh session to record the failure
+            err_db = get_session()
+            try:
+                for js_id in transfer_ok:
+                    js = err_db.query(JobSlide).filter_by(id=js_id).first()
+                    if js:
+                        js.status = "failed"
+                        js.error_message = f"Job start failed: {e}"
+                err_db.commit()
+            except Exception:
+                err_db.rollback()
+            finally:
+                err_db.close()
+        finally:
+            bg_db.close()
+
+        _recompute_job_status_standalone(job_id)
 
     t = threading.Thread(target=_run_submissions, daemon=True)
     t.start()
@@ -2178,6 +2484,20 @@ def submit_jobs(data: JobSubmitRequest, db: Session = Depends(get_db)):
         "errors": errors,
         "cluster_connected": cluster_service.is_connected,
     }
+
+
+def _recompute_job_status_standalone(job_id: int):
+    """Open a fresh DB session, recompute parent job status, commit, close."""
+    db = get_session()
+    try:
+        job = db.query(AnalysisJob).options(joinedload(AnalysisJob.slides)).filter_by(id=job_id).first()
+        if job:
+            _recompute_job_status(job)
+            db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
 
 
 def _recompute_job_status(job: AnalysisJob):
@@ -2199,14 +2519,118 @@ def _recompute_job_status(job: AnalysisJob):
         job.status = "pending"
 
 
-@app.post("/jobs/submit-cohort/{cohort_id}")
-def submit_cohort_jobs(cohort_id: int, data: CohortJobSubmitRequest, db: Session = Depends(get_db)):
-    """Submit a multi-slide analysis job for all slides in a cohort."""
+@app.get("/cohorts/{cohort_id}/flags")
+def get_cohort_flags(cohort_id: int, db: Session = Depends(get_db)):
+    """List all flags for a cohort."""
+    flags = db.query(CohortFlag).filter_by(cohort_id=cohort_id).order_by(CohortFlag.created_at).all()
+    return [{"id": f.id, "name": f.name, "case_hashes": f.get_case_hashes()} for f in flags]
+
+
+@app.post("/cohorts/{cohort_id}/flags")
+def create_cohort_flag(cohort_id: int, data: CohortFlagCreate, db: Session = Depends(get_db)):
+    """Create a new cohort flag, optionally with initial case_hashes."""
     cohort = db.query(Cohort).filter_by(id=cohort_id).first()
     if not cohort:
         raise HTTPException(status_code=404, detail="Cohort not found")
+    name = data.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Flag name cannot be empty")
+    flag = CohortFlag(cohort_id=cohort_id, name=name)
+    flag.set_case_hashes(data.case_hashes)
+    db.add(flag)
+    db.commit()
+    db.refresh(flag)
+    return {"id": flag.id, "name": flag.name, "case_hashes": flag.get_case_hashes()}
 
-    slide_hashes = [s.slide_hash for s in cohort.slides]
+
+@app.patch("/cohorts/{cohort_id}/flags/{flag_id}")
+def update_cohort_flag(cohort_id: int, flag_id: int, data: CohortFlagPatch, db: Session = Depends(get_db)):
+    """Add or remove case_hashes from a flag."""
+    flag = db.query(CohortFlag).filter_by(id=flag_id, cohort_id=cohort_id).first()
+    if not flag:
+        raise HTTPException(status_code=404, detail="Flag not found")
+    current = set(flag.get_case_hashes())
+    current.update(data.add_case_hashes)
+    current -= set(data.remove_case_hashes)
+    flag.set_case_hashes(list(current))
+    db.commit()
+    return {"id": flag.id, "name": flag.name, "case_hashes": flag.get_case_hashes()}
+
+
+@app.delete("/cohorts/{cohort_id}/flags/{flag_id}")
+def delete_cohort_flag(cohort_id: int, flag_id: int, db: Session = Depends(get_db)):
+    """Delete a cohort flag."""
+    flag = db.query(CohortFlag).filter_by(id=flag_id, cohort_id=cohort_id).first()
+    if not flag:
+        raise HTTPException(status_code=404, detail="Flag not found")
+    db.delete(flag)
+    db.commit()
+    return {"status": "ok"}
+
+
+@app.get("/cohorts/{cohort_id}/analysis-status")
+def get_cohort_analysis_status(cohort_id: int, db: Session = Depends(get_db)):
+    """Get per-slide analysis completion status for all slides in a cohort."""
+    cohort = db.query(Cohort).options(
+        joinedload(Cohort.slides)
+    ).filter_by(id=cohort_id).first()
+    if not cohort:
+        raise HTTPException(status_code=404, detail="Cohort not found")
+
+    if not cohort.slides:
+        return {"slides": {}}
+
+    slide_ids = [s.id for s in cohort.slides]
+    slide_id_to_hash = {s.id: s.slide_hash for s in cohort.slides}
+
+    job_slides = (
+        db.query(JobSlide)
+        .options(joinedload(JobSlide.job))
+        .filter(JobSlide.slide_id.in_(slide_ids))
+        .all()
+    )
+
+    STATUS_PRIORITY = {"completed": 4, "running": 3, "transferring": 3, "pending": 2, "failed": 1}
+
+    result: dict = {}
+    for js in job_slides:
+        slide_hash = slide_id_to_hash.get(js.slide_id)
+        if not slide_hash or not js.job:
+            continue
+        analysis_key = js.job.model_name
+        if slide_hash not in result:
+            result[slide_hash] = {}
+        existing = result[slide_hash].get(analysis_key)
+        new_priority = STATUS_PRIORITY.get(js.status, 0)
+        if existing is None or new_priority > STATUS_PRIORITY.get(existing["status"], 0):
+            result[slide_hash][analysis_key] = {
+                "status": js.status,
+                "job_id": js.job.id,
+                "analysis_id": js.job.analysis_id,
+                "analysis_name": js.job.model_name,
+            }
+
+    return {"slides": result}
+
+
+@app.post("/jobs/submit-cohort/{cohort_id}")
+def submit_cohort_jobs(cohort_id: int, data: CohortJobSubmitRequest, db: Session = Depends(get_db)):
+    """Submit a multi-slide analysis job for all (or selected) slides in a cohort."""
+    cohort = db.query(Cohort).options(
+        joinedload(Cohort.slides).joinedload(Slide.case)
+    ).filter_by(id=cohort_id).first()
+    if not cohort:
+        raise HTTPException(status_code=404, detail="Cohort not found")
+
+    if data.case_hashes:
+        case_hash_set = set(data.case_hashes)
+        slide_hashes = [
+            s.slide_hash for s in cohort.slides
+            if s.case and s.case.accession_hash in case_hash_set
+        ]
+    else:
+        slide_hashes = [s.slide_hash for s in cohort.slides]
+
     submit_data = JobSubmitRequest(
         analysis_id=data.analysis_id,
         slide_hashes=slide_hashes,
@@ -2228,29 +2652,49 @@ def list_jobs(
     limit: int = Query(200, le=1000),
 ):
     """List analysis jobs with slide progress counts."""
-    query = db.query(AnalysisJob).options(
-        joinedload(AnalysisJob.slides).joinedload(JobSlide.slide)
+    from sqlalchemy import func
+    from sqlalchemy import case as sa_case
+
+    # Aggregate counts in SQL — avoids loading log_tail blobs for every slide
+    counts_sq = (
+        db.query(
+            JobSlide.job_id,
+            func.count(JobSlide.id).label("total"),
+            func.sum(sa_case((JobSlide.status == "completed", 1), else_=0)).label("completed"),
+            func.sum(sa_case((JobSlide.status == "failed", 1), else_=0)).label("failed"),
+        )
+        .group_by(JobSlide.job_id)
+        .subquery()
     )
+
+    query = (
+        db.query(
+            AnalysisJob,
+            func.coalesce(counts_sq.c.total, 0),
+            func.coalesce(counts_sq.c.completed, 0),
+            func.coalesce(counts_sq.c.failed, 0),
+        )
+        .outerjoin(counts_sq, AnalysisJob.id == counts_sq.c.job_id)
+    )
+
     if status:
         query = query.filter(AnalysisJob.status == status)
     if analysis_id:
         query = query.filter(AnalysisJob.analysis_id == analysis_id)
-
-    jobs = query.order_by(AnalysisJob.submitted_at.desc()).limit(limit).all()
-
-    # Filter to only jobs that contain at least one of the requested slides
     if slide_hashes:
-        wanted = set(h.strip() for h in slide_hashes.split(",") if h.strip())
-        jobs = [
-            j for j in jobs
-            if any(js.slide and js.slide.slide_hash in wanted for js in j.slides)
-        ]
+        wanted = [h.strip() for h in slide_hashes.split(",") if h.strip()]
+        matching_jobs_sq = (
+            db.query(JobSlide.job_id)
+            .join(Slide, JobSlide.slide_id == Slide.id)
+            .filter(Slide.slide_hash.in_(wanted))
+            .subquery()
+        )
+        query = query.filter(AnalysisJob.id.in_(matching_jobs_sq))
 
-    def _job_dict(j):
-        slide_count = len(j.slides)
-        completed_count = sum(1 for js in j.slides if js.status == "completed")
-        failed_count = sum(1 for js in j.slides if js.status == "failed")
-        return {
+    rows = query.order_by(AnalysisJob.submitted_at.desc()).limit(limit).all()
+
+    return [
+        {
             "id": j.id,
             "analysis_id": j.analysis_id,
             "model_name": j.model_name,
@@ -2263,12 +2707,12 @@ def list_jobs(
             "started_at": j.started_at.isoformat() if j.started_at else None,
             "completed_at": j.completed_at.isoformat() if j.completed_at else None,
             "error_message": j.error_message,
-            "slide_count": slide_count,
-            "completed_count": completed_count,
-            "failed_count": failed_count,
+            "slide_count": total,
+            "completed_count": completed,
+            "failed_count": failed,
         }
-
-    return [_job_dict(j) for j in jobs]
+        for j, total, completed, failed in rows
+    ]
 
 
 @app.get("/jobs/{job_id}")
@@ -2305,6 +2749,12 @@ def get_job(job_id: int, db: Session = Depends(get_db)):
                 "id": js.id,
                 "slide_hash": js.slide.slide_hash if js.slide else None,
                 "filename": (indexer.get_filepath(js.slide.slide_hash).name if indexer and js.slide and indexer.get_filepath(js.slide.slide_hash) else None),
+                "accession_number": (
+                    indexer.parser.parse(indexer.get_filepath(js.slide.slide_hash).name).accession
+                    if indexer and js.slide and indexer.get_filepath(js.slide.slide_hash) else None
+                ),
+                "block_id": js.slide.block_id if js.slide else None,
+                "stain_type": js.slide.stain_type if js.slide else None,
                 "cluster_job_id": js.cluster_job_id,
                 "status": js.status,
                 "started_at": js.started_at.isoformat() if js.started_at else None,
@@ -2312,7 +2762,7 @@ def get_job(job_id: int, db: Session = Depends(get_db)):
                 "error_message": js.error_message,
                 "log_tail": js.log_tail,
                 "remote_output_path": js.remote_output_path,
-                "cell_stats": _parse_cell_stats(js.log_tail),
+                "cell_stats": json.loads(js.cell_stats) if js.cell_stats else _parse_cell_stats(js.log_tail, js.local_output_path, js.filename),
             }
             for js in job.slides
         ],
@@ -2411,6 +2861,201 @@ def cancel_jobs(data: JobCancelRequest, db: Session = Depends(get_db)):
     return {"cancelled": cancelled, "errors": errors}
 
 
+@app.post("/jobs/{job_id}/retry")
+def retry_job(job_id: int, db: Session = Depends(get_db)):
+    """
+    Retry failed/cancelled slides in an existing job without re-uploading slides
+    that already made it to the cluster.
+
+    Reuses the same remote directories (keyed by job_id), so rsync will:
+      - Skip files that are already fully uploaded (size+mtime match)
+      - Resume files that were only partially uploaded (--partial flag)
+    """
+    if not cluster_service or not cluster_service.is_connected:
+        raise HTTPException(status_code=503, detail="Not connected to cluster. Connect first.")
+
+    job = db.query(AnalysisJob).options(
+        joinedload(AnalysisJob.slides).joinedload(JobSlide.slide)
+    ).filter_by(id=job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.status in ("running", "transferring", "pending"):
+        raise HTTPException(status_code=400, detail=f"Job is currently {job.status} — wait for it to finish or cancel it first")
+
+    analysis = db.query(Analysis).filter_by(id=job.analysis_id, active=True).first()
+    if not analysis:
+        raise HTTPException(status_code=404, detail="Analysis pipeline not found or inactive")
+
+    # Collect slides that need to be retried
+    slides_to_retry = [js for js in job.slides if js.status in ("failed", "cancelled")]
+    if not slides_to_retry:
+        raise HTTPException(status_code=400, detail="No failed slides to retry")
+
+    # Resolve local paths now (indexer lookup must happen in the request thread)
+    slides_to_process: list[tuple[int, str, str, str]] = []
+    skipped = []
+    for js in slides_to_retry:
+        if not js.slide:
+            continue
+        slide_hash = js.slide.slide_hash
+        local_path = indexer.get_filepath(slide_hash) if indexer else None
+        if not local_path:
+            skipped.append(slide_hash[:12])
+            continue
+        slides_to_process.append((js.id, slide_hash, str(local_path), js.remote_wsi_path or ""))
+
+    if not slides_to_process:
+        raise HTTPException(status_code=400, detail="No local files found for failed slides")
+
+    # Reset slides to pending
+    for js in slides_to_retry:
+        js.status = "pending"
+        js.error_message = None
+        js.cluster_job_id = None
+        js.started_at = None
+        js.completed_at = None
+        js.log_tail = None
+    job.status = "pending"
+    job.error_message = None
+    job.completed_at = None
+    db.commit()
+
+    # Snapshot what the background thread needs (detached from DB session)
+    analysis_snapshot = {
+        "id": analysis.id,
+        "name": analysis.name,
+        "version": analysis.version,
+        "script_path": analysis.script_path,
+        "working_directory": analysis.working_directory,
+        "env_setup": analysis.env_setup,
+        "command_template": analysis.command_template,
+        "gpu_required": analysis.gpu_required,
+    }
+    gpu_index = job.gpu_index or 0
+    params = json.loads(job.parameters) if job.parameters else None
+    remote_wsi_batch_dir = f"{job.remote_wsi_dir}/{job_id}"
+    remote_output_batch_dir = f"{job.remote_output_dir}/{job_id}"
+
+    def _run_retry():
+        n = len(slides_to_process)
+
+        # Mark all as transferring upfront
+        bg_db = get_session()
+        try:
+            for (js_id, *_) in slides_to_process:
+                js = bg_db.query(JobSlide).filter_by(id=js_id).first()
+                if js:
+                    js.status = "transferring"
+            bg_db.commit()
+        except Exception:
+            bg_db.rollback()
+        finally:
+            bg_db.close()
+
+        transfer_ok: list[int] = []
+        transfer_errors: dict[int, str] = {}
+
+        for i, (js_id, _slide_hash, local_path_str, _remote) in enumerate(slides_to_process):
+            local_path = Path(local_path_str)
+            if not local_path.exists():
+                transfer_errors[js_id] = f"Local file not found: {local_path}"
+                continue
+            try:
+                local_size = local_path.stat().st_size
+                remote_path = f"{remote_wsi_batch_dir}/{local_path.name}"
+                stdout, _, rc = cluster_service.run_command(
+                    f"stat -c%s '{remote_path}' 2>/dev/null"
+                )
+                if rc == 0 and stdout.strip().isdigit() and int(stdout.strip()) == local_size:
+                    print(f"[Job {job_id}/Retry {i+1}/{n}] Already on cluster: {local_path.name} — skipping")
+                    transfer_ok.append(js_id)
+                    continue
+                mb = local_size / 1e6
+                print(f"[Job {job_id}/Retry {i+1}/{n}] Rsyncing {local_path.name} ({mb:.0f} MB)")
+                cluster_service.rsync_slide(local_path, remote_wsi_batch_dir)
+                print(f"[Job {job_id}/Retry {i+1}/{n}] Done: {local_path.name}")
+                transfer_ok.append(js_id)
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                transfer_errors[js_id] = f"Transfer failed: {e}"
+
+        if transfer_errors:
+            bg_db = get_session()
+            try:
+                for js_id, msg in transfer_errors.items():
+                    js = bg_db.query(JobSlide).filter_by(id=js_id).first()
+                    if js:
+                        js.status = "failed"
+                        js.error_message = msg
+                bg_db.commit()
+            except Exception:
+                bg_db.rollback()
+            finally:
+                bg_db.close()
+
+        if not transfer_ok:
+            print(f"[Job {job_id}/Retry] All transfers failed.")
+            _recompute_job_status_standalone(job_id)
+            return
+
+        print(f"[Job {job_id}/Retry] Transfers complete ({len(transfer_ok)}/{n}). Starting job...")
+
+        bg_db = get_session()
+        try:
+            _analysis = bg_db.query(Analysis).filter_by(id=analysis_snapshot["id"]).first()
+            if not _analysis:
+                raise RuntimeError("Analysis not found")
+
+            session_name = cluster_service.start_job(
+                analysis=_analysis,
+                job_id=job_id,
+                remote_wsi_dir=remote_wsi_batch_dir,
+                remote_output_dir=remote_output_batch_dir,
+                gpu_index=gpu_index,
+                parameters=params,
+            )
+
+            started_at = datetime.utcnow()
+            for js_id in transfer_ok:
+                js = bg_db.query(JobSlide).filter_by(id=js_id).first()
+                if js:
+                    js.cluster_job_id = session_name
+                    js.status = "running"
+                    js.started_at = started_at
+            bg_db.commit()
+            print(f"[Job {job_id}/Retry] Started tmux session '{session_name}'")
+
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            bg_db.rollback()
+            err_db = get_session()
+            try:
+                for js_id in transfer_ok:
+                    js = err_db.query(JobSlide).filter_by(id=js_id).first()
+                    if js:
+                        js.status = "failed"
+                        js.error_message = f"Job start failed: {e}"
+                err_db.commit()
+            except Exception:
+                err_db.rollback()
+            finally:
+                err_db.close()
+        finally:
+            bg_db.close()
+
+        _recompute_job_status_standalone(job_id)
+
+    t = threading.Thread(target=_run_retry, daemon=True)
+    t.start()
+
+    return {
+        "job_id": job_id,
+        "retrying": len(slides_to_process),
+        "skipped_no_path": skipped,
+    }
+
+
 @app.delete("/jobs/{job_id}")
 def delete_job(job_id: int, delete_files: bool = False, db: Session = Depends(get_db)):
     """Hard-delete a job and all its JobSlide records from the database.
@@ -2501,27 +3146,26 @@ def transfer_job_results(job_id: int, db: Session = Depends(get_db)):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    transferred = 0
-    errors = []
-    for js in job.slides:
-        if js.status != "completed":
-            continue
-        if js.local_output_path:
-            local_dir = Path(js.local_output_path)
-            if local_dir.exists() and any(local_dir.iterdir()):
-                # Already transferred and files exist
-                continue
-        try:
-            local_path = job_poller._transfer_results(js)
-            if local_path:
-                js.local_output_path = local_path
-                transferred += 1
-            else:
-                errors.append(f"Slide {js.id}: transfer returned None")
-        except Exception as e:
-            errors.append(f"Slide {js.id}: {e}")
+    # Collect slides that need transfer (no local output yet)
+    slides_needing_transfer = [
+        js for js in job.slides
+        if not (js.local_output_path and Path(js.local_output_path).exists()
+                and any(Path(js.local_output_path).iterdir()))
+    ]
 
-    db.commit()
+    if not slides_needing_transfer:
+        return {"transferred": 0, "errors": [], "message": "All slides already transferred"}
+
+    try:
+        job_poller._transfer_and_distribute(slides_needing_transfer, db)
+        db.commit()
+        transferred = sum(1 for js in slides_needing_transfer if js.status == "completed")
+        errors = [f"Slide {js.id} ({js.filename}): {js.error_message}"
+                  for js in slides_needing_transfer if js.status == "failed" and js.error_message]
+    except Exception as e:
+        errors = [str(e)]
+        transferred = 0
+
     return {"transferred": transferred, "errors": errors}
 
 
@@ -2566,15 +3210,20 @@ def cluster_disconnect():
 
 @app.get("/cluster/status")
 def cluster_status():
-    """Get cluster connection status."""
+    """Get cluster connection status. Actively probes the SSH connection."""
     if not cluster_service:
         return {"connected": False}
 
     info = cluster_service.connection_info
     if info["connected"]:
-        try:
-            info["gpus"] = cluster_service.get_gpu_status()
-        except Exception:
+        if cluster_service.ping():
+            try:
+                info["gpus"] = cluster_service.get_gpu_status()
+            except Exception:
+                info["gpus"] = []
+        else:
+            cluster_service.disconnect()
+            info["connected"] = False
             info["gpus"] = []
     return info
 
@@ -2632,27 +3281,64 @@ def seed_cellvit(db: Session = Depends(get_db)):
 # ------------------------------------------------------------------
 
 
-def _parse_cell_stats(log_tail: Optional[str]) -> Optional[dict]:
-    """Extract cell count stats from a CellViT log tail.
+def _parse_cell_stats(log_tail: Optional[str],
+                      local_output_path: Optional[str] = None,
+                      filename: Optional[str] = None) -> Optional[dict]:
+    """Extract per-slide cell count stats from a CellViT log.
 
-    Looks for a line like: {'Connective': 10550, 'Inflammatory': 5058, ...}
+    Preferentially reads the full run.log from local_output_path and extracts
+    the section for the specific slide (identified by filename stem), so that
+    stats are correct even in multi-slide batch jobs where log_tail only
+    contains the last slide's output.
+
+    Falls back to scanning log_tail directly.
     """
-    if not log_tail:
-        return None
     import ast
-    for line in reversed(log_tail.splitlines()):
-        line = line.strip()
-        # Strip the log prefix if present (everything up to " - ")
-        if " - " in line:
-            line = line.split(" - ", 2)[-1].strip()
-        if line.startswith("{") and line.endswith("}"):
+    import re as _re
+
+    def _extract_stats_from_text(text: str) -> Optional[dict]:
+        """Find last stats dict in the given text block."""
+        for line in reversed(text.splitlines()):
+            line = line.strip()
+            if " - " in line:
+                line = line.split(" - ", 2)[-1].strip()
+            if line.startswith("{") and line.endswith("}"):
+                try:
+                    parsed = ast.literal_eval(line)
+                    if isinstance(parsed, dict) and all(isinstance(v, (int, float)) for v in parsed.values()):
+                        return parsed
+                except Exception:
+                    continue
+        return None
+
+    # Try reading per-slide section from the local run.log first
+    if local_output_path and filename:
+        run_log = Path(local_output_path) / "run.log"
+        if run_log.exists():
             try:
-                parsed = ast.literal_eval(line)
-                if isinstance(parsed, dict) and all(isinstance(v, (int, float)) for v in parsed.values()):
-                    return parsed
+                full_log = run_log.read_text(errors="replace")
+                stem = Path(filename).stem
+                # Find the section of the log that belongs to this slide
+                wsi_pattern = _re.compile(r"Processing WSI:\s+(\S+)")
+                sections: list[tuple[str, int]] = []
+                for m in wsi_pattern.finditer(full_log):
+                    sections.append((Path(m.group(1)).stem, m.start()))
+                for i, (s, start) in enumerate(sections):
+                    if s == stem:
+                        end = sections[i + 1][1] if i + 1 < len(sections) else len(full_log)
+                        result = _extract_stats_from_text(full_log[start:end])
+                        if result is not None:
+                            return result
+                        break
+                # Fallback: no section match — scan whole log
+                result = _extract_stats_from_text(full_log)
+                if result is not None:
+                    return result
             except Exception:
-                continue
-    return None
+                pass
+
+    # Final fallback: use log_tail stored in DB
+    return _extract_stats_from_text(log_tail or "")
 # ============================================================
 
 @app.get("/results/search")
@@ -2717,7 +3403,7 @@ def search_results(
                     "status": js.status,
                     "completed_at": js.completed_at.isoformat() if js.completed_at else None,
                     "output_path": js.local_output_path or js.remote_output_path,
-                    "cell_stats": _parse_cell_stats(js.log_tail),
+                    "cell_stats": json.loads(js.cell_stats) if js.cell_stats else _parse_cell_stats(js.log_tail, js.local_output_path, js.filename),
                 }
                 for js in completed
             ],
@@ -2753,7 +3439,7 @@ def get_slide_results(slide_hash: str, db: Session = Depends(get_db)):
             "status": js.status,
             "completed_at": js.completed_at.isoformat() if js.completed_at else None,
             "output_path": js.local_output_path or js.remote_output_path,
-            "cell_stats": _parse_cell_stats(js.log_tail),
+            "cell_stats": _parse_cell_stats(js.log_tail, js.local_output_path, js.filename),
         }
         for js in completed_job_slides
     ]
@@ -2787,23 +3473,9 @@ def list_result_files(
     if not output_dir or not output_dir.exists():
         return []
 
-    IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".svg"}
-
-    files = []
-    for f in sorted(output_dir.iterdir()):
-        if f.is_file():
-            files.append({
-                "name": f.name,
-                "size": f.stat().st_size,
-                "is_image": f.suffix.lower() in IMAGE_EXTS,
-            })
-
-    return files
+    return _build_file_tree(output_dir, output_dir)
 
 
-from fastapi.responses import FileResponse
-
-import snappy as snappy_module
 import sys as _sys
 _scripts_dir = str(Path(__file__).resolve().parent.parent / "scripts")
 if _scripts_dir not in _sys.path:
@@ -2814,6 +3486,7 @@ from postprocess_cellvit import fix_geometry
 def _decompress_snappy_file(file_path: Path) -> tuple[bytes, str]:
     """Decompress a .snappy file and optionally fix geometries.
     Returns (content_bytes, download_filename)."""
+    import snappy as snappy_module
     compressed = file_path.read_bytes()
     raw = snappy_module.decompress(compressed)
     download_name = file_path.name
@@ -2829,7 +3502,7 @@ def _decompress_snappy_file(file_path: Path) -> tuple[bytes, str]:
     return raw, download_name
 
 
-@app.get("/results/{job_id}/file/{filename}")
+@app.get("/results/{job_id}/file/{filename:path}")
 def get_result_file(
     job_id: int,
     filename: str,
@@ -2858,15 +3531,17 @@ def get_result_file(
     if not output_dir:
         raise HTTPException(status_code=404, detail="No output path for this job")
 
-    # Prevent path traversal
-    safe_name = Path(filename).name
-    file_path = output_dir / safe_name
+    # Resolve path safely (prevent traversal)
+    try:
+        file_path = _safe_resolve(output_dir, filename)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid file path")
 
     if not file_path.exists() or not file_path.is_file():
         raise HTTPException(status_code=404, detail="File not found")
 
     # Decompress .snappy files on-the-fly
-    if safe_name.endswith(".snappy"):
+    if file_path.name.endswith(".snappy"):
         content, download_name = _decompress_snappy_file(file_path)
         media_type = "application/geo+json" if download_name.endswith(".geojson") else "application/octet-stream"
         return Response(
@@ -2875,10 +3550,10 @@ def get_result_file(
             headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
         )
 
-    return FileResponse(str(file_path), filename=safe_name)
+    return FileResponse(str(file_path), filename=file_path.name)
 
 
-@app.delete("/results/{job_id}/file/{filename}")
+@app.delete("/results/{job_id}/file/{filename:path}")
 def delete_result_file(
     job_id: int,
     filename: str,
@@ -2903,14 +3578,62 @@ def delete_result_file(
     if not output_dir:
         raise HTTPException(status_code=404, detail="No output path for this job")
 
-    safe_name = Path(filename).name
-    file_path = output_dir / safe_name
+    try:
+        file_path = _safe_resolve(output_dir, filename)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid file path")
 
     if not file_path.exists() or not file_path.is_file():
         raise HTTPException(status_code=404, detail="File not found")
 
     file_path.unlink()
-    return {"status": "ok", "deleted": safe_name}
+    return {"status": "ok", "deleted": filename}
+
+
+@app.get("/results/{job_id}/download-folder")
+def download_result_folder_zip(
+    job_id: int,
+    slide_hash: Optional[str] = Query(None),
+    folder_path: str = Query(""),
+    db: Session = Depends(get_db),
+):
+    """Download a subfolder of a slide's output as a ZIP file."""
+    job = db.query(AnalysisJob).options(
+        joinedload(AnalysisJob.slides).joinedload(JobSlide.slide)
+    ).filter_by(id=job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    output_dir = None
+    if slide_hash:
+        js = next((js for js in job.slides if js.slide and js.slide.slide_hash == slide_hash), None)
+        if js:
+            output_dir = _resolve_job_slide_output(js)
+    elif job.output_path:
+        output_dir = Path(job.output_path)
+
+    if not output_dir:
+        raise HTTPException(status_code=404, detail="No output path for this job")
+
+    try:
+        target = _safe_resolve(output_dir, folder_path) if folder_path else output_dir.resolve()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid folder path")
+
+    if not target.is_dir():
+        raise HTTPException(status_code=404, detail="Folder not found")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        _add_files_to_zip(zf, target, target.name)
+    buf.seek(0)
+
+    zip_name = f"{target.name}.zip"
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
+    )
 
 
 def _resolve_job_slide_output(js) -> Optional[Path]:
@@ -2924,16 +3647,55 @@ def _resolve_job_slide_output(js) -> Optional[Path]:
     return None
 
 
+_RESULT_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".svg"}
+
+
+def _build_file_tree(base_dir: Path, current_dir: Path) -> list:
+    """Recursively build a file/folder tree for a result output directory."""
+    result = []
+    try:
+        entries = sorted(current_dir.iterdir(), key=lambda e: (e.is_file(), e.name.lower()))
+    except PermissionError:
+        return result
+    for entry in entries:
+        rel = entry.relative_to(base_dir).as_posix()
+        if entry.is_dir():
+            result.append({
+                "name": entry.name,
+                "type": "dir",
+                "path": rel,
+                "children": _build_file_tree(base_dir, entry),
+            })
+        else:
+            result.append({
+                "name": entry.name,
+                "type": "file",
+                "path": rel,
+                "size": entry.stat().st_size,
+                "is_image": entry.suffix.lower() in _RESULT_IMAGE_EXTS,
+            })
+    return result
+
+
+def _safe_resolve(output_dir: Path, rel_path: str) -> Path:
+    """Resolve a relative path within output_dir, raising ValueError on traversal attempts."""
+    resolved = (output_dir / rel_path).resolve()
+    resolved.relative_to(output_dir.resolve())  # raises ValueError if outside
+    return resolved
+
+
 def _add_files_to_zip(zf: zipfile.ZipFile, output_dir: Path, arc_prefix: str):
-    """Add all files from output_dir to the ZIP, decompressing .snappy on-the-fly."""
-    for f in sorted(output_dir.iterdir()):
+    """Recursively add all files from output_dir to the ZIP, decompressing .snappy on-the-fly."""
+    for f in sorted(output_dir.rglob("*")):
         if not f.is_file():
             continue
+        rel = f.relative_to(output_dir).as_posix()
         if f.name.endswith(".snappy"):
             content, download_name = _decompress_snappy_file(f)
-            zf.writestr(f"{arc_prefix}/{download_name}", content)
+            arc_name = f"{arc_prefix}/{rel}".removesuffix(".snappy")
+            zf.writestr(arc_name, content)
         else:
-            zf.write(str(f), f"{arc_prefix}/{f.name}")
+            zf.write(str(f), f"{arc_prefix}/{rel}")
 
 
 @app.get("/jobs/{job_id}/download-zip")
@@ -3021,13 +3783,16 @@ def download_cart(data: CartDownloadRequest, db: Session = Depends(get_db)):
         if not output_dir:
             continue
 
-        safe_name = Path(item.filename).name
-        file_path = output_dir / safe_name
+        try:
+            file_path = _safe_resolve(output_dir, item.filename)
+        except ValueError:
+            continue
         if not file_path.exists() or not file_path.is_file():
             continue
 
         arc_prefix = item.slide_hash[:12]
-        resolved.append((file_path, f"{arc_prefix}/{safe_name}"))
+        rel = file_path.relative_to(output_dir).as_posix()
+        resolved.append((file_path, f"{arc_prefix}/{rel}"))
 
     if not resolved:
         raise HTTPException(status_code=404, detail="No files found for the selected items")
@@ -3431,6 +4196,128 @@ def staging_sort(req: SortRequest):
 
     threading.Thread(target=_run_sort_background, args=(filenames,), daemon=True).start()
     return {"started": True, "total": len(filenames)}
+
+
+@app.get("/export/slides.csv")
+def export_slides_csv(db: Session = Depends(get_db)):
+    """Export all slides with metadata and tags as a CSV file."""
+    slides = db.query(Slide).options(
+        joinedload(Slide.tags),
+        joinedload(Slide.case).joinedload(Case.tags),
+    ).all()
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow([
+        "slide_hash", "filename", "accession", "year",
+        "block_id", "slide_number", "stain_type", "random_id",
+        "file_size_bytes", "slide_tags", "case_tags",
+    ])
+
+    for slide in slides:
+        filepath = indexer.get_filepath(slide.slide_hash) if indexer else None
+        filename = filepath.name if filepath else ""
+        if filepath and indexer:
+            parsed = indexer.parser.parse(filepath.name)
+            accession = parsed.accession if parsed else ""
+            slide_number = parsed.slide_number if parsed else ""
+        else:
+            accession = ""
+            slide_number = ""
+
+        writer.writerow([
+            slide.slide_hash,
+            filename,
+            accession,
+            slide.case.year if slide.case else "",
+            slide.block_id or "",
+            slide_number,
+            slide.stain_type or "",
+            slide.random_id or "",
+            slide.file_size_bytes or "",
+            ";".join(t.name for t in slide.tags),
+            ";".join(t.name for t in slide.case.tags) if slide.case else "",
+        ])
+
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="slides_export.csv"'},
+    )
+
+
+@app.post("/import/slides-csv")
+async def import_slides_csv(
+    file: UploadFile = File(...),
+    mode: str = Query("merge", enum=["merge", "replace"]),
+    db: Session = Depends(get_db),
+):
+    """
+    Bulk-import slide tags from a CSV file.
+
+    Required column: slide_hash
+    Optional columns: slide_tags (semicolon-separated), case_tags (semicolon-separated)
+
+    mode='merge'   — add CSV tags to existing tags (default)
+    mode='replace' — replace all slide/case tags with CSV values
+    """
+    raw = await file.read()
+    text = raw.decode("utf-8-sig")  # handle Excel BOM
+
+    reader = csv.DictReader(io.StringIO(text))
+    if "slide_hash" not in (reader.fieldnames or []):
+        raise HTTPException(status_code=400, detail="CSV must contain a 'slide_hash' column")
+
+    matched = 0
+    unmatched = 0
+    tags_added = 0
+
+    for row in reader:
+        slide_hash = row.get("slide_hash", "").strip()
+        if not slide_hash:
+            continue
+
+        slide = db.query(Slide).options(
+            joinedload(Slide.tags),
+            joinedload(Slide.case).joinedload(Case.tags),
+        ).filter_by(slide_hash=slide_hash).first()
+
+        if not slide:
+            unmatched += 1
+            continue
+        matched += 1
+
+        def _apply_tags(obj, raw_str: str):
+            nonlocal tags_added
+            names = [n.strip() for n in raw_str.split(";") if n.strip()]
+            if not names:
+                return
+            if mode == "replace":
+                obj.tags.clear()
+            existing = {t.name for t in obj.tags}
+            for name in names:
+                if name in existing:
+                    continue
+                tag = db.query(Tag).filter_by(name=name).first()
+                if not tag:
+                    tag = Tag(name=name)
+                    db.add(tag)
+                    db.flush()
+                obj.tags.append(tag)
+                existing.add(name)
+                tags_added += 1
+
+        _apply_tags(slide, row.get("slide_tags", ""))
+        if slide.case:
+            _apply_tags(slide.case, row.get("case_tags", ""))
+
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+    return {"matched": matched, "unmatched": unmatched, "tags_added": tags_added, "mode": mode}
 
 
 @app.get("/dashboard/summary")

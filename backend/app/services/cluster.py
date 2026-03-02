@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Optional
 
 import paramiko
+from sqlalchemy.orm import joinedload
 
 from ..db import get_session, AnalysisJob, JobSlide, Analysis, Slide
 
@@ -87,6 +88,26 @@ class ClusterService:
                 return False
             transport = self._client.get_transport()
             return transport is not None and transport.is_active()
+
+    def ping(self, timeout: int = 5) -> bool:
+        """
+        Actively verify the SSH connection is alive by running 'echo ping'.
+        Unlike run_command, this does NOT attempt to reconnect if the transport
+        is dead — it simply returns False. Intended for health checks.
+        """
+        with self._lock:
+            if self._client is None:
+                return False
+            transport = self._client.get_transport()
+            if transport is None or not transport.is_active():
+                return False
+            # Transport reports active — verify with a real command
+            try:
+                stdin, stdout, stderr = self._client.exec_command("echo ping", timeout=timeout)
+                stdout.channel.recv_exit_status()
+                return True
+            except Exception:
+                return False
 
     @property
     def connection_info(self) -> dict:
@@ -182,11 +203,12 @@ class ClusterService:
         self.run_command(f"mkdir -p {remote_dir}")
 
         # Try rsync + sshpass first (faster for large files)
+        # No -z: SVS/NDPI are already compressed; compression wastes CPU with no size benefit
         if shutil.which("sshpass") and shutil.which("rsync"):
             try:
                 cmd = [
                     "sshpass", "-p", self._password,
-                    "rsync", "-avzP", "--no-perms",
+                    "rsync", "-avP", "--no-perms",
                     "-e", f"ssh -p {self._port} -o StrictHostKeyChecking=no",
                     str(local_path),
                     f"{self._username}@{self._host}:{remote_dir}/",
@@ -216,55 +238,53 @@ class ClusterService:
     def start_job(
         self,
         analysis: Analysis,
-        slide_hash: str,
-        remote_wsi_path: str,
+        job_id: int,
+        remote_wsi_dir: str,
         remote_output_dir: str,
         gpu_index: int,
         parameters: Optional[dict] = None,
     ) -> str:
         """
-        Start an analysis job in a tmux session.
+        Start a batch analysis job in a tmux session covering all slides in remote_wsi_dir.
         Returns the tmux session name.
         """
-        session_name = f"slidecap_{analysis.name.lower().replace(' ', '_')}_{slide_hash[:8]}"
+        import shlex as _shlex
+        session_name = f"slidecap_{analysis.name.lower().replace(' ', '_')}_{job_id}"
 
-        # Build the command from template
-        # GPU note: CUDA_VISIBLE_DEVICES is set to the real gpu_index,
-        # which makes it appear as device 0 inside the process.
-        # So {gpu} in the template should always be 0.
         params = parameters or {}
         template_vars = {
-            "wsi_path": remote_wsi_path,
-            "wsi_dir": str(Path(remote_wsi_path).parent),
+            "wsi_dir": remote_wsi_dir,
             "outdir": remote_output_dir,
-            "gpu": "0",  # Always 0 because CUDA_VISIBLE_DEVICES handles the real mapping
+            "gpu": str(gpu_index),  # Physical GPU index — also exported via CUDA_VISIBLE_DEVICES
             "batch_size": str(params.get("batch_size", 4)),
             "model_path": params.get("model_path", ""),
         }
 
-        # Use command_template if available, otherwise construct from script_path
         if analysis.command_template:
             command = analysis.command_template.format(**template_vars)
         elif analysis.script_path:
-            command = f"{analysis.script_path} {remote_wsi_path} {remote_output_dir}"
+            command = f"{analysis.script_path} {remote_wsi_dir} {remote_output_dir}"
         else:
             raise RuntimeError("Analysis has no command_template or script_path defined")
 
-        # Build the full tmux command
         parts = []
         if analysis.working_directory:
             parts.append(f"cd {analysis.working_directory}")
         if analysis.env_setup:
             parts.append(analysis.env_setup)
 
-        if analysis.gpu_required:
-            parts.append(f"export CUDA_VISIBLE_DEVICES={gpu_index}")
-        # Clean old output (handles reruns where resume scripts would skip)
-        parts.append(f"rm -rf {remote_output_dir}")
-        parts.append(f"mkdir -p {remote_output_dir}")
-        parts.append(f"{command} 2>&1 | tee {remote_output_dir}/run.log")
+        # Clean any stale output from a previous run, then create fresh dir
+        parts.append(f"rm -rf {_shlex.quote(remote_output_dir)}")
+        parts.append(f"mkdir -p {_shlex.quote(remote_output_dir)}")
+        parts.append(f"{command} 2>&1 | tee {_shlex.quote(remote_output_dir)}/run.log")
 
         full_command = " && ".join(parts)
+
+        # After analysis (success or failure): delete the entire batch WSI dir
+        full_command += (
+            f"; rm -rf {_shlex.quote(remote_wsi_dir)}"
+            f"; true"
+        )
 
         # Create tmux session
         tmux_cmd = f"tmux new-session -d -s {session_name} '{full_command}'"
@@ -315,6 +335,7 @@ class JobStatusPoller:
         self.analyses_path = analyses_path
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._poll_lock = threading.Lock()  # Prevent concurrent _do_poll() calls
 
     def start(self):
         self._stop_event.clear()
@@ -329,14 +350,19 @@ class JobStatusPoller:
         print("[Poller] Stopped")
 
     def poll_now(self):
-        """Trigger an immediate status check."""
-        self._do_poll()
+        """Trigger an immediate status check (no-op if a poll is already running)."""
+        if self._poll_lock.locked():
+            print("[Poller] poll_now skipped — poll already in progress")
+            return
+        with self._poll_lock:
+            self._do_poll()
 
     def _poll_loop(self):
         while not self._stop_event.is_set():
             try:
                 if self.cluster.is_connected:
-                    self._do_poll()
+                    with self._poll_lock:
+                        self._do_poll()
             except Exception as e:
                 print(f"[Poller] Error: {e}")
             self._stop_event.wait(self.interval)
@@ -347,7 +373,10 @@ class JobStatusPoller:
 
         db = get_session()
         try:
-            # Get all active job_slides with cluster IDs (tmux session names)
+            updated = 0
+            affected_job_ids = set()
+
+            # --- Part 1: Poll known tmux sessions ---
             active_slides = (
                 db.query(JobSlide)
                 .filter(
@@ -357,59 +386,91 @@ class JobStatusPoller:
                 .all()
             )
 
-            if not active_slides:
-                return
-
-            updated = 0
-            affected_job_ids = set()
-
+            # Group by tmux session — one SSH check per session
+            session_groups: dict[str, list] = {}
             for js in active_slides:
+                session_groups.setdefault(js.cluster_job_id, []).append(js)
+
+            for session_name, group in session_groups.items():
+                representative = group[0]
                 try:
                     info = self.cluster.check_job_status(
-                        js.cluster_job_id,
-                        js.remote_output_path or ""
+                        session_name,
+                        representative.remote_output_path or ""
                     )
                 except Exception as e:
-                    print(f"[Poller] Failed to check job_slide {js.id}: {e}")
+                    print(f"[Poller] Failed to check session {session_name}: {e}")
                     continue
 
-                # Update log tail
                 if info.get("log_tail"):
-                    js.log_tail = info["log_tail"]
+                    for js in group:
+                        js.log_tail = info["log_tail"]
 
                 if info["alive"]:
-                    if js.status != "running":
-                        js.status = "running"
-                        if not js.started_at:
-                            js.started_at = datetime.utcnow()
-                        updated += 1
-                        affected_job_ids.add(js.job_id)
+                    for js in group:
+                        if js.status != "running":
+                            js.status = "running"
+                            if not js.started_at:
+                                js.started_at = datetime.utcnow()
+                            updated += 1
+                            affected_job_ids.add(js.job_id)
                 else:
-                    # Session gone — check if completed or failed
-                    if js.status in ("queued", "running"):
-                        output_dir = js.remote_output_path
+                    log_tail = info.get("log_tail", "")
+                    log_error = self._detect_log_error(log_tail)
+
+                    if log_error:
+                        for js in group:
+                            js.status = "failed"
+                            js.error_message = log_error
+                            js.completed_at = datetime.utcnow()
+                    else:
+                        output_dir = representative.remote_output_path
+                        has_output = False
                         if output_dir:
                             stdout, _, _ = self.cluster.run_command(
                                 f"ls {output_dir}/ 2>/dev/null | head -20"
                             )
                             has_output = bool(stdout.strip())
-                        else:
-                            has_output = False
 
                         if has_output:
-                            js.status = "completed"
-                            # Auto-transfer results back to network drive
-                            local_path = self._transfer_results(js)
-                            if local_path:
-                                js.local_output_path = local_path
+                            for js in group:
+                                js.status = "completed"
+                                js.completed_at = datetime.utcnow()
+                            print(f"[Poller] Session {session_name}: cluster job done, awaiting manual transfer")
                         else:
-                            js.status = "failed"
-                            if not js.error_message:
+                            for js in group:
+                                js.status = "failed"
                                 js.error_message = "tmux session ended without output files"
+                                js.completed_at = datetime.utcnow()
 
+                    updated += len(group)
+                    for js in group:
+                        affected_job_ids.add(js.job_id)
+
+            # --- Part 2: Recover orphaned slides (stuck 'transferring', no cluster_job_id) ---
+            # This happens when start_job() succeeded but the DB commit marking them 'running' failed.
+            orphaned = (
+                db.query(JobSlide)
+                .filter(
+                    JobSlide.status == "transferring",
+                    JobSlide.cluster_job_id.is_(None),
+                    JobSlide.remote_output_path.isnot(None),
+                )
+                .all()
+            )
+            for js in orphaned:
+                try:
+                    stdout, _, _ = self.cluster.run_command(
+                        f"ls {js.remote_output_path}/ 2>/dev/null | head -5"
+                    )
+                    if stdout.strip():
+                        js.status = "completed"
                         js.completed_at = datetime.utcnow()
                         updated += 1
                         affected_job_ids.add(js.job_id)
+                        print(f"[Poller] Recovered orphaned slide {js.id}: output found at {js.remote_output_path}")
+                except Exception as e:
+                    print(f"[Poller] Could not check orphaned slide {js.id}: {e}")
 
             # Recompute parent job statuses
             if affected_job_ids:
@@ -417,6 +478,35 @@ class JobStatusPoller:
                     job = db.query(AnalysisJob).filter_by(id=job_id).first()
                     if job:
                         self._recompute_job_status(job)
+
+            # --- Part 3: Reconcile stale job statuses ---
+            # Jobs can end up with a status that doesn't match their slides if a
+            # slide was corrected after the job was last recomputed (e.g. NFS error
+            # marked slide failed, output check then flipped it to completed, but the
+            # job status was never updated again).
+            stale_jobs = (
+                db.query(AnalysisJob)
+                .options(joinedload(AnalysisJob.slides))
+                .filter(AnalysisJob.status.in_(["failed", "running"]))
+                .all()
+            )
+            for job in stale_jobs:
+                if not job.slides:
+                    continue
+                statuses = [js.status for js in job.slides]
+                if any(s in ("running", "transferring", "pending") for s in statuses):
+                    continue  # still genuinely active, skip
+                expected = None
+                if all(s == "completed" for s in statuses):
+                    expected = "completed"
+                elif all(s in ("completed", "failed") for s in statuses):
+                    expected = "failed" if any(s == "failed" for s in statuses) else "completed"
+                if expected and job.status != expected:
+                    job.status = expected
+                    if not job.completed_at:
+                        job.completed_at = datetime.utcnow()
+                    affected_job_ids.add(job.id)
+                    updated += 1
 
             if updated:
                 db.commit()
@@ -430,8 +520,227 @@ class JobStatusPoller:
         finally:
             db.close()
 
+    def _transfer_and_distribute(self, group: list, db) -> None:
+        """Rsync the shared batch output dir from cluster, distribute files per slide
+        to the network drive, then clean up staging and cluster output."""
+        import shlex
+        if not group:
+            return
+
+        representative = group[0]
+        remote_output_dir = representative.remote_output_path
+        job = representative.job
+        analysis_name = job.model_name if job else "unknown"
+
+        if not remote_output_dir or not self.analyses_path:
+            for js in group:
+                js.status = "failed"
+                js.error_message = "No remote output path or analyses_path configured"
+                js.completed_at = datetime.utcnow()
+            return
+
+        # Rsync entire batch output dir to a staging area
+        staging_dir = self.analyses_path / f"_staging_{job.id if job else 'unknown'}"
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        remote_path = remote_output_dir.rstrip("/") + "/"
+
+        success = False
+        if shutil.which("sshpass") and shutil.which("rsync"):
+            try:
+                cmd = [
+                    "sshpass", "-p", self.cluster._password,
+                    "rsync", "-av", "--no-perms",
+                    "-e", f"ssh -p {self.cluster._port} -o StrictHostKeyChecking=no",
+                    f"{self.cluster._username}@{self.cluster._host}:{remote_path}",
+                    str(staging_dir) + "/",
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                success = result.returncode == 0
+                if not success:
+                    print(f"[Transfer] rsync failed for job {job.id}: rc={result.returncode} {result.stderr[:200]}")
+            except Exception as e:
+                print(f"[Transfer] rsync error for job {job.id}: {e}")
+
+        if not success:
+            try:
+                client = self.cluster._get_client()
+                sftp = client.open_sftp()
+                try:
+                    self._sftp_get_recursive(sftp, remote_output_dir.rstrip("/"), staging_dir)
+                    success = True
+                finally:
+                    sftp.close()
+            except Exception as e:
+                print(f"[Transfer] SFTP error for job {job.id}: {e}")
+
+        if not success:
+            # Transfer failed — check if local output already exists from a previous
+            # successful transfer (e.g. remote dir was already cleaned up).
+            all_have_local = all(
+                js.slide and any(
+                    (self.analyses_path / js.slide.slide_hash / analysis_name).iterdir()
+                ) if js.slide and (self.analyses_path / js.slide.slide_hash / analysis_name).exists() else False
+                for js in group
+            )
+            if all_have_local:
+                print(f"[Transfer] Job {job.id if job else '?'}: remote gone but local output exists — marking completed")
+                for js in group:
+                    if js.slide:
+                        js.status = "completed"
+                        js.local_output_path = str(self.analyses_path / js.slide.slide_hash / analysis_name)
+                        js.completed_at = datetime.utcnow()
+                shutil.rmtree(staging_dir, ignore_errors=True)
+                return
+            for js in group:
+                js.status = "failed"
+                js.error_message = "Failed to transfer output from cluster"
+                js.completed_at = datetime.utcnow()
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            return
+
+        # Parse progress.log for per-slide success/failure
+        slide_results: dict[str, bool] = {}  # filename_stem → success
+        progress_log = staging_dir / "progress.log"
+        if progress_log.exists():
+            for line in progress_log.read_text(errors="replace").splitlines():
+                line = line.strip()
+                if line.startswith("[SUCCESS] "):
+                    stem = Path(line[len("[SUCCESS] "):]).stem
+                    slide_results[stem] = True
+                elif line.startswith("[FAILED] "):
+                    stem = Path(line[len("[FAILED] "):]).stem
+                    slide_results[stem] = False
+
+        # Distribute output files per slide
+        for js in group:
+            slide = js.slide
+            if not slide:
+                js.status = "failed"
+                js.error_message = "Slide record not found"
+                js.completed_at = datetime.utcnow()
+                continue
+
+            if not js.filename:
+                # Legacy single-slide job: move all non-log files to per-slide dir
+                local_dir = self.analyses_path / slide.slide_hash / analysis_name
+                local_dir.mkdir(parents=True, exist_ok=True)
+                for f in staging_dir.iterdir():
+                    if f.name not in ("run.log", "progress.log") and f.is_file():
+                        shutil.move(str(f), str(local_dir / f.name))
+                js.status = "completed"
+                js.local_output_path = str(local_dir)
+                js.completed_at = datetime.utcnow()
+                continue
+
+            stem = Path(js.filename).stem
+            local_dir = self.analyses_path / slide.slide_hash / analysis_name
+            local_dir.mkdir(parents=True, exist_ok=True)
+
+            # Recursively find files whose name starts with this stem anywhere in staging_dir.
+            # This handles both flat output (CellViT: staging/{stem}_cells.pt) and
+            # deeply nested output (UNI: staging/20x_256px/features/{stem}.h5).
+            matched_files = [
+                p for p in staging_dir.rglob("*")
+                if p.is_file()
+                and p.name.startswith(stem)
+                and p.name not in ("run.log", "progress.log")
+            ]
+            # Top-level directories named with this stem (models that create per-slide subdirs)
+            matched_top_dirs = [
+                p for p in staging_dir.iterdir()
+                if p.is_dir() and p.name.startswith(stem)
+            ]
+
+            # Move files preserving relative directory structure
+            for f in matched_files:
+                rel = f.relative_to(staging_dir)
+                dest = local_dir / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(f), str(dest))
+
+            # Move top-level stem-named subdirs
+            for d in matched_top_dirs:
+                dest = local_dir / d.name
+                if dest.exists():
+                    shutil.rmtree(dest)
+                shutil.move(str(d), str(dest))
+
+            found_output = bool(matched_files or matched_top_dirs)
+
+            if stem in slide_results:
+                if slide_results[stem]:
+                    js.status = "completed"
+                    js.local_output_path = str(local_dir)
+                else:
+                    js.status = "failed"
+                    js.error_message = f"Analysis script reported failure for {js.filename}"
+            elif found_output:
+                js.status = "completed"
+                js.local_output_path = str(local_dir)
+            else:
+                js.status = "failed"
+                js.error_message = f"No output files found for {js.filename}"
+
+            js.completed_at = datetime.utcnow()
+
+        # Parse full run.log to extract per-slide log sections (for cell stats etc.)
+        run_log_src = staging_dir / "run.log"
+        slide_log_sections: dict[str, str] = {}  # stem → log section for that slide
+        if run_log_src.exists():
+            full_log = run_log_src.read_text(errors="replace")
+            # Split log on "Processing WSI: {filename}" markers
+            import re as _re
+            wsi_pattern = _re.compile(r"Processing WSI:\s+(\S+)")
+            sections: list[tuple[str, int]] = []  # (stem, start_index)
+            for m in wsi_pattern.finditer(full_log):
+                stem = Path(m.group(1)).stem
+                sections.append((stem, m.start()))
+            for i, (stem, start) in enumerate(sections):
+                end = sections[i + 1][1] if i + 1 < len(sections) else len(full_log)
+                slide_log_sections[stem] = full_log[start:end]
+
+        # Copy shared logs (run.log, progress.log) to each completed slide's dir
+        # and update log_tail with the slide-specific section
+        for log_name in ("run.log", "progress.log"):
+            log_src = staging_dir / log_name
+            if log_src.exists():
+                for js in group:
+                    if js.local_output_path:
+                        dest = Path(js.local_output_path) / log_name
+                        try:
+                            shutil.copy2(str(log_src), str(dest))
+                        except Exception:
+                            pass
+
+        # Set per-slide log_tail and compute+cache cell_stats
+        import ast as _ast
+        import json as _json
+        for js in group:
+            if js.filename:
+                stem = Path(js.filename).stem
+                section = slide_log_sections.get(stem, "")
+                if section:
+                    js.log_tail = section[-4000:]  # last 4KB of slide's section
+                    # Parse and cache cell stats now so GET /jobs/{id} never reads disk
+                    stats = self._extract_cell_stats_from_text(section)
+                    if stats:
+                        js.cell_stats = _json.dumps(stats)
+
+        # Cleanup: remove staging dir and cluster output dir
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        self._cleanup_cluster_files_batch(remote_output_dir)
+        print(f"[Transfer] Job {job.id if job else '?'}: distributed to {len(group)} slides")
+
+    def _cleanup_cluster_files_batch(self, remote_output_dir: str) -> None:
+        """Remove the batch output dir from the cluster after successful transfer."""
+        import shlex
+        remote_out = remote_output_dir.rstrip("/")
+        _, _, rc = self.cluster.run_command(f"rm -rf {shlex.quote(remote_out)}")
+        print(f"[Cleanup] rm -rf {remote_out}: rc={rc}")
+
     def _transfer_results(self, js: JobSlide) -> Optional[str]:
-        """Rsync results from cluster back to network drive for a completed slide."""
+        """Rsync results from cluster back to network drive for a completed slide,
+        then clean up both the output dir and the WSI file from the cluster."""
         if not self.analyses_path:
             print(f"[Transfer] No analyses_path configured")
             return None
@@ -453,16 +762,16 @@ class JobStatusPoller:
         local_dir.mkdir(parents=True, exist_ok=True)
 
         remote_path = js.remote_output_path.rstrip("/") + "/"
+        remote_dir = js.remote_output_path.rstrip("/")
         print(f"[Transfer] Slide {slide.slide_hash[:12]}: {remote_path} -> {local_dir}")
 
-        # Try rsync+sshpass first, fall back to paramiko SFTP
-        remote_dir = js.remote_output_path.rstrip("/")
+        success = False
 
         if shutil.which("sshpass") and shutil.which("rsync"):
             try:
                 cmd = [
                     "sshpass", "-p", self.cluster._password,
-                    "rsync", "-avz", "--no-perms",
+                    "rsync", "-av", "--no-perms",
                     "-e", f"ssh -p {self.cluster._port} -o StrictHostKeyChecking=no",
                     f"{self.cluster._username}@{self.cluster._host}:{remote_path}",
                     str(local_dir) + "/",
@@ -470,41 +779,98 @@ class JobStatusPoller:
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
                 if result.returncode == 0:
                     print(f"[Transfer] rsync OK for {slide.slide_hash[:12]} -> {local_dir}")
-                    return str(local_dir)
+                    success = True
                 else:
                     print(f"[Transfer] rsync failed for {slide.slide_hash[:12]}: rc={result.returncode} stderr={result.stderr[:300]}")
             except Exception as e:
                 print(f"[Transfer] rsync error for {slide.slide_hash[:12]}: {e}")
 
-        # Fallback: paramiko SFTP
-        print(f"[Transfer] Using SFTP fallback for {slide.slide_hash[:12]}")
-        try:
-            client = self.cluster._get_client()
-            sftp = client.open_sftp()
+        if not success:
+            # Fallback: paramiko SFTP (recursive)
+            print(f"[Transfer] Using SFTP fallback for {slide.slide_hash[:12]}")
             try:
-                remote_files = sftp.listdir(remote_dir)
-                transferred_count = 0
-                for fname in remote_files:
-                    remote_file = f"{remote_dir}/{fname}"
-                    try:
-                        stat = sftp.stat(remote_file)
-                        # Skip directories (mode check: S_ISDIR)
-                        import stat as stat_module
-                        if stat_module.S_ISDIR(stat.st_mode):
-                            continue
-                    except Exception:
-                        continue
-                    local_file = local_dir / fname
-                    print(f"[Transfer]   SFTP get: {fname} ({stat.st_size / 1024:.0f} KB)")
-                    sftp.get(remote_file, str(local_file))
-                    transferred_count += 1
-                print(f"[Transfer] SFTP OK for {slide.slide_hash[:12]}: {transferred_count} files -> {local_dir}")
-                return str(local_dir)
-            finally:
-                sftp.close()
-        except Exception as e:
-            print(f"[Transfer] SFTP error for {slide.slide_hash[:12]}: {e}")
+                client = self.cluster._get_client()
+                sftp = client.open_sftp()
+                try:
+                    count = self._sftp_get_recursive(sftp, remote_dir, local_dir)
+                    print(f"[Transfer] SFTP OK for {slide.slide_hash[:12]}: {count} files -> {local_dir}")
+                    success = True
+                finally:
+                    sftp.close()
+            except Exception as e:
+                print(f"[Transfer] SFTP error for {slide.slide_hash[:12]}: {e}")
+
+        if success:
+            self._cleanup_cluster_files(js)
+            return str(local_dir)
+        return None
+
+    def _sftp_get_recursive(self, sftp, remote_dir: str, local_dir: Path) -> int:
+        """Recursively download a remote directory tree via SFTP. Returns file count."""
+        import stat as stat_module
+        local_dir.mkdir(parents=True, exist_ok=True)
+        count = 0
+        for entry in sftp.listdir_attr(remote_dir):
+            remote_path = f"{remote_dir}/{entry.filename}"
+            local_path = local_dir / entry.filename
+            if stat_module.S_ISDIR(entry.st_mode):
+                count += self._sftp_get_recursive(sftp, remote_path, local_path)
+            else:
+                print(f"[Transfer]   SFTP get: {entry.filename} ({entry.st_size / 1024:.0f} KB)")
+                sftp.get(remote_path, str(local_path))
+                count += 1
+        return count
+
+    def _cleanup_cluster_files(self, js: JobSlide) -> None:
+        """Remove output dir from cluster after successful transfer (legacy single-slide path)."""
+        if js.remote_output_path:
+            self._cleanup_cluster_files_batch(js.remote_output_path)
+
+    @staticmethod
+    def _extract_cell_stats_from_text(text: str) -> Optional[dict]:
+        """Scan log text (bottom-up) for the last dict-like line of numeric cell counts."""
+        import ast as _ast
+        for line in reversed(text.splitlines()):
+            line = line.strip()
+            if " - " in line:
+                line = line.split(" - ", 2)[-1].strip()
+            if line.startswith("{") and line.endswith("}"):
+                try:
+                    parsed = _ast.literal_eval(line)
+                    if isinstance(parsed, dict) and all(isinstance(v, (int, float)) for v in parsed.values()):
+                        return parsed
+                except Exception:
+                    continue
+        return None
+
+    @staticmethod
+    def _detect_log_error(log_tail: str) -> Optional[str]:
+        """Scan the tail of run.log for Python exceptions or known error patterns.
+        Returns a short error string if an error is found, else None."""
+        import re
+        if not log_tail:
             return None
+        lines = [l.rstrip() for l in log_tail.splitlines()]
+        # Walk lines in reverse to find the last meaningful error
+        for line in reversed(lines):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            # CUDA / GPU OOM
+            if "OutOfMemoryError" in stripped or "out of memory" in stripped.lower():
+                return stripped[:300]
+            # Benign NFS cleanup artifact — not a real failure
+            if "Device or resource busy" in stripped and ".nfs" in stripped:
+                continue
+            # Any named Python exception at the end of a traceback
+            if re.match(r"[A-Za-z][A-Za-z0-9_.]*Error[:\s]", stripped):
+                return stripped[:300]
+            if re.match(r"[A-Za-z][A-Za-z0-9_.]*Exception[:\s]", stripped):
+                return stripped[:300]
+        # Fallback: traceback present but error line not in tail
+        if "Traceback (most recent call last)" in log_tail:
+            return "Python exception (see run.log for details)"
+        return None
 
     @staticmethod
     def _recompute_job_status(job: AnalysisJob):

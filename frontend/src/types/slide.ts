@@ -56,6 +56,12 @@ export interface CohortSlide {
   file_size_bytes?: number
 }
 
+export interface CohortFlag {
+  id: number
+  name: string
+  case_hashes: string[]
+}
+
 export interface CohortDetail {
   id: number
   name: string
@@ -75,6 +81,23 @@ export interface CaseGroup {
   accession_number: string | null
   year: number | null
   slides: CohortSlide[]
+}
+
+export interface PatientSurgery {
+  id: number
+  surgery_label: string   // "S1", "S2", "S3"
+  case_hash: string
+  accession_number: string | null
+  year: number | null
+  slide_count: number
+  note?: string
+}
+
+export interface CohortPatient {
+  id: number
+  label: string           // user-defined de-identified label, e.g. "P001"
+  note?: string
+  surgeries: PatientSurgery[]
 }
 
 export interface Analysis {
