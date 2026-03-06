@@ -128,8 +128,19 @@ export function PatientTracker({ cohortId, caseGroups }: PatientTrackerProps) {
   }
 
   const deletePatient = async (patientId: number) => {
-    const res = await fetch(`${API_BASE}/cohorts/${cohortId}/patients/${patientId}`, { method: 'DELETE' })
-    if (res.ok) setPatients((prev) => prev.filter((p) => p.id !== patientId))
+    try {
+      const res = await fetch(`${API_BASE}/cohorts/${cohortId}/patients/${patientId}`, { method: 'DELETE' })
+      if (res.ok) {
+        setPatients((prev) => prev.filter((p) => p.id !== patientId))
+      } else {
+        const err = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }))
+        console.error('Delete patient failed:', err)
+        alert(`Failed to delete patient: ${err.detail || res.status}`)
+      }
+    } catch (e) {
+      console.error('Delete patient error:', e)
+      alert('Failed to delete patient: network error')
+    }
   }
 
   const savePatientLabel = async (patientId: number) => {

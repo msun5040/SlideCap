@@ -615,8 +615,12 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
       if (res.ok) {
         const data = await res.json()
         setCohort(p => p ? { ...p, slide_count: data.total_slides, case_count: data.total_cases } : p)
-      } else setCohort(prev)
-    } catch { setCohort(prev) }
+      } else {
+        setCohort(prev)
+        const err = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }))
+        console.error('Remove slide failed:', err)
+      }
+    } catch (e) { setCohort(prev); console.error('Remove slide error:', e) }
   }
 
   const removeCase = async (caseSlides: CohortSlide[]) => {
@@ -634,8 +638,12 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
       if (res.ok) {
         const data = await res.json()
         setCohort(p => p ? { ...p, slide_count: data.total_slides, case_count: data.total_cases } : p)
-      } else setCohort(prev)
-    } catch { setCohort(prev) }
+      } else {
+        setCohort(prev)
+        const err = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }))
+        console.error('Remove case failed:', err)
+      }
+    } catch (e) { setCohort(prev); console.error('Remove case error:', e) }
   }
 
   // ── Toggle helpers ───────────────────────────────────────────────────

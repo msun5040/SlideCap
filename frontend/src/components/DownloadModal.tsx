@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from 'react'
-import { Download, FileDown, Image, Loader2, Search, X, ChevronDown, ChevronRight, FileText } from 'lucide-react'
+import { Download, FileDown, Image, Loader2, Search, X, ChevronDown, ChevronRight, FileText, Wand2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -20,6 +20,7 @@ interface SlideGroup {
   label: string
   files: string[]
   annotation_count: number
+  is_local: boolean
 }
 
 interface DownloadModalProps {
@@ -27,13 +28,15 @@ interface DownloadModalProps {
   onOpenChange: (open: boolean) => void
   slideHashes: string[]
   jobId: number
+  postprocessAvailable?: boolean
 }
 
-export function DownloadModal({ open, onOpenChange, slideHashes, jobId }: DownloadModalProps) {
+export function DownloadModal({ open, onOpenChange, slideHashes, jobId, postprocessAvailable }: DownloadModalProps) {
   const [groups, setGroups] = useState<SlideGroup[]>([])
   const [selected, setSelected] = useState<Set<string>>(new Set()) // "slideHash:filename"
   const [includeWsi, setIncludeWsi] = useState(false)
   const [includeAnnotations, setIncludeAnnotations] = useState(false)
+  const [applyPostprocess, setApplyPostprocess] = useState(false)
   const [loading, setLoading] = useState(false)
   const [downloading, setDownloading] = useState(false)
 
@@ -207,14 +210,34 @@ export function DownloadModal({ open, onOpenChange, slideHashes, jobId }: Downlo
   // --- Download ---
 
   const doDownload = async () => {
-    // Collect unique filenames from selected keys
-    const filenameSet = new Set<string>()
+    // Build per-slide file map: slideHash -> [filenames]
+    const slideFileMap = new Map<string, string[]>()
     for (const key of selected) {
       const colonIdx = key.indexOf(':')
-      filenameSet.add(key.substring(colonIdx + 1))
+      const hash = key.substring(0, colonIdx)
+      const name = key.substring(colonIdx + 1)
+      if (!slideFileMap.has(hash)) slideFileMap.set(hash, [])
+      slideFileMap.get(hash)!.push(name)
     }
 
-    if (filenameSet.size === 0 && !includeWsi && !includeAnnotations) return
+    const filenameSet = new Set<string>()
+    for (const files of slideFileMap.values()) {
+      for (const f of files) filenameSet.add(f)
+    }
+
+    // Only include WSI for slides that have at least one file selected.
+    // If no files are selected at all (WSI-only download), include for all slides.
+    const slidesWithFiles = Array.from(slideFileMap.keys())
+    const wsiSlideHashes = includeWsi
+      ? (slidesWithFiles.length > 0 ? slidesWithFiles : slideHashes)
+      : []
+
+    // slide_hashes: union of slides needing files + slides needing WSI
+    const requestedHashes = Array.from(
+      new Set([...slidesWithFiles, ...wsiSlideHashes])
+    )
+
+    if (requestedHashes.length === 0 && !includeAnnotations) return
 
     setDownloading(true)
     try {
@@ -222,11 +245,12 @@ export function DownloadModal({ open, onOpenChange, slideHashes, jobId }: Downlo
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          slide_hashes: slideHashes,
+          slide_hashes: requestedHashes,
           job_id: jobId,
           include_filenames: Array.from(filenameSet),
-          include_wsi: includeWsi,
+          wsi_slide_hashes: wsiSlideHashes,
           include_annotations: includeAnnotations,
+          apply_postprocess: applyPostprocess,
         }),
       })
       if (res.ok) {
@@ -250,11 +274,6 @@ export function DownloadModal({ open, onOpenChange, slideHashes, jobId }: Downlo
     }
   }
 
-  const formatName = (name: string) => {
-    if (name.endsWith('.snappy')) return name.replace(/\.snappy$/, '') + ' *'
-    return name
-  }
-
   const isImage = (name: string) =>
     /\.(png|jpg|jpeg|tif|tiff|bmp|gif|svg)$/i.test(name)
 
@@ -276,7 +295,7 @@ export function DownloadModal({ open, onOpenChange, slideHashes, jobId }: Downlo
 
         <div className="space-y-4 py-2 overflow-y-auto flex-1 min-h-0">
           {/* Include toggles */}
-          <div className="flex gap-3">
+          <div className="flex gap-3 flex-wrap">
             <label className="flex items-center gap-3 rounded-md border p-3 cursor-pointer hover:bg-muted/50 flex-1">
               <Checkbox
                 checked={includeWsi}
@@ -298,6 +317,19 @@ export function DownloadModal({ open, onOpenChange, slideHashes, jobId }: Downlo
                 <div className="min-w-0">
                   <p className="text-sm font-medium">Imported Annotations</p>
                   <p className="text-xs text-muted-foreground">{totalAnnotations} file{totalAnnotations !== 1 ? 's' : ''}</p>
+                </div>
+              </label>
+            )}
+            {postprocessAvailable && (
+              <label className="flex items-center gap-3 rounded-md border p-3 cursor-pointer hover:bg-muted/50 flex-1">
+                <Checkbox
+                  checked={applyPostprocess}
+                  onCheckedChange={(v) => setApplyPostprocess(v === true)}
+                />
+                <Wand2 className="h-4 w-4 text-purple-500 shrink-0" />
+                <div className="min-w-0">
+                  <p className="text-sm font-medium">Apply post-processing</p>
+                  <p className="text-xs text-muted-foreground">Run pipeline script on download</p>
                 </div>
               </label>
             )}
@@ -418,6 +450,13 @@ export function DownloadModal({ open, onOpenChange, slideHashes, jobId }: Downlo
                           <ChevronDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
                         )}
                         <span className="text-sm font-medium truncate">{group.label}</span>
+                        <span className={`text-xs px-1.5 py-0.5 rounded border shrink-0 ${
+                          group.is_local
+                            ? 'bg-green-500/10 text-green-700 border-green-300'
+                            : 'bg-amber-500/10 text-amber-700 border-amber-300'
+                        }`}>
+                          {group.is_local ? 'On drive' : 'On cluster'}
+                        </span>
                         <span className="text-xs text-muted-foreground ml-auto shrink-0">
                           {groupSelectedCount}/{visibleGroupFiles.length}
                         </span>
@@ -444,7 +483,7 @@ export function DownloadModal({ open, onOpenChange, slideHashes, jobId }: Downlo
                                   <FileDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
                                 )}
                                 <span className="text-xs font-mono truncate min-w-0" title={name}>
-                                  {formatName(name)}
+                                  {name}
                                 </span>
                               </label>
                             )
@@ -465,11 +504,6 @@ export function DownloadModal({ open, onOpenChange, slideHashes, jobId }: Downlo
               </p>
             )}
 
-            {allFiles.some(({ name }) => name.endsWith('.snappy')) && (
-              <p className="text-xs text-muted-foreground mt-1">
-                * .snappy files will be decompressed automatically
-              </p>
-            )}
           </div>
         </div>
 

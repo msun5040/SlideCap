@@ -11,12 +11,14 @@ import io
 import os
 import json
 import shutil
+import subprocess
 import zipfile
 import queue
 import threading
 import re
 from datetime import datetime
 from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import text as sa_text
 
 from .config import settings
 from .db import init_db, get_db, get_session, Case, Slide, Tag, Project, Cohort, CohortFlag, CohortPatient, CohortPatientCase, Analysis, AnalysisJob, JobSlide, init_lock, get_lock
@@ -1239,22 +1241,44 @@ def add_slides_to_cohort(cohort_id: int, data: CohortAddSlides, db: Session = De
     if not cohort:
         raise HTTPException(status_code=404, detail="Cohort not found")
 
-    added = []
+    # ── READ phase (outside lock — NFS queries can be slow) ──────────────
+    requested_hashes = list(dict.fromkeys(data.slide_hashes))  # dedupe, preserve order
+    slides_by_hash = {
+        s.slide_hash: s
+        for s in db.query(Slide).filter(Slide.slide_hash.in_(requested_hashes)).all()
+    }
+    # Existing membership — one query instead of lazy-loading entire collection
+    existing_ids: set[int] = {
+        row[0]
+        for row in db.execute(
+            sa_text("SELECT slide_id FROM cohort_slides WHERE cohort_id = :cid"),
+            {"cid": cohort_id},
+        ).fetchall()
+    }
+
+    to_add = []
     not_found = []
+    for h in requested_hashes:
+        slide = slides_by_hash.get(h)
+        if not slide:
+            not_found.append(h)
+        elif slide.id not in existing_ids:
+            to_add.append(slide)
 
+    # ── WRITE phase (inside lock — fast, no NFS reads) ───────────────────
+    added = []
     with get_lock().write_lock():
-        for slide_hash in data.slide_hashes:
-            slide = db.query(Slide).filter_by(slide_hash=slide_hash).first()
-            if not slide:
-                not_found.append(slide_hash)
-                continue
-
-            if slide not in cohort.slides:
-                cohort.slides.append(slide)
-                added.append(slide_hash)
-
+        for slide in to_add:
+            db.execute(
+                sa_text(
+                    "INSERT OR IGNORE INTO cohort_slides (cohort_id, slide_id) VALUES (:cid, :sid)"
+                ),
+                {"cid": cohort_id, "sid": slide.id},
+            )
+            added.append(slide.slide_hash)
         db.commit()
 
+    db.refresh(cohort)
     return {
         "status": "ok",
         "added": len(added),
@@ -1272,17 +1296,28 @@ def remove_slides_from_cohort(cohort_id: int, data: CohortAddSlides, db: Session
     if not cohort:
         raise HTTPException(status_code=404, detail="Cohort not found")
 
+    # ── READ phase (outside lock) ─────────────────────────────────────────
+    requested_hashes = list(data.slide_hashes)
+    slides_by_hash = {
+        s.slide_hash: s
+        for s in db.query(Slide).filter(Slide.slide_hash.in_(requested_hashes)).all()
+    }
+
+    # ── WRITE phase (inside lock) ─────────────────────────────────────────
     removed = []
-
     with get_lock().write_lock():
-        for slide_hash in data.slide_hashes:
-            slide = db.query(Slide).filter_by(slide_hash=slide_hash).first()
-            if slide and slide in cohort.slides:
-                cohort.slides.remove(slide)
-                removed.append(slide_hash)
-
+        for slide_hash in requested_hashes:
+            slide = slides_by_hash.get(slide_hash)
+            if slide:
+                result = db.execute(
+                    sa_text("DELETE FROM cohort_slides WHERE cohort_id = :cid AND slide_id = :sid"),
+                    {"cid": cohort_id, "sid": slide.id},
+                )
+                if result.rowcount > 0:
+                    removed.append(slide_hash)
         db.commit()
 
+    db.refresh(cohort)
     return {
         "status": "ok",
         "removed": len(removed),
@@ -2719,6 +2754,7 @@ def list_jobs(
 def get_job(job_id: int, db: Session = Depends(get_db)):
     """Get a single job with nested slides detail."""
     job = db.query(AnalysisJob).options(
+        joinedload(AnalysisJob.analysis),
         joinedload(AnalysisJob.slides).joinedload(JobSlide.slide)
     ).filter_by(id=job_id).first()
     if not job:
@@ -2727,6 +2763,7 @@ def get_job(job_id: int, db: Session = Depends(get_db)):
     slide_count = len(job.slides)
     completed_count = sum(1 for js in job.slides if js.status == "completed")
     failed_count = sum(1 for js in job.slides if js.status == "failed")
+    postprocess_available = bool(job.analysis and job.analysis.postprocess_template)
 
     return {
         "id": job.id,
@@ -2744,6 +2781,7 @@ def get_job(job_id: int, db: Session = Depends(get_db)):
         "slide_count": slide_count,
         "completed_count": completed_count,
         "failed_count": failed_count,
+        "postprocess_available": postprocess_available,
         "slides": [
             {
                 "id": js.id,
@@ -2762,6 +2800,7 @@ def get_job(job_id: int, db: Session = Depends(get_db)):
                 "error_message": js.error_message,
                 "log_tail": js.log_tail,
                 "remote_output_path": js.remote_output_path,
+                "local_output_path": js.local_output_path,
                 "cell_stats": json.loads(js.cell_stats) if js.cell_stats else _parse_cell_stats(js.log_tail, js.local_output_path, js.filename),
             }
             for js in job.slides
@@ -3476,30 +3515,6 @@ def list_result_files(
     return _build_file_tree(output_dir, output_dir)
 
 
-import sys as _sys
-_scripts_dir = str(Path(__file__).resolve().parent.parent / "scripts")
-if _scripts_dir not in _sys.path:
-    _sys.path.insert(0, _scripts_dir)
-from postprocess_cellvit import fix_geometry
-
-
-def _decompress_snappy_file(file_path: Path) -> tuple[bytes, str]:
-    """Decompress a .snappy file and optionally fix geometries.
-    Returns (content_bytes, download_filename)."""
-    import snappy as snappy_module
-    compressed = file_path.read_bytes()
-    raw = snappy_module.decompress(compressed)
-    download_name = file_path.name
-
-    if file_path.name.endswith(".geojson.snappy"):
-        # Decompress + fix geometry
-        raw = fix_geometry(raw)
-        download_name = file_path.name.removesuffix(".snappy")
-    elif file_path.name.endswith(".snappy"):
-        # Decompress only (e.g. .json.snappy)
-        download_name = file_path.name.removesuffix(".snappy")
-
-    return raw, download_name
 
 
 @app.get("/results/{job_id}/file/{filename:path}")
@@ -3539,16 +3554,6 @@ def get_result_file(
 
     if not file_path.exists() or not file_path.is_file():
         raise HTTPException(status_code=404, detail="File not found")
-
-    # Decompress .snappy files on-the-fly
-    if file_path.name.endswith(".snappy"):
-        content, download_name = _decompress_snappy_file(file_path)
-        media_type = "application/geo+json" if download_name.endswith(".geojson") else "application/octet-stream"
-        return Response(
-            content=content,
-            media_type=media_type,
-            headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
-        )
 
     return FileResponse(str(file_path), filename=file_path.name)
 
@@ -3685,22 +3690,17 @@ def _safe_resolve(output_dir: Path, rel_path: str) -> Path:
 
 
 def _add_files_to_zip(zf: zipfile.ZipFile, output_dir: Path, arc_prefix: str):
-    """Recursively add all files from output_dir to the ZIP, decompressing .snappy on-the-fly."""
+    """Recursively add all files from output_dir to the ZIP as-is."""
     for f in sorted(output_dir.rglob("*")):
         if not f.is_file():
             continue
         rel = f.relative_to(output_dir).as_posix()
-        if f.name.endswith(".snappy"):
-            content, download_name = _decompress_snappy_file(f)
-            arc_name = f"{arc_prefix}/{rel}".removesuffix(".snappy")
-            zf.writestr(arc_name, content)
-        else:
-            zf.write(str(f), f"{arc_prefix}/{rel}")
+        zf.write(str(f), f"{arc_prefix}/{rel}")
 
 
 @app.get("/jobs/{job_id}/download-zip")
 def download_job_zip(job_id: int, db: Session = Depends(get_db)):
-    """Stream a ZIP of all completed slides' output files for a job, decompressing .snappy."""
+    """Stream a ZIP of all completed slides' output files for a job."""
     job = db.query(AnalysisJob).options(
         joinedload(AnalysisJob.slides).joinedload(JobSlide.slide)
     ).filter_by(id=job_id).first()
@@ -3805,13 +3805,7 @@ def download_cart(data: CartDownloadRequest, db: Session = Depends(get_db)):
                 stream = _ZipStreamWriter(q)
                 with zipfile.ZipFile(stream, 'w', zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
                     for file_path, arcname in resolved:
-                        if file_path.name.endswith(".snappy"):
-                            content, download_name = _decompress_snappy_file(file_path)
-                            # Replace the .snappy arcname with decompressed name
-                            arc_dir = str(Path(arcname).parent)
-                            zf.writestr(f"{arc_dir}/{download_name}", content)
-                        else:
-                            zf.write(str(file_path), arcname)
+                        zf.write(str(file_path), arcname)
                 stream.flush()
             except Exception as e:
                 print(f"Cart ZIP export error: {e}")
@@ -3861,17 +3855,23 @@ def get_job_output_filenames(
         if wanted and sh not in wanted:
             continue
 
-        # Resolve a human-readable label
+        # Resolve a human-readable label: accession_block_stain
         label = sh[:12] + "..."
         if indexer:
             fp = indexer.get_filepath(sh)
             if fp:
                 parsed = indexer.parser.parse(fp.name)
                 if parsed:
-                    label = parsed.accession
+                    parts = [parsed.accession]
+                    if parsed.block_id:
+                        parts.append(parsed.block_id)
+                    if parsed.stain_type:
+                        parts.append(parsed.stain_type)
+                    label = '_'.join(parts)
 
-        # Output files
+        # Output files — prefer local (network drive), fall back to remote (cluster)
         files: list[str] = []
+        is_local = bool(js.local_output_path and Path(js.local_output_path).is_dir())
         output_dir = _resolve_job_slide_output(js)
         if output_dir:
             for f in sorted(output_dir.iterdir()):
@@ -3889,6 +3889,7 @@ def get_job_output_filenames(
             "label": label,
             "files": files,
             "annotation_count": annotation_count,
+            "is_local": is_local,
         })
 
     return groups
@@ -3898,26 +3899,55 @@ class DownloadBundleRequest(BaseModel):
     slide_hashes: List[str]
     job_id: int
     include_filenames: List[str]
-    include_wsi: bool = False
+    # wsi_slide_hashes: explicit per-slide WSI inclusion (preferred).
+    # Fallback: if empty but include_wsi=True, include WSI for all slide_hashes.
+    wsi_slide_hashes: List[str] = []
+    include_wsi: bool = False  # legacy fallback
     include_annotations: bool = False
+    # If True and the analysis has a postprocess_template, run it on-the-fly
+    # per slide via a temp dir before adding files to the ZIP.
+    apply_postprocess: bool = False
 
 
 @app.post("/download-bundle")
 def download_bundle(data: DownloadBundleRequest, db: Session = Depends(get_db)):
     """
-    Stream a ZIP with selected output files (decompressed) and optionally the
+    Stream a ZIP with selected output files (as-is) and optionally the
     original WSI for each requested slide.
 
-    ZIP structure: {accession_or_hash}/{filename}
+    ZIP structure: {accession_block_stain}/{filename}
     """
     job = db.query(AnalysisJob).options(
+        joinedload(AnalysisJob.analysis),
         joinedload(AnalysisJob.slides).joinedload(JobSlide.slide).joinedload(Slide.case)
     ).filter_by(id=data.job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
+    pp_template = (
+        job.analysis.postprocess_template
+        if data.apply_postprocess and job.analysis
+        else None
+    )
+
     requested = set(data.slide_hashes)
     include_set = set(data.include_filenames)
+
+    # Build WSI set: explicit per-slide list takes priority; fall back to
+    # include_wsi=True meaning "all requested slides".
+    if data.wsi_slide_hashes:
+        wsi_set = set(data.wsi_slide_hashes)
+    elif data.include_wsi:
+        wsi_set = requested
+    else:
+        wsi_set = set()
+
+    # If WSI is requested but the path cache might be stale, refresh it once
+    if wsi_set and indexer:
+        missing = all(indexer.get_filepath(h) is None for h in wsi_set)
+        if missing:
+            print("WSI requested but no paths in cache — refreshing path cache")
+            indexer.build_path_cache()
 
     # Resolve per-slide: (folder_name, slide_hash, output_dir, wsi_path)
     items: list[tuple[str, str, Optional[Path], Optional[Path]]] = []
@@ -3928,7 +3958,7 @@ def download_bundle(data: DownloadBundleRequest, db: Session = Depends(get_db)):
         slide_hash = js.slide.slide_hash
         output_dir = _resolve_job_slide_output(js)
 
-        # Resolve folder name (accession if possible, else hash prefix)
+        # Resolve folder name: accession_block_stain if possible, else hash prefix
         wsi_path = None
         folder = slide_hash[:12]
         if indexer:
@@ -3936,8 +3966,13 @@ def download_bundle(data: DownloadBundleRequest, db: Session = Depends(get_db)):
             if fp:
                 parsed = indexer.parser.parse(fp.name)
                 if parsed:
-                    folder = parsed.accession
-                if data.include_wsi and fp.exists():
+                    parts = [parsed.accession]
+                    if parsed.block_id:
+                        parts.append(parsed.block_id)
+                    if parsed.stain_type:
+                        parts.append(parsed.stain_type)
+                    folder = '_'.join(parts)
+                if slide_hash in wsi_set:
                     wsi_path = fp
 
         items.append((folder, slide_hash, output_dir, wsi_path))
@@ -3949,19 +3984,34 @@ def download_bundle(data: DownloadBundleRequest, db: Session = Depends(get_db)):
         q: queue.Queue = queue.Queue(maxsize=32)
 
         def writer():
+            import tempfile
             try:
                 stream = _ZipStreamWriter(q)
                 with zipfile.ZipFile(stream, 'w', zipfile.ZIP_STORED, allowZip64=True) as zf:
                     for folder, slide_hash, output_dir, wsi_path in items:
-                        # Add selected output files
+                        # Add selected output files (with optional on-the-fly postprocessing)
                         if output_dir:
-                            for f in sorted(output_dir.iterdir()):
-                                if not f.is_file() or f.name not in include_set:
-                                    continue
-                                if f.name.endswith(".snappy"):
-                                    content, dl_name = _decompress_snappy_file(f)
-                                    zf.writestr(f"{folder}/{dl_name}", content)
-                                else:
+                            if pp_template:
+                                # Run postprocess into a temp dir, then add outputs
+                                with tempfile.TemporaryDirectory() as tmpdir:
+                                    cmd = pp_template.format(
+                                        input_dir=str(output_dir),
+                                        output_dir=tmpdir,
+                                        filename_stem=output_dir.name,
+                                    )
+                                    try:
+                                        subprocess.run(cmd, shell=True, check=True, timeout=300)
+                                        src_dir = Path(tmpdir)
+                                    except Exception as e:
+                                        print(f"Postprocess failed for {folder}: {e}, using raw files")
+                                        src_dir = output_dir
+                                    for f in sorted(src_dir.iterdir()):
+                                        if f.is_file() and (include_set and f.name in include_set or not include_set):
+                                            zf.write(str(f), f"{folder}/{f.name}")
+                            else:
+                                for f in sorted(output_dir.iterdir()):
+                                    if not f.is_file() or f.name not in include_set:
+                                        continue
                                     zf.write(str(f), f"{folder}/{f.name}")
                         # Add annotations
                         if data.include_annotations:
@@ -3972,7 +4022,10 @@ def download_bundle(data: DownloadBundleRequest, db: Session = Depends(get_db)):
                                         zf.write(str(f), f"{folder}/annotations/{f.name}")
                         # Add WSI
                         if wsi_path:
-                            zf.write(str(wsi_path), f"{folder}/{wsi_path.name}")
+                            try:
+                                zf.write(str(wsi_path), f"{folder}/{wsi_path.name}")
+                            except Exception as e:
+                                print(f"Warning: could not add WSI {wsi_path}: {e}")
                 stream.flush()
             except Exception as e:
                 print(f"Bundle ZIP error: {e}")

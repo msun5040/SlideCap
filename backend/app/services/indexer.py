@@ -261,10 +261,14 @@ class SlideIndexer:
             'errors': []
         }
 
-        # Get set of existing slide hashes for fast lookup
+        # Get set of existing slide hashes from DB (not path cache — the cache
+        # may contain files that parsed successfully but were never committed to
+        # the DB, e.g. files that previously failed to parse and are now fixed).
         t0 = time.time()
-        existing_hashes = set(self.slide_hash_to_path.keys())
-        print(f"  [TIMING] Load existing hashes from cache: {time.time()-t0:.3f}s")
+        existing_hashes = set(
+            row.slide_hash for row in db.query(Slide.slide_hash).all()
+        )
+        print(f"  [TIMING] Load existing hashes from DB: {time.time()-t0:.3f}s")
 
         # Load existing case hashes upfront
         t0 = time.time()

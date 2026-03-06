@@ -69,10 +69,12 @@ interface JobSlideDetail {
   error_message: string | null
   log_tail: string | null
   remote_output_path: string | null
+  local_output_path: string | null
   cell_stats: Record<string, number> | null
 }
 
 interface JobDetail extends JobSummary {
+  postprocess_available: boolean
   slides: JobSlideDetail[]
 }
 
@@ -175,7 +177,6 @@ export function AnalysisResults() {
   // Transfer state
   const [transferringJobs, setTransferringJobs] = useState<Set<number>>(new Set())
 
-
   // Cart state
   const [cart, setCart] = useState<Set<string>>(new Set()) // "jobId:slideHash:filename"
 
@@ -183,10 +184,11 @@ export function AnalysisResults() {
   const [selectedJobSlides, setSelectedJobSlides] = useState<Record<number, Set<string>>>({}) // jobId -> Set<slideHash>
 
   // Bundle modal state
-  const [bundleModal, setBundleModal] = useState<{ open: boolean; jobId: number; slideHashes: string[] }>({
+  const [bundleModal, setBundleModal] = useState<{ open: boolean; jobId: number; slideHashes: string[]; postprocessAvailable: boolean }>({
     open: false,
     jobId: 0,
     slideHashes: [],
+    postprocessAvailable: false,
   })
 
   // Preview
@@ -500,7 +502,7 @@ export function AnalysisResults() {
     const url = `${API_BASE}/results/${jobId}/file/${encodeFilePath(filePath)}?slide_hash=${encodeURIComponent(slideHash)}`
     const a = document.createElement('a')
     a.href = url
-    a.download = filePath.split('/').pop()!.replace(/\.snappy$/, '')
+    a.download = filePath.split('/').pop()!
     a.click()
   }
 
@@ -600,16 +602,17 @@ export function AnalysisResults() {
 
   const openBundleModal = (jobId: number, slideHashes?: string[]) => {
     const hashes = slideHashes ?? Array.from(selectedJobSlides[jobId] ?? new Set())
+    const detail = jobDetails[jobId]
+    const postprocessAvailable = detail?.postprocess_available ?? false
     if (hashes.length === 0) {
       // Default to all slides in the job
-      const detail = jobDetails[jobId]
       if (detail) {
         const all = detail.slides.filter((s) => s.slide_hash).map((s) => s.slide_hash!)
-        setBundleModal({ open: true, jobId, slideHashes: all })
+        setBundleModal({ open: true, jobId, slideHashes: all, postprocessAvailable })
         return
       }
     }
-    setBundleModal({ open: true, jobId, slideHashes: hashes })
+    setBundleModal({ open: true, jobId, slideHashes: hashes, postprocessAvailable })
   }
 
   // ---------- Status badge helper ----------
@@ -910,6 +913,13 @@ export function AnalysisResults() {
                               copyValue={showHashes ? js.slide_hash! : (js.accession_number || js.filename || js.slide_hash!)}
                             />
                             {statusBadge(js.status)}
+                            {js.status === 'completed' && (
+                              js.local_output_path
+                                ? <Badge variant="outline" className="text-xs bg-green-500/10 text-green-700 border-green-300">On drive</Badge>
+                                : js.remote_output_path
+                                  ? <Badge variant="outline" className="text-xs bg-amber-500/10 text-amber-700 border-amber-300">On cluster</Badge>
+                                  : null
+                            )}
                             {js.error_message && (
                               <span className="text-xs text-red-500 truncate max-w-50">
                                 {js.error_message}
@@ -1139,6 +1149,7 @@ export function AnalysisResults() {
         onOpenChange={(open) => setBundleModal((prev) => ({ ...prev, open }))}
         slideHashes={bundleModal.slideHashes}
         jobId={bundleModal.jobId}
+        postprocessAvailable={bundleModal.postprocessAvailable}
       />
 
       {/* Delete confirmation dialog */}

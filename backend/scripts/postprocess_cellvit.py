@@ -19,30 +19,49 @@ import json
 
 
 def fix_geometry(geojson_bytes: bytes) -> bytes:
-    """Parse GeoJSON, fix any invalid geometries, return corrected GeoJSON bytes."""
-    data = json.loads(geojson_bytes)
+    """Parse GeoJSON, fix any invalid geometries, return corrected GeoJSON bytes.
 
-    # If data is a list (array of features/geometries), wrap or skip geometry fixing
-    if isinstance(data, list):
-        return json.dumps(data).encode("utf-8")
+    Only modifies geometries that are actually invalid; valid geometries are
+    left untouched to avoid subtle serialization differences. Geometry type
+    changes from make_valid (e.g. Polygon -> GeometryCollection) are skipped
+    to preserve compatibility with downstream consumers.
+    """
+    try:
+        data = json.loads(geojson_bytes)
 
-    if data.get("type") == "FeatureCollection":
-        for feature in data.get("features", []):
-            geom = feature.get("geometry")
+        # If data is a list, return as-is
+        if isinstance(data, list):
+            return json.dumps(data).encode("utf-8")
+
+        if data.get("type") == "FeatureCollection":
+            for feature in data.get("features", []):
+                geom = feature.get("geometry")
+                if geom:
+                    try:
+                        shape = from_geojson(json.dumps(geom))
+                        if not shape.is_valid:
+                            fixed = make_valid(shape)
+                            # Only substitute if the geometry type is preserved
+                            if fixed.geom_type == shape.geom_type:
+                                feature["geometry"] = json.loads(to_geojson(fixed))
+                    except Exception:
+                        pass  # Leave this feature's geometry unchanged
+        elif data.get("type") == "Feature":
+            geom = data.get("geometry")
             if geom:
-                shape = from_geojson(json.dumps(geom))
-                if not shape.is_valid:
-                    shape = make_valid(shape)
-                feature["geometry"] = json.loads(to_geojson(shape))
-    elif data.get("type") == "Feature":
-        geom = data.get("geometry")
-        if geom:
-            shape = from_geojson(json.dumps(geom))
-            if not shape.is_valid:
-                shape = make_valid(shape)
-            data["geometry"] = json.loads(to_geojson(shape))
+                try:
+                    shape = from_geojson(json.dumps(geom))
+                    if not shape.is_valid:
+                        fixed = make_valid(shape)
+                        if fixed.geom_type == shape.geom_type:
+                            data["geometry"] = json.loads(to_geojson(fixed))
+                except Exception:
+                    pass
 
-    return json.dumps(data).encode("utf-8")
+        return json.dumps(data).encode("utf-8")
+    except Exception:
+        # If anything fails, return the original bytes unchanged
+        return geojson_bytes
 
 
 def postprocess(input_dir: Path, output_dir: Path) -> None:

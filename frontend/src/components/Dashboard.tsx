@@ -20,6 +20,7 @@ import {
   Download,
   Tags,
   RefreshCw,
+  Database,
 } from 'lucide-react'
 
 const API = 'http://127.0.0.1:8000'
@@ -126,6 +127,15 @@ export function Dashboard({ onSortStarted, sortStatus }: DashboardProps) {
   const [scanning, setScanning] = useState(false)
   const [sorting, setSorting] = useState(false)
 
+  // Indexing state
+  const [indexing, setIndexing] = useState(false)
+  const [indexResult, setIndexResult] = useState<{
+    type: 'full' | 'incremental'
+    new_slides: number
+    skipped: number
+    errors: string[]
+  } | null>(null)
+
   // CSV import state
   const [importFile, setImportFile] = useState<File | null>(null)
   const [importMode, setImportMode] = useState<'merge' | 'replace'>('merge')
@@ -184,6 +194,26 @@ export function Dashboard({ onSortStarted, sortStatus }: DashboardProps) {
   const handleDeleteAllConflicts = async () => {
     const conflicts = stagingFiles?.filter(f => f.conflict) ?? []
     await Promise.all(conflicts.map(f => handleDeleteStaging(f.filename)))
+  }
+
+  const handleIndex = async (type: 'full' | 'incremental') => {
+    setIndexing(true)
+    setIndexResult(null)
+    try {
+      const endpoint = type === 'full' ? '/index/full' : '/index/incremental'
+      const res = await fetch(`${API}${endpoint}`, { method: 'POST' })
+      if (res.ok) {
+        const data = await res.json()
+        setIndexResult({
+          type,
+          new_slides: type === 'full' ? (data.slides_indexed ?? 0) : (data.new_slides_indexed ?? 0),
+          skipped: data.files_skipped ?? 0,
+          errors: data.errors ?? [],
+        })
+        fetchSummary()
+      }
+    } catch { /* ignore */ }
+    setIndexing(false)
   }
 
   const parseCSVPreview = (file: File) => {
@@ -474,6 +504,107 @@ export function Dashboard({ onSortStarted, sortStatus }: DashboardProps) {
             </div>
           )}
         </div>
+      </div>
+
+      {/* Library Index */}
+      <div className="rounded-lg border bg-card">
+        <div className="flex items-center gap-2 p-4 border-b">
+          <Database className="h-5 w-5 text-muted-foreground" />
+          <h2 className="text-lg font-semibold">Library Index</h2>
+        </div>
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-0 divide-y lg:divide-y-0 lg:divide-x">
+
+          {/* Incremental */}
+          <div className="p-6 flex flex-col gap-4">
+            <div className="flex items-start gap-3">
+              <div className="rounded-md bg-blue-100 p-2 shrink-0">
+                <RefreshCw className="h-5 w-5 text-blue-600" />
+              </div>
+              <div>
+                <h3 className="font-medium">Incremental Index</h3>
+                <p className="text-sm text-muted-foreground mt-0.5">
+                  Scans for new slides only — much faster. Run this after sorting new files from staging.
+                </p>
+              </div>
+            </div>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => handleIndex('incremental')}
+              disabled={indexing}
+              className="w-fit"
+            >
+              {indexing ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <RefreshCw className="h-4 w-4 mr-1" />}
+              Run Incremental Index
+            </Button>
+          </div>
+
+          {/* Full */}
+          <div className="p-6 flex flex-col gap-4">
+            <div className="flex items-start gap-3">
+              <div className="rounded-md bg-orange-100 p-2 shrink-0">
+                <Database className="h-5 w-5 text-orange-600" />
+              </div>
+              <div>
+                <h3 className="font-medium">Full Index</h3>
+                <p className="text-sm text-muted-foreground mt-0.5">
+                  Rescans the entire slide library. Marks missing files and adds any slides not yet in the database. Takes longer on large collections.
+                </p>
+              </div>
+            </div>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => handleIndex('full')}
+              disabled={indexing}
+              className="w-fit"
+            >
+              {indexing ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <Database className="h-4 w-4 mr-1" />}
+              Run Full Index
+            </Button>
+          </div>
+
+        </div>
+
+        {/* Result */}
+        {indexResult && (
+          <div className="border-t p-4">
+            <div className="rounded-lg border border-green-200 bg-green-50 p-4 space-y-1">
+              <p className="text-sm font-medium text-green-800 flex items-center gap-1.5">
+                <CheckCircle className="h-4 w-4" />
+                {indexResult.type === 'full' ? 'Full index' : 'Incremental index'} complete
+              </p>
+              <div className="flex gap-6 pt-1">
+                <div>
+                  <p className="text-xl font-bold text-green-700">{indexResult.new_slides.toLocaleString()}</p>
+                  <p className="text-xs text-green-600">new slides added</p>
+                </div>
+                <div>
+                  <p className={`text-xl font-bold ${indexResult.skipped > 0 ? 'text-yellow-600' : 'text-green-700'}`}>
+                    {indexResult.skipped.toLocaleString()}
+                  </p>
+                  <p className={`text-xs ${indexResult.skipped > 0 ? 'text-yellow-600' : 'text-green-600'}`}>skipped</p>
+                </div>
+                {indexResult.errors.length > 0 && (
+                  <div>
+                    <p className="text-xl font-bold text-red-600">{indexResult.errors.length}</p>
+                    <p className="text-xs text-red-500">errors</p>
+                  </div>
+                )}
+              </div>
+              {indexResult.errors.length > 0 && (
+                <div className="mt-2 space-y-0.5">
+                  {indexResult.errors.slice(0, 5).map((e, i) => (
+                    <p key={i} className="text-xs text-red-600 font-mono">{typeof e === 'string' ? e : JSON.stringify(e)}</p>
+                  ))}
+                  {indexResult.errors.length > 5 && (
+                    <p className="text-xs text-red-500">+{indexResult.errors.length - 5} more errors</p>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Data Management */}
