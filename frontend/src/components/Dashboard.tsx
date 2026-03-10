@@ -23,7 +23,7 @@ import {
   Database,
 } from 'lucide-react'
 
-const API = 'http://127.0.0.1:8000'
+import { getApiBase } from '@/api'
 
 interface StagingFile {
   filename: string
@@ -146,7 +146,7 @@ export function Dashboard({ onSortStarted, sortStatus }: DashboardProps) {
 
   const fetchSummary = useCallback(async () => {
     try {
-      const res = await fetch(`${API}/dashboard/summary`)
+      const res = await fetch(`${getApiBase()}/dashboard/summary`)
       if (res.ok) setSummary(await res.json())
     } catch { /* ignore */ }
   }, [])
@@ -158,7 +158,7 @@ export function Dashboard({ onSortStarted, sortStatus }: DashboardProps) {
   const handleScan = async () => {
     setScanning(true)
     try {
-      const res = await fetch(`${API}/staging/scan`)
+      const res = await fetch(`${getApiBase()}/staging/scan`)
       if (res.ok) {
         const files: StagingFile[] = await res.json()
         setStagingFiles(files)
@@ -172,7 +172,7 @@ export function Dashboard({ onSortStarted, sortStatus }: DashboardProps) {
     setSorting(true)
     try {
       const body = filenames ? { filenames } : { filenames: [] }
-      const res = await fetch(`${API}/staging/sort`, {
+      const res = await fetch(`${getApiBase()}/staging/sort`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
@@ -186,7 +186,7 @@ export function Dashboard({ onSortStarted, sortStatus }: DashboardProps) {
 
   const handleDeleteStaging = async (filename: string) => {
     try {
-      await fetch(`${API}/staging/file/${encodeURIComponent(filename)}`, { method: 'DELETE' })
+      await fetch(`${getApiBase()}/staging/file/${encodeURIComponent(filename)}`, { method: 'DELETE' })
       setStagingFiles(prev => prev?.filter(f => f.filename !== filename) ?? null)
     } catch { /* ignore */ }
   }
@@ -201,7 +201,7 @@ export function Dashboard({ onSortStarted, sortStatus }: DashboardProps) {
     setIndexResult(null)
     try {
       const endpoint = type === 'full' ? '/index/full' : '/index/incremental'
-      const res = await fetch(`${API}${endpoint}`, { method: 'POST' })
+      const res = await fetch(`${getApiBase()}${endpoint}`, { method: 'POST' })
       if (res.ok) {
         const data = await res.json()
         setIndexResult({
@@ -244,7 +244,7 @@ export function Dashboard({ onSortStarted, sortStatus }: DashboardProps) {
     try {
       const form = new FormData()
       form.append('file', importFile)
-      const res = await fetch(`${API}/import/slides-csv?mode=${importMode}`, {
+      const res = await fetch(`${getApiBase()}/import/slides-csv?mode=${importMode}`, {
         method: 'POST',
         body: form,
       })
@@ -634,7 +634,7 @@ export function Dashboard({ onSortStarted, sortStatus }: DashboardProps) {
               </p>
             )}
             <a
-              href={`${API}/export/slides.csv`}
+              href={`${getApiBase()}/export/slides.csv`}
               download="slides_export.csv"
               className="inline-flex items-center gap-2 rounded-md bg-green-600 hover:bg-green-700 text-white px-4 py-2 text-sm font-medium transition-colors w-fit"
             >

@@ -33,7 +33,7 @@ import { CopyableText } from '@/components/CopyableText'
 import type { Analysis } from '@/types/slide'
 import { signalClusterDisconnected } from '@/components/ClusterConnect'
 
-const API_BASE = 'http://localhost:8000'
+import { getApiBase } from '@/api'
 
 // ---------- Types ----------
 
@@ -208,7 +208,7 @@ export function AnalysisResults() {
   const fetchJobs = useCallback(async () => {
     setLoadingJobs(true)
     try {
-      const res = await fetch(`${API_BASE}/jobs?limit=100`)
+      const res = await fetch(`${getApiBase()}/jobs?limit=100`)
       if (res.ok) {
         setJobs(await res.json())
       }
@@ -234,7 +234,7 @@ export function AnalysisResults() {
       // Fetch detail if not already loaded
       if (!jobDetails[jobId]) {
         try {
-          const res = await fetch(`${API_BASE}/jobs/${jobId}`)
+          const res = await fetch(`${getApiBase()}/jobs/${jobId}`)
           if (res.ok) {
             const detail: JobDetail = await res.json()
             setJobDetails((prev) => ({ ...prev, [jobId]: detail }))
@@ -262,7 +262,7 @@ export function AnalysisResults() {
         setLoadingSlideFiles((prev) => new Set(prev).add(key))
         try {
           const res = await fetch(
-            `${API_BASE}/results/${jobId}/files?slide_hash=${encodeURIComponent(slideHash)}`
+            `${getApiBase()}/results/${jobId}/files?slide_hash=${encodeURIComponent(slideHash)}`
           )
           if (res.ok) {
             const data = await res.json()
@@ -295,7 +295,7 @@ export function AnalysisResults() {
     setSearchSlideFiles({})
     try {
       const res = await fetch(
-        `${API_BASE}/results/search?q=${encodeURIComponent(query.trim())}`
+        `${getApiBase()}/results/search?q=${encodeURIComponent(query.trim())}`
       )
       if (res.ok) {
         const data = await res.json()
@@ -333,7 +333,7 @@ export function AnalysisResults() {
         setSearchLoadingFiles((prev) => new Set(prev).add(key))
         try {
           const res = await fetch(
-            `${API_BASE}/results/${jobId}/files?slide_hash=${encodeURIComponent(slideHash)}`
+            `${getApiBase()}/results/${jobId}/files?slide_hash=${encodeURIComponent(slideHash)}`
           )
           if (res.ok) {
             const data = await res.json()
@@ -360,13 +360,13 @@ export function AnalysisResults() {
   const transferAll = async (jobId: number) => {
     setTransferringJobs((prev) => new Set(prev).add(jobId))
     try {
-      const res = await fetch(`${API_BASE}/jobs/${jobId}/transfer-results`, { method: 'POST' })
+      const res = await fetch(`${getApiBase()}/jobs/${jobId}/transfer-results`, { method: 'POST' })
       if (res.status === 503) { signalClusterDisconnected(); return }
       if (res.ok) {
         const data = await res.json()
         if (data.transferred > 0) {
           // Re-fetch job detail to update slide statuses
-          const detailRes = await fetch(`${API_BASE}/jobs/${jobId}`)
+          const detailRes = await fetch(`${getApiBase()}/jobs/${jobId}`)
           if (detailRes.ok) {
             const detail: JobDetail = await detailRes.json()
             setJobDetails((prev) => ({ ...prev, [jobId]: detail }))
@@ -413,8 +413,8 @@ export function AnalysisResults() {
       onConfirm: async (deleteFiles?: boolean) => {
         try {
           const url = deleteFiles
-            ? `${API_BASE}/jobs/${jobId}?delete_files=true`
-            : `${API_BASE}/jobs/${jobId}`
+            ? `${getApiBase()}/jobs/${jobId}?delete_files=true`
+            : `${getApiBase()}/jobs/${jobId}`
           const res = await fetch(url, { method: 'DELETE' })
           if (res.ok) {
             setJobs((prev) => prev.filter((j) => j.id !== jobId))
@@ -442,7 +442,7 @@ export function AnalysisResults() {
       onConfirm: async () => {
         try {
           const res = await fetch(
-            `${API_BASE}/results/${jobId}/file/${encodeFilePath(filePath)}?slide_hash=${encodeURIComponent(slideHash)}`,
+            `${getApiBase()}/results/${jobId}/file/${encodeFilePath(filePath)}?slide_hash=${encodeURIComponent(slideHash)}`,
             { method: 'DELETE' }
           )
           if (res.ok) {
@@ -499,7 +499,7 @@ export function AnalysisResults() {
   // ---------- File download ----------
 
   const downloadFile = (jobId: number, slideHash: string, filePath: string) => {
-    const url = `${API_BASE}/results/${jobId}/file/${encodeFilePath(filePath)}?slide_hash=${encodeURIComponent(slideHash)}`
+    const url = `${getApiBase()}/results/${jobId}/file/${encodeFilePath(filePath)}?slide_hash=${encodeURIComponent(slideHash)}`
     const a = document.createElement('a')
     a.href = url
     a.download = filePath.split('/').pop()!
@@ -507,7 +507,7 @@ export function AnalysisResults() {
   }
 
   const downloadFolder = (jobId: number, slideHash: string, folderPath: string) => {
-    const url = `${API_BASE}/results/${jobId}/download-folder?slide_hash=${encodeURIComponent(slideHash)}&folder_path=${encodeURIComponent(folderPath)}`
+    const url = `${getApiBase()}/results/${jobId}/download-folder?slide_hash=${encodeURIComponent(slideHash)}&folder_path=${encodeURIComponent(folderPath)}`
     const a = document.createElement('a')
     a.href = url
     a.download = `${folderPath.split('/').pop()}.zip`
@@ -516,14 +516,14 @@ export function AnalysisResults() {
 
   const downloadJobZip = (jobId: number) => {
     const a = document.createElement('a')
-    a.href = `${API_BASE}/jobs/${jobId}/download-zip`
+    a.href = `${getApiBase()}/jobs/${jobId}/download-zip`
     a.download = `job_${jobId}_results.zip`
     a.click()
   }
 
   const previewFile = (jobId: number, slideHash: string, filePath: string) => {
     setPreviewUrl(
-      `${API_BASE}/results/${jobId}/file/${encodeFilePath(filePath)}?slide_hash=${encodeURIComponent(slideHash)}`
+      `${getApiBase()}/results/${jobId}/file/${encodeFilePath(filePath)}?slide_hash=${encodeURIComponent(slideHash)}`
     )
   }
 
@@ -554,7 +554,7 @@ export function AnalysisResults() {
     })
 
     try {
-      const res = await fetch(`${API_BASE}/results/download-cart`, {
+      const res = await fetch(`${getApiBase()}/results/download-cart`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ items }),

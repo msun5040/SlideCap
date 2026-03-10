@@ -25,7 +25,7 @@ import {
 import type { Analysis, AnalysisJob, Cohort, CohortDetail, CohortPatient, Slide, GpuInfo } from '@/types/slide'
 import { signalClusterDisconnected } from '@/components/ClusterConnect'
 
-const API_BASE = 'http://localhost:8000'
+import { getApiBase } from '@/api'
 
 interface AnalysisSubmitProps {
   clusterConnected?: boolean
@@ -95,7 +95,7 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
     if (!trackedJobId) return
     const poll = async () => {
       try {
-        const res = await fetch(`${API_BASE}/jobs/${trackedJobId}`)
+        const res = await fetch(`${getApiBase()}/jobs/${trackedJobId}`)
         if (res.ok) {
           const data: AnalysisJob = await res.json()
           setTrackedJob(data)
@@ -130,8 +130,8 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
       setLoadingCohortDetail(true)
       try {
         const [detailRes, patientsRes] = await Promise.all([
-          fetch(`${API_BASE}/cohorts/${selectedCohortId}`),
-          fetch(`${API_BASE}/cohorts/${selectedCohortId}/patients`),
+          fetch(`${getApiBase()}/cohorts/${selectedCohortId}`),
+          fetch(`${getApiBase()}/cohorts/${selectedCohortId}/patients`),
         ])
         if (detailRes.ok) setCohortDetail(await detailRes.json())
         if (patientsRes.ok) {
@@ -154,7 +154,7 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
     const load = async () => {
       setLoadingTagSlides(true)
       try {
-        const res = await fetch(`${API_BASE}/tags/${encodeURIComponent(selectedTagName)}/slides`)
+        const res = await fetch(`${getApiBase()}/tags/${encodeURIComponent(selectedTagName)}/slides`)
         if (res.ok) {
           const data = await res.json()
           const slides: Slide[] = data.slides || data
@@ -170,28 +170,28 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
   // ── Fetch functions ──────────────────────────────────────────────────
   const fetchCohorts = async () => {
     try {
-      const res = await fetch(`${API_BASE}/cohorts`)
+      const res = await fetch(`${getApiBase()}/cohorts`)
       if (res.ok) setCohorts(await res.json())
     } catch (e) { console.error(e) }
   }
 
   const fetchAnalyses = async () => {
     try {
-      const res = await fetch(`${API_BASE}/analyses?active_only=true`)
+      const res = await fetch(`${getApiBase()}/analyses?active_only=true`)
       if (res.ok) setAnalyses(await res.json())
     } catch (e) { console.error(e) }
   }
 
   const fetchTags = async () => {
     try {
-      const res = await fetch(`${API_BASE}/tags`)
+      const res = await fetch(`${getApiBase()}/tags`)
       if (res.ok) setTags(await res.json())
     } catch (e) { console.error(e) }
   }
 
   const fetchGpus = async () => {
     try {
-      const res = await fetch(`${API_BASE}/cluster/gpus`)
+      const res = await fetch(`${getApiBase()}/cluster/gpus`)
       if (res.ok) setGpus(await res.json())
     } catch { /* ignore */ }
   }
@@ -263,7 +263,7 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
   const handleSearch = async () => {
     if (!searchQuery.trim()) return
     try {
-      const res = await fetch(`${API_BASE}/search?q=${encodeURIComponent(searchQuery)}&limit=100`)
+      const res = await fetch(`${getApiBase()}/search?q=${encodeURIComponent(searchQuery)}&limit=100`)
       if (res.ok) {
         const data = await res.json()
         setSearchResults(data.results)
@@ -341,7 +341,7 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
       let body: Record<string, unknown>
 
       if (mode === 'cohort' && selectedCohortId) {
-        url = `${API_BASE}/jobs/submit-cohort/${selectedCohortId}`
+        url = `${getApiBase()}/jobs/submit-cohort/${selectedCohortId}`
         body = {
           analysis_id: selectedAnalysisId,
           gpu_index: selectedGpu,
@@ -356,7 +356,7 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
         const hashes = mode === 'tag'
           ? Array.from(tagSelectedHashes)
           : Array.from(selectedHashes)
-        url = `${API_BASE}/jobs/submit`
+        url = `${getApiBase()}/jobs/submit`
         body = {
           analysis_id: selectedAnalysisId,
           slide_hashes: hashes,

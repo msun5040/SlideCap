@@ -13,7 +13,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 
-const API_BASE = 'http://localhost:8000'
+import { getApiBase } from '@/api'
 
 interface SlideGroup {
   slide_hash: string
@@ -55,7 +55,7 @@ export function DownloadModal({ open, onOpenChange, slideHashes, jobId, postproc
     setActiveFilters([])
     setCollapsedGroups(new Set())
     const hashParam = slideHashes.join(',')
-    fetch(`${API_BASE}/jobs/${jobId}/output-filenames?slide_hashes=${encodeURIComponent(hashParam)}`)
+    fetch(`${getApiBase()}/jobs/${jobId}/output-filenames?slide_hashes=${encodeURIComponent(hashParam)}`)
       .then((res) => (res.ok ? res.json() : []))
       .then((data: SlideGroup[]) => {
         setGroups(data)
@@ -241,7 +241,7 @@ export function DownloadModal({ open, onOpenChange, slideHashes, jobId, postproc
 
     setDownloading(true)
     try {
-      const res = await fetch(`${API_BASE}/download-bundle`, {
+      const res = await fetch(`${getApiBase()}/download-bundle`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

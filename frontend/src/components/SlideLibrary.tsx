@@ -33,7 +33,7 @@ import type { Slide, Tag } from '@/types/slide'
 import { DownloadModal } from '@/components/DownloadModal'
 import { CopyableText } from '@/components/CopyableText'
 
-const API_BASE = 'http://localhost:8000'
+import { getApiBase } from '@/api'
 
 // Preset colors for tags
 const PRESET_COLORS = [
@@ -124,7 +124,7 @@ export function SlideLibrary() {
 
     const fetchSuggestions = async () => {
       try {
-        const response = await fetch(`${API_BASE}/tags/search?q=${encodeURIComponent(bulkTagInput)}`)
+        const response = await fetch(`${getApiBase()}/tags/search?q=${encodeURIComponent(bulkTagInput)}`)
         if (response.ok) {
           const data = await response.json()
           setBulkTagSuggestions(data)
@@ -169,7 +169,7 @@ export function SlideLibrary() {
 
     const fetchSuggestions = async () => {
       try {
-        const response = await fetch(`${API_BASE}/tags/search?q=${encodeURIComponent(bulkRemoveTagInput)}`)
+        const response = await fetch(`${getApiBase()}/tags/search?q=${encodeURIComponent(bulkRemoveTagInput)}`)
         if (response.ok) {
           const data = await response.json()
           setBulkRemoveTagSuggestions(data)
@@ -185,7 +185,7 @@ export function SlideLibrary() {
 
   const fetchStats = async () => {
     try {
-      const response = await fetch(`${API_BASE}/stats`)
+      const response = await fetch(`${getApiBase()}/stats`)
       if (response.ok) {
         const data = await response.json()
         setStats(data)
@@ -197,7 +197,7 @@ export function SlideLibrary() {
 
   const fetchAvailableTags = async () => {
     try {
-      const response = await fetch(`${API_BASE}/tags`)
+      const response = await fetch(`${getApiBase()}/tags`)
       if (response.ok) {
         const data = await response.json()
         setAvailableTags(data)
@@ -223,7 +223,7 @@ export function SlideLibrary() {
       if (stainFilter !== 'all') params.append('stain', stainFilter)
       if (tagFilter !== 'all') params.append('tag', tagFilter)
 
-      const url = `${API_BASE}/search?${params.toString()}`
+      const url = `${getApiBase()}/search?${params.toString()}`
       const response = await fetch(url)
       if (response.ok) {
         const data = await response.json()
@@ -279,7 +279,7 @@ export function SlideLibrary() {
 
     // Fetch full tag details for this slide
     try {
-      const response = await fetch(`${API_BASE}/slides/${slide.slide_hash}/tags`)
+      const response = await fetch(`${getApiBase()}/slides/${slide.slide_hash}/tags`)
       if (response.ok) {
         const tags = await response.json()
         setSlideTags(tags)
@@ -340,7 +340,7 @@ export function SlideLibrary() {
     setLoadingJobs(true)
     try {
       const hashParam = Array.from(selectedSlides).join(',')
-      const res = await fetch(`${API_BASE}/jobs?limit=50&slide_hashes=${encodeURIComponent(hashParam)}`)
+      const res = await fetch(`${getApiBase()}/jobs?limit=50&slide_hashes=${encodeURIComponent(hashParam)}`)
       if (res.ok) {
         const data = await res.json()
         setJobsList(data.filter((j: any) => j.completed_count > 0))
@@ -366,7 +366,7 @@ export function SlideLibrary() {
   const fetchAnnotations = useCallback(async (slideHash: string) => {
     setLoadingAnnotations(true)
     try {
-      const res = await fetch(`${API_BASE}/slides/${slideHash}/annotations`)
+      const res = await fetch(`${getApiBase()}/slides/${slideHash}/annotations`)
       if (res.ok) setAnnotations(await res.json())
       else setAnnotations([])
     } catch {
@@ -381,7 +381,7 @@ export function SlideLibrary() {
     try {
       const form = new FormData()
       form.append('file', file)
-      const res = await fetch(`${API_BASE}/slides/${slideHash}/annotations`, {
+      const res = await fetch(`${getApiBase()}/slides/${slideHash}/annotations`, {
         method: 'POST',
         body: form,
       })
@@ -410,7 +410,7 @@ export function SlideLibrary() {
     const { slideHash, filename } = deleteAnnotationConfirm
     try {
       const res = await fetch(
-        `${API_BASE}/slides/${slideHash}/annotations/${encodeURIComponent(filename)}`,
+        `${getApiBase()}/slides/${slideHash}/annotations/${encodeURIComponent(filename)}`,
         { method: 'DELETE' }
       )
       if (res.ok) {
@@ -428,7 +428,7 @@ export function SlideLibrary() {
       fetchAnnotations(selectedSlide.slide_hash)
       // Fetch cell stats
       setLoadingResults(true)
-      fetch(`${API_BASE}/slides/${selectedSlide.slide_hash}/results`)
+      fetch(`${getApiBase()}/slides/${selectedSlide.slide_hash}/results`)
         .then((res) => (res.ok ? res.json() : []))
         .then((data) => setSlideResults(data))
         .catch(() => setSlideResults([]))
@@ -444,7 +444,7 @@ export function SlideLibrary() {
     setIsBulkTagging(true)
     setShowBulkSuggestions(false)
     try {
-      const response = await fetch(`${API_BASE}/slides/bulk/tags/add`, {
+      const response = await fetch(`${getApiBase()}/slides/bulk/tags/add`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -515,7 +515,7 @@ export function SlideLibrary() {
     setIsBulkTagging(true)
     setShowBulkRemoveSuggestions(false)
     try {
-      const response = await fetch(`${API_BASE}/slides/bulk/tags/remove`, {
+      const response = await fetch(`${getApiBase()}/slides/bulk/tags/remove`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -577,7 +577,7 @@ export function SlideLibrary() {
 
     setIsCreatingTag(true)
     try {
-      const response = await fetch(`${API_BASE}/tags`, {
+      const response = await fetch(`${getApiBase()}/tags`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -607,7 +607,7 @@ export function SlideLibrary() {
 
     setIsDeletingTag(tagId)
     try {
-      const response = await fetch(`${API_BASE}/tags/${tagId}`, {
+      const response = await fetch(`${getApiBase()}/tags/${tagId}`, {
         method: 'DELETE'
       })
 
@@ -661,7 +661,7 @@ export function SlideLibrary() {
     }
     setSavingTagName(true)
     try {
-      const res = await fetch(`${API_BASE}/tags/${tagId}`, {
+      const res = await fetch(`${getApiBase()}/tags/${tagId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: newName }),

@@ -24,7 +24,6 @@ share/python-wheels/
 MANIFEST
 
 *.manifest
-*.spec
 
 pip-log.txt
 pip-delete-this-directory.txt
@@ -200,3 +199,11 @@ frontend/.claude
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+claude.md
+
+# Electron / Build artifacts
+frontend/release/
+frontend/dist/
+backend/dist/
+backend/build/

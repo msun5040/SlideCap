@@ -4,7 +4,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import type { ClusterStatus, GpuInfo } from '@/types/slide'
 
-const API_BASE = 'http://localhost:8000'
+import { getApiBase } from '@/api'
 
 /** Call this from any component that receives a 503 from the backend. */
 export function signalClusterDisconnected() {
@@ -28,7 +28,7 @@ export function ClusterConnect({ onStatusChange }: ClusterConnectProps) {
 
   const fetchStatus = useCallback(async () => {
     try {
-      const res = await fetch(`${API_BASE}/cluster/status`)
+      const res = await fetch(`${getApiBase()}/cluster/status`)
       if (res.ok) {
         const data = await res.json()
         const wasConnected = status.connected
@@ -68,7 +68,7 @@ export function ClusterConnect({ onStatusChange }: ClusterConnectProps) {
     setError('')
 
     try {
-      const res = await fetch(`${API_BASE}/cluster/connect`, {
+      const res = await fetch(`${getApiBase()}/cluster/connect`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -99,7 +99,7 @@ export function ClusterConnect({ onStatusChange }: ClusterConnectProps) {
 
   const handleDisconnect = async () => {
     try {
-      await fetch(`${API_BASE}/cluster/disconnect`, { method: 'POST' })
+      await fetch(`${getApiBase()}/cluster/disconnect`, { method: 'POST' })
       setStatus({ connected: false })
       setLostConnection(false)
       onStatusChange?.(false)
@@ -110,7 +110,7 @@ export function ClusterConnect({ onStatusChange }: ClusterConnectProps) {
 
   const refreshGpus = async () => {
     try {
-      const res = await fetch(`${API_BASE}/cluster/gpus`)
+      const res = await fetch(`${getApiBase()}/cluster/gpus`)
       if (res.ok) {
         const gpus = await res.json()
         setStatus((prev) => ({ ...prev, gpus }))

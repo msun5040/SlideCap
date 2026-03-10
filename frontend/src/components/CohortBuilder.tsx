@@ -33,7 +33,7 @@ import {
 import type { Slide, CohortSlide, CohortDetail, CaseGroup, CohortFlag, CohortPatient } from '@/types/slide'
 import { PatientTracker } from '@/components/PatientTracker'
 
-const API_BASE = 'http://localhost:8000'
+import { getApiBase } from '@/api'
 const SLIDE_FLAG_TAG = 'flagged'
 
 interface CohortBuilderProps {
@@ -295,7 +295,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
   const fetchCohort = useCallback(async () => {
     setCohortLoading(true)
     try {
-      const res = await fetch(`${API_BASE}/cohorts/${cohortId}`)
+      const res = await fetch(`${getApiBase()}/cohorts/${cohortId}`)
       if (res.ok) setCohort(await res.json())
     } catch (e) {
       console.error('Failed to fetch cohort:', e)
@@ -307,7 +307,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
   const fetchFlags = useCallback(async () => {
     setLoadingFlags(true)
     try {
-      const res = await fetch(`${API_BASE}/cohorts/${cohortId}/flags`)
+      const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/flags`)
       if (res.ok) setCohortFlags(await res.json())
     } catch (e) {
       console.error('Failed to fetch flags:', e)
@@ -318,7 +318,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
 
   const fetchAnalysisStatus = useCallback(async () => {
     try {
-      const res = await fetch(`${API_BASE}/cohorts/${cohortId}/analysis-status`)
+      const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/analysis-status`)
       if (res.ok) {
         const data = await res.json()
         setSlideAnalysisStatus(data.slides || {})
@@ -331,7 +331,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
   const fetchCohortPatients = useCallback(async () => {
     setPatientsLoading(true)
     try {
-      const res = await fetch(`${API_BASE}/cohorts/${cohortId}/patients`)
+      const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/patients`)
       if (res.ok) {
         const data: CohortPatient[] = await res.json()
         setCohortPatients(data)
@@ -351,7 +351,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
   useEffect(() => {
     const fetchTags = async () => {
       try {
-        const res = await fetch(`${API_BASE}/tags`)
+        const res = await fetch(`${getApiBase()}/tags`)
         if (res.ok) setAvailableTags(await res.json())
       } catch (e) { console.error(e) }
     }
@@ -363,7 +363,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
     if (selectedCaseHashes.size === 0 || flagApplying) return
     setFlagApplying(true)
     try {
-      const res = await fetch(`${API_BASE}/cohorts/${cohortId}/flags/${flagId}`, {
+      const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/flags/${flagId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ add_case_hashes: Array.from(selectedCaseHashes), remove_case_hashes: [] }),
@@ -385,7 +385,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
     if (!trimmed || flagApplying) return
     setFlagApplying(true)
     try {
-      const res = await fetch(`${API_BASE}/cohorts/${cohortId}/flags`, {
+      const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/flags`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: trimmed, case_hashes: Array.from(selectedCaseHashes) }),
@@ -402,7 +402,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
 
   const removeCaseFromFlag = async (flagId: number, caseHash: string) => {
     try {
-      const res = await fetch(`${API_BASE}/cohorts/${cohortId}/flags/${flagId}`, {
+      const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/flags/${flagId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ add_case_hashes: [], remove_case_hashes: [caseHash] }),
@@ -416,7 +416,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
 
   const deleteFlag = async (flagId: number) => {
     try {
-      const res = await fetch(`${API_BASE}/cohorts/${cohortId}/flags/${flagId}`, { method: 'DELETE' })
+      const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/flags/${flagId}`, { method: 'DELETE' })
       if (res.ok) setCohortFlags(prev => prev.filter(f => f.id !== flagId))
     } catch (e) { console.error(e) }
   }
@@ -453,11 +453,11 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
 
     try {
       if (currentlyFlagged) {
-        await fetch(`${API_BASE}/slides/${encodeURIComponent(slideHash)}/tags/${encodeURIComponent(SLIDE_FLAG_TAG)}`, {
+        await fetch(`${getApiBase()}/slides/${encodeURIComponent(slideHash)}/tags/${encodeURIComponent(SLIDE_FLAG_TAG)}`, {
           method: 'DELETE',
         })
       } else {
-        await fetch(`${API_BASE}/slides/${encodeURIComponent(slideHash)}/tags`, {
+        await fetch(`${getApiBase()}/slides/${encodeURIComponent(slideHash)}/tags`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ name: SLIDE_FLAG_TAG, color: '#F59E0B' }), // amber
@@ -497,7 +497,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
     })
 
     try {
-      const url = `${API_BASE}/slides/bulk/tags/${allFlagged ? 'remove' : 'add'}`
+      const url = `${getApiBase()}/slides/bulk/tags/${allFlagged ? 'remove' : 'add'}`
       const body: any = {
         slide_hashes: slideHashes,
         tags: [SLIDE_FLAG_TAG],
@@ -549,7 +549,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
       if (yearFilter !== 'all') params.append('year', yearFilter)
       if (stainFilter !== 'all') params.append('stain', stainFilter)
       if (tagFilter !== 'all') params.append('tag', tagFilter)
-      const res = await fetch(`${API_BASE}/search?${params}`)
+      const res = await fetch(`${getApiBase()}/search?${params}`)
       if (res.ok) {
         const data = await res.json()
         setSearchResults(data.results)
@@ -585,7 +585,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
     if (newSlides.length > 0) setCohort({ ...cohort, slides: [...cohort.slides, ...newSlides] })
     setSelectedHashes(new Set())
     try {
-      const res = await fetch(`${API_BASE}/cohorts/${cohortId}/slides`, {
+      const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/slides`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ slide_hashes: hashes }),
@@ -607,7 +607,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
     const prev = cohort
     setCohort({ ...cohort, slides: cohort.slides.filter(s => s.slide_hash !== slideHash) })
     try {
-      const res = await fetch(`${API_BASE}/cohorts/${cohortId}/slides`, {
+      const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/slides`, {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ slide_hashes: [slideHash] }),
@@ -630,7 +630,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
     const prev = cohort
     setCohort({ ...cohort, slides: cohort.slides.filter(s => !hashSet.has(s.slide_hash)) })
     try {
-      const res = await fetch(`${API_BASE}/cohorts/${cohortId}/slides`, {
+      const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/slides`, {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ slide_hashes: hashes }),
@@ -676,7 +676,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
 
   const handleExport = () => {
     setIsExporting(true)
-    window.location.href = `${API_BASE}/cohorts/${cohortId}/export`
+    window.location.href = `${getApiBase()}/cohorts/${cohortId}/export`
     setTimeout(() => { setIsExporting(false); setIsExportDialogOpen(false) }, 1500)
   }
 
@@ -735,7 +735,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
           {stats.slides > 0 && (
             <>
               <a
-                href={`${API_BASE}/cohorts/${cohortId}/export.csv`}
+                href={`${getApiBase()}/cohorts/${cohortId}/export.csv`}
                 download
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md border border-input bg-background hover:bg-accent hover:text-accent-foreground transition-colors"
                 title="Export metadata as CSV"

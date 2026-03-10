@@ -20,7 +20,7 @@ import {
 } from '@/components/ui/dialog'
 import type { Analysis } from '@/types/slide'
 
-const API_BASE = 'http://localhost:8000'
+import { getApiBase } from '@/api'
 
 export function AnalysisRegistry() {
   const [analyses, setAnalyses] = useState<Analysis[]>([])
@@ -50,7 +50,7 @@ export function AnalysisRegistry() {
   const fetchAnalyses = async () => {
     setLoading(true)
     try {
-      const response = await fetch(`${API_BASE}/analyses`)
+      const response = await fetch(`${getApiBase()}/analyses`)
       if (response.ok) {
         setAnalyses(await response.json())
       }
@@ -120,8 +120,8 @@ export function AnalysisRegistry() {
       }
 
       const url = editingAnalysis
-        ? `${API_BASE}/analyses/${editingAnalysis.id}`
-        : `${API_BASE}/analyses`
+        ? `${getApiBase()}/analyses/${editingAnalysis.id}`
+        : `${getApiBase()}/analyses`
       const method = editingAnalysis ? 'PATCH' : 'POST'
 
       const response = await fetch(url, {
@@ -147,7 +147,7 @@ export function AnalysisRegistry() {
 
   const toggleActive = async (analysis: Analysis) => {
     try {
-      const response = await fetch(`${API_BASE}/analyses/${analysis.id}`, {
+      const response = await fetch(`${getApiBase()}/analyses/${analysis.id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ active: !analysis.active }),

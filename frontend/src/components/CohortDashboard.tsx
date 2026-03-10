@@ -21,7 +21,7 @@ import {
 import { CohortBuilder } from '@/components/CohortBuilder'
 import type { Cohort } from '@/types/slide'
 
-const API_BASE = 'http://localhost:8000'
+import { getApiBase } from '@/api'
 
 export function CohortDashboard() {
   const [subView, setSubView] = useState<'list' | 'builder'>('list')
@@ -44,7 +44,7 @@ export function CohortDashboard() {
   const fetchCohorts = async () => {
     setLoading(true)
     try {
-      const response = await fetch(`${API_BASE}/cohorts`)
+      const response = await fetch(`${getApiBase()}/cohorts`)
       if (response.ok) {
         const data = await response.json()
         setCohorts(data)
@@ -61,7 +61,7 @@ export function CohortDashboard() {
 
     setIsCreating(true)
     try {
-      const response = await fetch(`${API_BASE}/cohorts`, {
+      const response = await fetch(`${getApiBase()}/cohorts`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -101,7 +101,7 @@ export function CohortDashboard() {
         formData.append('description', newCohortDescription)
       }
 
-      const response = await fetch(`${API_BASE}/cohorts/from-file?name=${encodeURIComponent(newCohortName)}${newCohortDescription ? `&description=${encodeURIComponent(newCohortDescription)}` : ''}`, {
+      const response = await fetch(`${getApiBase()}/cohorts/from-file?name=${encodeURIComponent(newCohortName)}${newCohortDescription ? `&description=${encodeURIComponent(newCohortDescription)}` : ''}`, {
         method: 'POST',
         body: formData
       })
@@ -136,7 +136,7 @@ export function CohortDashboard() {
 
     setIsCreating(true)
     try {
-      const response = await fetch(`${API_BASE}/cohorts/from-tag`, {
+      const response = await fetch(`${getApiBase()}/cohorts/from-tag`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -169,7 +169,7 @@ export function CohortDashboard() {
     if (!confirm('Are you sure you want to delete this cohort?')) return
 
     try {
-      const response = await fetch(`${API_BASE}/cohorts/${cohortId}`, {
+      const response = await fetch(`${getApiBase()}/cohorts/${cohortId}`, {
         method: 'DELETE'
       })
 

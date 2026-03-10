@@ -13,7 +13,7 @@ import {
 } from '@/components/ui/table'
 import type { AnalysisJob, JobSlide } from '@/types/slide'
 
-const API_BASE = 'http://localhost:8000'
+import { getApiBase } from '@/api'
 
 const STATUS_COLORS: Record<string, string> = {
   pending: 'bg-gray-500/10 text-gray-600 border-gray-300',
@@ -62,7 +62,7 @@ export function AnalysisJobs() {
     try {
       const params = new URLSearchParams({ limit: '200' })
       if (statusFilter) params.set('status', statusFilter)
-      const res = await fetch(`${API_BASE}/jobs?${params}`)
+      const res = await fetch(`${getApiBase()}/jobs?${params}`)
       if (res.ok) setJobs(await res.json())
     } catch (e) {
       console.error('Failed to fetch jobs:', e)
@@ -74,7 +74,7 @@ export function AnalysisJobs() {
   const fetchJobDetail = async (jobId: number) => {
     setLoadingSlides(true)
     try {
-      const res = await fetch(`${API_BASE}/jobs/${jobId}`)
+      const res = await fetch(`${getApiBase()}/jobs/${jobId}`)
       if (res.ok) {
         const data = await res.json()
         setExpandedSlides(data.slides || [])
@@ -89,7 +89,7 @@ export function AnalysisJobs() {
   const handleRefresh = async () => {
     setIsRefreshing(true)
     try {
-      const res = await fetch(`${API_BASE}/jobs/refresh`, { method: 'POST' })
+      const res = await fetch(`${getApiBase()}/jobs/refresh`, { method: 'POST' })
       if (res.status === 503) { signalClusterDisconnected(); return }
       await fetchJobs()
       if (expandedJobId) await fetchJobDetail(expandedJobId)
@@ -103,7 +103,7 @@ export function AnalysisJobs() {
   const handleRetry = async (jobId: number) => {
     setRetryingJobs((prev) => new Set(prev).add(jobId))
     try {
-      const res = await fetch(`${API_BASE}/jobs/${jobId}/retry`, { method: 'POST' })
+      const res = await fetch(`${getApiBase()}/jobs/${jobId}/retry`, { method: 'POST' })
       if (res.status === 503) { signalClusterDisconnected(); return }
       if (!res.ok) {
         const err = await res.json().catch(() => ({}))
@@ -121,7 +121,7 @@ export function AnalysisJobs() {
   const handleCancel = async (jobId: number) => {
     if (!confirm('Cancel this job and all its slides?')) return
     try {
-      await fetch(`${API_BASE}/jobs/cancel`, {
+      await fetch(`${getApiBase()}/jobs/cancel`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ job_ids: [jobId] }),

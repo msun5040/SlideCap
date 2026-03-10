@@ -4,7 +4,7 @@ import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
 import type { Tag } from '@/types/slide'
 
-const API_BASE = 'http://localhost:8000'
+import { getApiBase } from '@/api'
 
 // Preset colors for tags
 const PRESET_COLORS = [
@@ -43,7 +43,7 @@ export function TagInput({ slideHash, currentTags, onTagsChange }: TagInputProps
 
     const fetchSuggestions = async () => {
       try {
-        const response = await fetch(`${API_BASE}/tags/search?q=${encodeURIComponent(inputValue)}`)
+        const response = await fetch(`${getApiBase()}/tags/search?q=${encodeURIComponent(inputValue)}`)
         if (response.ok) {
           const data = await response.json()
           // Filter out tags already applied (case-insensitive)
@@ -102,7 +102,7 @@ export function TagInput({ slideHash, currentTags, onTagsChange }: TagInputProps
 
     setIsAdding(true)
     try {
-      const response = await fetch(`${API_BASE}/slides/${slideHash}/tags`, {
+      const response = await fetch(`${getApiBase()}/slides/${slideHash}/tags`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: tagName.trim(), color: tagColor })
@@ -135,7 +135,7 @@ export function TagInput({ slideHash, currentTags, onTagsChange }: TagInputProps
     onTagsChange(currentTags.filter(t => t.name !== tagName))
 
     try {
-      const response = await fetch(`${API_BASE}/slides/${slideHash}/tags/${encodeURIComponent(tagName)}`, {
+      const response = await fetch(`${getApiBase()}/slides/${slideHash}/tags/${encodeURIComponent(tagName)}`, {
         method: 'DELETE'
       })
 

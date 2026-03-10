@@ -19,7 +19,7 @@ import {
 } from '@/components/ui/select'
 import type { CaseGroup, CohortPatient, PatientSurgery } from '@/types/slide'
 
-const API_BASE = 'http://localhost:8000'
+import { getApiBase } from '@/api'
 
 interface PatientTrackerProps {
   cohortId: number
@@ -61,7 +61,7 @@ export function PatientTracker({ cohortId, caseGroups }: PatientTrackerProps) {
   const fetchPatients = useCallback(async () => {
     setLoading(true)
     try {
-      const res = await fetch(`${API_BASE}/cohorts/${cohortId}/patients`)
+      const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/patients`)
       if (res.ok) {
         const data: CohortPatient[] = await res.json()
         setPatients(data)
@@ -113,7 +113,7 @@ export function PatientTracker({ cohortId, caseGroups }: PatientTrackerProps) {
 
   const createPatient = async () => {
     if (!newPatientLabel.trim()) return
-    const res = await fetch(`${API_BASE}/cohorts/${cohortId}/patients`, {
+    const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/patients`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ label: newPatientLabel.trim() }),
@@ -129,7 +129,7 @@ export function PatientTracker({ cohortId, caseGroups }: PatientTrackerProps) {
 
   const deletePatient = async (patientId: number) => {
     try {
-      const res = await fetch(`${API_BASE}/cohorts/${cohortId}/patients/${patientId}`, { method: 'DELETE' })
+      const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/patients/${patientId}`, { method: 'DELETE' })
       if (res.ok) {
         setPatients((prev) => prev.filter((p) => p.id !== patientId))
       } else {
@@ -146,7 +146,7 @@ export function PatientTracker({ cohortId, caseGroups }: PatientTrackerProps) {
   const savePatientLabel = async (patientId: number) => {
     const trimmed = editingLabel.trim()
     if (!trimmed) { setEditingPatientId(null); return }
-    const res = await fetch(`${API_BASE}/cohorts/${cohortId}/patients/${patientId}`, {
+    const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/patients/${patientId}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ label: trimmed }),
@@ -158,7 +158,7 @@ export function PatientTracker({ cohortId, caseGroups }: PatientTrackerProps) {
 
   const removeSurgery = async (patientId: number, caseHash: string) => {
     const res = await fetch(
-      `${API_BASE}/cohorts/${cohortId}/patients/${patientId}/cases/${caseHash}`,
+      `${getApiBase()}/cohorts/${cohortId}/patients/${patientId}/cases/${caseHash}`,
       { method: 'DELETE' },
     )
     if (res.ok)
@@ -171,7 +171,7 @@ export function PatientTracker({ cohortId, caseGroups }: PatientTrackerProps) {
     const trimmed = editingSurgeryLabel.trim()
     if (!trimmed) { setEditingSurgery(null); return }
     const res = await fetch(
-      `${API_BASE}/cohorts/${cohortId}/patients/${patientId}/cases/${caseHash}`,
+      `${getApiBase()}/cohorts/${cohortId}/patients/${patientId}/cases/${caseHash}`,
       {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
@@ -189,7 +189,7 @@ export function PatientTracker({ cohortId, caseGroups }: PatientTrackerProps) {
 
   const addSurgery = async (patientId: number, caseHash: string, surgeryLabel: string) => {
     if (!caseHash || !surgeryLabel.trim()) return
-    const res = await fetch(`${API_BASE}/cohorts/${cohortId}/patients/${patientId}/cases`, {
+    const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/patients/${patientId}/cases`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ case_hash: caseHash, surgery_label: surgeryLabel.trim() }),
@@ -214,7 +214,7 @@ export function PatientTracker({ cohortId, caseGroups }: PatientTrackerProps) {
 
     if (assignToPatient === 'new') {
       if (!assignNewPatientLabel.trim()) return
-      const createRes = await fetch(`${API_BASE}/cohorts/${cohortId}/patients`, {
+      const createRes = await fetch(`${getApiBase()}/cohorts/${cohortId}/patients`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ label: assignNewPatientLabel.trim() }),

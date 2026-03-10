@@ -2,7 +2,7 @@ import { useEffect, useState, useRef, useCallback } from 'react'
 import { X, ZoomIn, ZoomOut, RotateCcw, Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 
-const API_BASE = 'http://localhost:8000'
+import { getApiBase } from '@/api'
 
 interface SlideViewerProps {
   slideHash: string
@@ -22,9 +22,9 @@ export function SlideViewer({ slideHash, slideName, onClose }: SlideViewerProps)
   const containerRef = useRef<HTMLDivElement>(null)
 
   // Thumbnail URL - uses cached embedded thumbnail from SVS file
-  const thumbnailUrl = `${API_BASE}/slides/${slideHash}/thumbnail.jpeg?max_size=2048`
+  const thumbnailUrl = `${getApiBase()}/slides/${slideHash}/thumbnail.jpeg?max_size=2048`
   // Slide label (the paper label on the physical slide)
-  const labelUrl = `${API_BASE}/slides/${slideHash}/label.jpeg?max_size=256`
+  const labelUrl = `${getApiBase()}/slides/${slideHash}/label.jpeg?max_size=256`
 
   // Allow zoom once image is loaded
   const canZoom = imageLoaded
@@ -85,8 +85,8 @@ export function SlideViewer({ slideHash, slideName, onClose }: SlideViewerProps)
 
   return (
     <div className="fixed inset-0 z-100 bg-black flex flex-col">
-      {/* Header - always on top so close button works */}
-      <div className="flex items-center justify-between px-4 py-3 bg-black/80 border-b border-gray-800 relative z-20">
+      {/* Header - always on top so close button works; pt-8 clears macOS traffic lights */}
+      <div className="flex items-center justify-between px-4 py-3 pt-10 bg-black/80 border-b border-gray-800 relative z-20">
         <div className="text-white">
           <h2 className="font-semibold">{slideName}</h2>
           <p className="text-sm text-gray-400">
