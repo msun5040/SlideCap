@@ -34,6 +34,7 @@ packages_to_collect = [
     'idna',
     'openslide',
     'openslide_bin',
+    'paramiko',
 ]
 
 all_datas = []
