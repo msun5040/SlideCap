@@ -18,5 +18,8 @@ openslide-bin>=4.0.0
 # SSH for GPU cluster
 paramiko>=3.4.0
 
+# Form data / file uploads
+python-multipart>=0.0.6
+
 # Development
 python-dotenv>=1.0.0

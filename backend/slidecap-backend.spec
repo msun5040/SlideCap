@@ -35,6 +35,8 @@ packages_to_collect = [
     'openslide',
     'openslide_bin',
     'paramiko',
+    'multipart',
+    'python_multipart',
 ]
 
 all_datas = []
