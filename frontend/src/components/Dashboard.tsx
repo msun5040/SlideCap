@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Badge } from '@/components/ui/badge'
@@ -21,9 +21,22 @@ import {
   Tags,
   RefreshCw,
   Database,
+  X,
+  Plus,
+  Tag as TagIcon,
 } from 'lucide-react'
 
 import { getApiBase } from '@/api'
+import { Input } from '@/components/ui/input'
+import { SortableHeader } from '@/components/SortableHeader'
+import { useSortable } from '@/hooks/useSortable'
+import type { Tag } from '@/types/slide'
+
+// Preset colors for tags (matches SlideLibrary)
+const PRESET_COLORS = [
+  '#EF4444', '#F97316', '#EAB308', '#22C55E', '#14B8A6',
+  '#3B82F6', '#8B5CF6', '#EC4899', '#6B7280',
+]
 
 interface StagingFile {
   filename: string
@@ -36,6 +49,7 @@ interface StagingFile {
   year: number | null
   destination: string | null
   conflict: boolean
+  conflict_reason: string | null
 }
 
 interface SortStatus {
@@ -127,12 +141,23 @@ export function Dashboard({ onSortStarted, sortStatus }: DashboardProps) {
   const [scanning, setScanning] = useState(false)
   const [sorting, setSorting] = useState(false)
 
+  // Staging tag state
+  const [stagingTags, setStagingTags] = useState<{ name: string; color: string }[]>([])
+  const [stagingTagInput, setStagingTagInput] = useState('')
+  const [stagingTagColor, setStagingTagColor] = useState(PRESET_COLORS[0])
+  const [showStagingTagInput, setShowStagingTagInput] = useState(false)
+  const [stagingTagSuggestions, setStagingTagSuggestions] = useState<Tag[]>([])
+  const [showStagingTagSuggestions, setShowStagingTagSuggestions] = useState(false)
+  const stagingTagInputRef = useRef<HTMLInputElement>(null)
+  const stagingTagSuggestionsRef = useRef<HTMLDivElement>(null)
+
   // Indexing state
   const [indexing, setIndexing] = useState(false)
   const [indexResult, setIndexResult] = useState<{
     type: 'full' | 'incremental'
     new_slides: number
     skipped: number
+    skipped_files: string[]
     errors: string[]
   } | null>(null)
 
@@ -171,7 +196,11 @@ export function Dashboard({ onSortStarted, sortStatus }: DashboardProps) {
   const handleSort = async (filenames?: string[]) => {
     setSorting(true)
     try {
-      const body = filenames ? { filenames } : { filenames: [] }
+      const body: Record<string, unknown> = filenames ? { filenames } : { filenames: [] }
+      if (stagingTags.length > 0) {
+        body.tags = stagingTags.map(t => t.name)
+        body.tag_color = stagingTags[0].color
+      }
       const res = await fetch(`${getApiBase()}/staging/sort`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -184,16 +213,48 @@ export function Dashboard({ onSortStarted, sortStatus }: DashboardProps) {
     setSorting(false)
   }
 
+  // Staging tag helpers
+  const fetchStagingTagSuggestions = async (query: string) => {
+    if (!query.trim()) { setStagingTagSuggestions([]); return }
+    try {
+      const res = await fetch(`${getApiBase()}/tags/search?q=${encodeURIComponent(query)}`)
+      if (res.ok) setStagingTagSuggestions(await res.json())
+    } catch { /* ignore */ }
+  }
+
+  const addStagingTag = (name: string, color?: string) => {
+    const trimmed = name.trim()
+    if (!trimmed) return
+    if (stagingTags.some(t => t.name.toLowerCase() === trimmed.toLowerCase())) return
+    setStagingTags(prev => [...prev, { name: trimmed, color: color || stagingTagColor }])
+    setStagingTagInput('')
+    setStagingTagSuggestions([])
+    setShowStagingTagSuggestions(false)
+  }
+
+  const removeStagingTag = (name: string) => {
+    setStagingTags(prev => prev.filter(t => t.name !== name))
+  }
+
   const handleDeleteStaging = async (filename: string) => {
     try {
-      await fetch(`${getApiBase()}/staging/file/${encodeURIComponent(filename)}`, { method: 'DELETE' })
-      setStagingFiles(prev => prev?.filter(f => f.filename !== filename) ?? null)
-    } catch { /* ignore */ }
+      const res = await fetch(`${getApiBase()}/staging/file/${encodeURIComponent(filename)}`, { method: 'DELETE' })
+      if (res.ok) {
+        setStagingFiles(prev => prev?.filter(f => f.filename !== filename) ?? null)
+      } else {
+        const err = await res.json().catch(() => ({ detail: `Failed (${res.status})` }))
+        alert(`Could not delete ${filename}: ${err.detail}`)
+      }
+    } catch (e) {
+      alert(`Could not delete ${filename}: ${e}`)
+    }
   }
 
   const handleDeleteAllConflicts = async () => {
     const conflicts = stagingFiles?.filter(f => f.conflict) ?? []
-    await Promise.all(conflicts.map(f => handleDeleteStaging(f.filename)))
+    for (const f of conflicts) {
+      await handleDeleteStaging(f.filename)
+    }
   }
 
   const handleIndex = async (type: 'full' | 'incremental') => {
@@ -208,6 +269,7 @@ export function Dashboard({ onSortStarted, sortStatus }: DashboardProps) {
           type,
           new_slides: type === 'full' ? (data.slides_indexed ?? 0) : (data.new_slides_indexed ?? 0),
           skipped: data.files_skipped ?? 0,
+          skipped_files: data.skipped_files ?? [],
           errors: data.errors ?? [],
         })
         fetchSummary()
@@ -266,6 +328,7 @@ export function Dashboard({ onSortStarted, sortStatus }: DashboardProps) {
     }
   }, [sortStatus?.done, sortStatus?.running])
 
+  const { sorted: sortedStagingFiles, sortConfig: stagingSortConfig, handleSort: handleStagingSort } = useSortable(stagingFiles ?? [])
   const selectableFiles = stagingFiles?.filter(f => f.parsed && !f.conflict) || []
   const allSelected = selectableFiles.length > 0 && selectableFiles.every(f => selected.has(f.filename))
 
@@ -364,11 +427,123 @@ export function Dashboard({ onSortStarted, sortStatus }: DashboardProps) {
                 disabled={sorting || sortStatus?.running}
               >
                 {sorting ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <ArrowRightLeft className="h-4 w-4 mr-1" />}
-                Sort All ({selectableFiles.length})
+                Sort All ({selectableFiles.length}){stagingTags.length > 0 ? ` + ${stagingTags.length} tag${stagingTags.length > 1 ? 's' : ''}` : ''}
               </Button>
             )}
           </div>
         </div>
+
+        {/* Staging Tags Bar */}
+        {stagingFiles && stagingFiles.length > 0 && (
+          <div className="px-4 py-3 border-b bg-muted/30">
+            <div className="flex items-center gap-2 flex-wrap">
+              <div className="flex items-center gap-1.5 text-sm text-muted-foreground shrink-0">
+                <TagIcon className="h-4 w-4" />
+                <span className="font-medium">Tags on sort:</span>
+              </div>
+              {stagingTags.map(t => (
+                <span
+                  key={t.name}
+                  className="inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-medium text-white"
+                  style={{ backgroundColor: t.color }}
+                >
+                  {t.name}
+                  <button onClick={() => removeStagingTag(t.name)} className="hover:opacity-70">
+                    <X className="h-3 w-3" />
+                  </button>
+                </span>
+              ))}
+              {showStagingTagInput ? (
+                <div className="relative">
+                  <div className="flex items-center gap-1">
+                    <div className="flex items-center gap-1 border rounded-md px-1 bg-background">
+                      {/* Color picker */}
+                      <div className="flex items-center gap-0.5 pr-1 border-r">
+                        {PRESET_COLORS.map(c => (
+                          <button
+                            key={c}
+                            className={`w-4 h-4 rounded-full border-2 transition-all ${stagingTagColor === c ? 'border-foreground scale-110' : 'border-transparent hover:border-muted-foreground/50'}`}
+                            style={{ backgroundColor: c }}
+                            onClick={() => setStagingTagColor(c)}
+                          />
+                        ))}
+                      </div>
+                      <input
+                        ref={stagingTagInputRef}
+                        type="text"
+                        placeholder="Tag name..."
+                        className="border-0 bg-transparent text-sm py-1 px-1.5 outline-none w-32"
+                        value={stagingTagInput}
+                        onChange={e => {
+                          setStagingTagInput(e.target.value)
+                          fetchStagingTagSuggestions(e.target.value)
+                          setShowStagingTagSuggestions(true)
+                        }}
+                        onKeyDown={e => {
+                          if (e.key === 'Enter') {
+                            e.preventDefault()
+                            addStagingTag(stagingTagInput, stagingTagColor)
+                          } else if (e.key === 'Escape') {
+                            setShowStagingTagInput(false)
+                            setStagingTagInput('')
+                            setShowStagingTagSuggestions(false)
+                          }
+                        }}
+                        onFocus={() => { if (stagingTagInput) setShowStagingTagSuggestions(true) }}
+                        onBlur={() => setTimeout(() => setShowStagingTagSuggestions(false), 150)}
+                        autoFocus
+                      />
+                    </div>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-7 w-7 p-0"
+                      onClick={() => { setShowStagingTagInput(false); setStagingTagInput(''); setShowStagingTagSuggestions(false) }}
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </Button>
+                  </div>
+                  {/* Suggestions dropdown */}
+                  {showStagingTagSuggestions && stagingTagSuggestions.length > 0 && (
+                    <div
+                      ref={stagingTagSuggestionsRef}
+                      className="absolute top-full left-0 mt-1 w-56 bg-popover border rounded-md shadow-md z-20 py-1"
+                    >
+                      {stagingTagSuggestions.map(tag => (
+                        <button
+                          key={tag.id}
+                          className="w-full text-left px-3 py-1.5 text-sm hover:bg-muted flex items-center gap-2"
+                          onMouseDown={e => { e.preventDefault(); addStagingTag(tag.name, tag.color || stagingTagColor) }}
+                        >
+                          <span className="w-3 h-3 rounded-full shrink-0" style={{ backgroundColor: tag.color || '#6B7280' }} />
+                          {tag.name}
+                          {tag.slide_count != null && (
+                            <span className="text-xs text-muted-foreground ml-auto">{tag.slide_count} slides</span>
+                          )}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 text-xs"
+                  onClick={() => setShowStagingTagInput(true)}
+                >
+                  <Plus className="h-3 w-3 mr-1" />
+                  Add Tag
+                </Button>
+              )}
+              {stagingTags.length > 0 && (
+                <span className="text-xs text-muted-foreground ml-1">
+                  Applied to all slides after sorting
+                </span>
+              )}
+            </div>
+          </div>
+        )}
 
         {stagingFiles === null ? (
           <div className="p-8 text-center text-muted-foreground text-sm">
@@ -390,15 +565,15 @@ export function Dashboard({ onSortStarted, sortStatus }: DashboardProps) {
                       disabled={selectableFiles.length === 0}
                     />
                   </th>
-                  <th className="pb-2 pr-3">Filename</th>
-                  <th className="pb-2 pr-3 w-16">Year</th>
-                  <th className="pb-2 pr-3 w-16">Stain</th>
-                  <th className="pb-2 pr-3 w-20 text-right">Size</th>
+                  <th className="pb-2 pr-3"><SortableHeader label="Filename" sortKey="filename" sortConfig={stagingSortConfig} onSort={handleStagingSort} /></th>
+                  <th className="pb-2 pr-3 w-16"><SortableHeader label="Year" sortKey="year" sortConfig={stagingSortConfig} onSort={handleStagingSort} /></th>
+                  <th className="pb-2 pr-3 w-16"><SortableHeader label="Stain" sortKey="stain_type" sortConfig={stagingSortConfig} onSort={handleStagingSort} /></th>
+                  <th className="pb-2 pr-3 w-20 text-right"><SortableHeader label="Size" sortKey="size_bytes" sortConfig={stagingSortConfig} onSort={handleStagingSort} /></th>
                   <th className="pb-2 w-48">Destination</th>
                 </tr>
               </thead>
               <tbody>
-                {stagingFiles.map(f => {
+                {sortedStagingFiles.map(f => {
                   const disabled = !f.parsed || f.conflict
                   return (
                     <tr key={f.filename} className={`border-b last:border-0 ${disabled ? 'opacity-50' : ''}`}>
@@ -422,7 +597,7 @@ export function Dashboard({ onSortStarted, sortStatus }: DashboardProps) {
                       <td className="py-2 text-xs text-muted-foreground">
                         {f.conflict ? (
                           <div className="flex items-center gap-2">
-                            <span className="text-red-500">Conflict: file exists</span>
+                            <span className="text-red-500">Conflict: {f.conflict_reason || 'file exists'}</span>
                             <button
                               className="p-0.5 rounded text-muted-foreground hover:text-red-600 hover:bg-red-50 transition-colors"
                               title="Remove from staging"
@@ -444,10 +619,26 @@ export function Dashboard({ onSortStarted, sortStatus }: DashboardProps) {
             </table>
 
             {selected.size > 0 && (
-              <div className="mt-3 flex justify-end">
+              <div className="mt-3 flex items-center justify-between">
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  {stagingTags.length > 0 && (
+                    <>
+                      <TagIcon className="h-3.5 w-3.5 text-muted-foreground" />
+                      {stagingTags.map(t => (
+                        <span
+                          key={t.name}
+                          className="inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium text-white"
+                          style={{ backgroundColor: t.color }}
+                        >
+                          {t.name}
+                        </span>
+                      ))}
+                    </>
+                  )}
+                </div>
                 <Button size="sm" onClick={() => handleSort([...selected])} disabled={sorting || sortStatus?.running}>
                   {sorting ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <ArrowRightLeft className="h-4 w-4 mr-1" />}
-                  Sort Selected ({selected.size})
+                  Sort Selected ({selected.size}){stagingTags.length > 0 ? ` + ${stagingTags.length} tag${stagingTags.length > 1 ? 's' : ''}` : ''}
                 </Button>
               </div>
             )}
@@ -599,6 +790,17 @@ export function Dashboard({ onSortStarted, sortStatus }: DashboardProps) {
                   ))}
                   {indexResult.errors.length > 5 && (
                     <p className="text-xs text-red-500">+{indexResult.errors.length - 5} more errors</p>
+                  )}
+                </div>
+              )}
+              {indexResult.skipped_files.length > 0 && (
+                <div className="mt-2 space-y-0.5">
+                  <p className="text-xs font-medium text-yellow-700">Skipped files (unrecognized filename format):</p>
+                  {indexResult.skipped_files.slice(0, 10).map((f, i) => (
+                    <p key={i} className="text-xs text-yellow-600 font-mono">{f}</p>
+                  ))}
+                  {indexResult.skipped_files.length > 10 && (
+                    <p className="text-xs text-yellow-500">+{indexResult.skipped_files.length - 10} more skipped</p>
                   )}
                 </div>
               )}

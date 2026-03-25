@@ -32,8 +32,10 @@ import {
 import type { Slide, Tag } from '@/types/slide'
 import { DownloadModal } from '@/components/DownloadModal'
 import { CopyableText } from '@/components/CopyableText'
+import { SortableHeader } from '@/components/SortableHeader'
+import { useSortable } from '@/hooks/useSortable'
 
-import { getApiBase } from '@/api'
+import { getApiBase, normalizeAccession } from '@/api'
 
 // Preset colors for tags
 const PRESET_COLORS = [
@@ -216,19 +218,47 @@ export function SlideLibrary() {
     setLoading(true)
     setSelectedSlides(new Set()) // Clear selection on new search
     try {
-      // Build URL with optional query and filters
-      const params = new URLSearchParams()
-      if (searchTerm.trim()) params.append('q', searchTerm.trim())
-      if (yearFilter !== 'all') params.append('year', yearFilter)
-      if (stainFilter !== 'all') params.append('stain', stainFilter)
-      if (tagFilter !== 'all') params.append('tag', tagFilter)
+      const raw = searchTerm.trim()
+      const queries = raw.includes(',') ? raw.split(',').map(s => s.trim()).filter(Boolean) : [raw]
 
-      const url = `${getApiBase()}/search?${params.toString()}`
-      const response = await fetch(url)
-      if (response.ok) {
-        const data = await response.json()
-        setSlides(data.results)
-        setResultsTruncated(data.truncated || false)
+      if (queries.length <= 1) {
+        // Single query — original behavior
+        const params = new URLSearchParams()
+        if (raw) params.append('q', normalizeAccession(raw))
+        if (yearFilter !== 'all') params.append('year', yearFilter)
+        if (stainFilter !== 'all') params.append('stain', stainFilter)
+        if (tagFilter !== 'all') params.append('tag', tagFilter)
+
+        const response = await fetch(`${getApiBase()}/search?${params.toString()}`)
+        if (response.ok) {
+          const data = await response.json()
+          setSlides(data.results)
+          setResultsTruncated(data.truncated || false)
+        }
+      } else {
+        // Multiple comma-separated accessions
+        const allResults: typeof slides = []
+        const seen = new Set<string>()
+        for (const q of queries) {
+          const params = new URLSearchParams()
+          params.append('q', normalizeAccession(q))
+          if (yearFilter !== 'all') params.append('year', yearFilter)
+          if (stainFilter !== 'all') params.append('stain', stainFilter)
+          if (tagFilter !== 'all') params.append('tag', tagFilter)
+
+          const response = await fetch(`${getApiBase()}/search?${params.toString()}`)
+          if (response.ok) {
+            const data = await response.json()
+            for (const slide of data.results || []) {
+              if (!seen.has(slide.slide_hash)) {
+                seen.add(slide.slide_hash)
+                allResults.push(slide)
+              }
+            }
+          }
+        }
+        setSlides(allResults)
+        setResultsTruncated(false)
       }
     } catch (error) {
       console.error('Search error:', error)
@@ -256,6 +286,8 @@ export function SlideLibrary() {
     const matchesStatus = statusFilter === 'all' || slide.status === statusFilter
     return matchesStain && matchesStatus
   })
+
+  const { sorted: sortedSlides, sortConfig, handleSort } = useSortable(filteredSlides)
 
   const getStatusColor = (status?: string) => {
     switch (status) {
@@ -324,10 +356,10 @@ export function SlideLibrary() {
   }
 
   const toggleSelectAll = () => {
-    if (selectedSlides.size === filteredSlides.length) {
+    if (selectedSlides.size === sortedSlides.length) {
       setSelectedSlides(new Set())
     } else {
-      setSelectedSlides(new Set(filteredSlides.map(s => s.slide_hash)))
+      setSelectedSlides(new Set(sortedSlides.map(s => s.slide_hash)))
     }
   }
 
@@ -811,7 +843,7 @@ export function SlideLibrary() {
 
       <div className="flex items-center justify-between">
         <div className="text-sm text-muted-foreground">
-          Showing {filteredSlides.length} slides
+          Showing {sortedSlides.length} slides
           {resultsTruncated && (
             <span className="ml-1 text-orange-600">(limit reached - refine your search)</span>
           )}
@@ -866,22 +898,22 @@ export function SlideLibrary() {
             <TableRow>
               <TableHead className="w-12.5">
                 <Checkbox
-                  checked={filteredSlides.length > 0 && selectedSlides.size === filteredSlides.length}
+                  checked={sortedSlides.length > 0 && selectedSlides.size === sortedSlides.length}
                   onCheckedChange={toggleSelectAll}
                 />
               </TableHead>
-              <TableHead>Accession #</TableHead>
-              <TableHead>Block</TableHead>
-              <TableHead>Slide #</TableHead>
-              <TableHead>Stain</TableHead>
-              <TableHead>Year</TableHead>
-              <TableHead>Status</TableHead>
+              <TableHead><SortableHeader label="Accession #" sortKey="accession_number" sortConfig={sortConfig} onSort={handleSort} /></TableHead>
+              <TableHead><SortableHeader label="Block" sortKey="block_id" sortConfig={sortConfig} onSort={handleSort} /></TableHead>
+              <TableHead><SortableHeader label="Slide #" sortKey="slide_number" sortConfig={sortConfig} onSort={handleSort} /></TableHead>
+              <TableHead><SortableHeader label="Stain" sortKey="stain_type" sortConfig={sortConfig} onSort={handleSort} /></TableHead>
+              <TableHead><SortableHeader label="Year" sortKey="year" sortConfig={sortConfig} onSort={handleSort} /></TableHead>
+              <TableHead><SortableHeader label="Status" sortKey="status" sortConfig={sortConfig} onSort={handleSort} /></TableHead>
               <TableHead>Tags</TableHead>
               <TableHead>Analyses</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
-            {filteredSlides.length === 0 ? (
+            {sortedSlides.length === 0 ? (
               <TableRow>
                 <TableCell colSpan={9} className="h-24 text-center">
                   {slides.length === 0
@@ -890,7 +922,7 @@ export function SlideLibrary() {
                 </TableCell>
               </TableRow>
             ) : (
-              filteredSlides.map((slide) => (
+              sortedSlides.map((slide) => (
                 <TableRow
                   key={slide.slide_hash}
                   className={`hover:bg-muted/50 cursor-pointer ${selectedSlides.has(slide.slide_hash) ? 'bg-muted/30' : ''}`}

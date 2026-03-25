@@ -152,6 +152,53 @@ export interface AnalysisJob {
   slides?: JobSlide[]
 }
 
+// Request Tracker
+export interface RequestSheet {
+  id: number
+  name: string
+  description?: string
+  case_count: number
+  created_by?: string
+  created_at?: string
+  updated_at?: string
+}
+
+export interface RequestRow {
+  id: number
+  sheet_id: number
+  accession_number: string
+  case_status: string
+  all_blocks?: string
+  blocks_available?: string
+  order_id?: string
+  is_consult: boolean
+  blocks_hes_requested?: string
+  hes_requested: number
+  non_hes_requested: number
+  ihc_stains_requested?: string
+  block_hes_received?: string
+  hes_received: number
+  unaccounted_blocks?: string
+  non_hes_received: number
+  fs_received: number
+  uss_received: number
+  ihc_received: number
+  ihc_stains_received?: string
+  recut_blocks?: string
+  recut_status?: string
+  hes_scanned?: string
+  he_scanning_status?: string
+  non_hes_scanned?: string
+  slide_location?: string
+  notes?: string
+  created_at?: string
+  updated_at?: string
+}
+
+export interface RequestSheetDetail extends RequestSheet {
+  rows: RequestRow[]
+}
+
 export interface GpuInfo {
   index: number
   name: string

@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query, Depends, UploadFile, File
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import text as sa_text
 
 from .config import settings
-from .db import init_db, get_db, get_session, Case, Slide, Tag, Project, Cohort, CohortFlag, CohortPatient, CohortPatientCase, Analysis, AnalysisJob, JobSlide, init_lock, get_lock
+from .db import init_db, get_db, get_session, Case, Slide, Tag, Project, Cohort, CohortFlag, CohortPatient, CohortPatientCase, Analysis, AnalysisJob, JobSlide, RequestSheet, RequestRow, init_lock, get_lock
 from .services import SlideHasher, SlideIndexer, ClusterService, JobStatusPoller
 
 
@@ -1876,11 +1876,9 @@ async def create_cohort_from_file(
     # Detect mode: manifest (3 cols) vs accession list (1 col)
     is_manifest = len(raw_rows[0]) >= 3 and all(len(r) >= 3 for r in raw_rows)
 
-    import re as _re2
-
     def normalize_accession(acc: str) -> str:
         """Normalize BS-?YY- prefix so BS18- and BS-18- both match."""
-        return _re2.sub(r'^BS-?', 'BS', acc.upper())
+        return _normalize_accession(acc)
 
     matching_slides = []
     matching_slide_ids = set()  # track by id to avoid duplicates
@@ -4057,6 +4055,8 @@ def download_bundle(data: DownloadBundleRequest, db: Session = Depends(get_db)):
 
 class SortRequest(BaseModel):
     filenames: List[str] = []
+    tags: List[str] = []        # Tags to apply to sorted slides after indexing
+    tag_color: Optional[str] = None  # Color for newly-created tags
 
 
 # ── Sort background job state ────────────────────────────────────────────────
@@ -4072,7 +4072,7 @@ _sort_state: dict = {
 }
 
 
-def _run_sort_background(filenames: list) -> None:
+def _run_sort_background(filenames: list, tags: list = None, tag_color: str = None) -> None:
     """
     Two-phase background sort for maximum speed:
       Phase 1 – OS rename every file (atomic, instant on same filesystem)
@@ -4129,6 +4129,7 @@ def _run_sort_background(filenames: list) -> None:
             _sort_state["skipped"] += 1
 
     # Phase 2: single batch DB commit
+    new_slides = []
     if moved:
         _sort_state["current_file"] = "Indexing…"
         db = get_session()
@@ -4138,10 +4139,40 @@ def _run_sort_background(filenames: list) -> None:
                 if result:
                     _, slide = result
                     indexer.slide_hash_to_path[slide.slide_hash] = dest
+                    new_slides.append(slide)
             db.commit()
         except Exception as e:
             db.rollback()
             _sort_state["errors"].append(f"Indexing error: {str(e)}")
+        finally:
+            db.close()
+
+    # Phase 3: apply tags to newly sorted slides
+    if tags and new_slides:
+        _sort_state["current_file"] = "Applying tags…"
+        db = get_session()
+        try:
+            with get_lock().write_lock():
+                tag_objects = []
+                for tag_name in tags:
+                    tag = db.query(Tag).filter_by(name=tag_name).first()
+                    if not tag:
+                        tag = Tag(name=tag_name, color=tag_color)
+                        db.add(tag)
+                        db.flush()
+                    tag_objects.append(tag)
+
+                for slide in new_slides:
+                    # Re-attach slide to this session
+                    slide = db.merge(slide)
+                    for tag in tag_objects:
+                        if tag not in slide.tags:
+                            slide.tags.append(tag)
+
+                db.commit()
+        except Exception as e:
+            db.rollback()
+            _sort_state["errors"].append(f"Tagging error: {str(e)}")
         finally:
             db.close()
 
@@ -4159,9 +4190,19 @@ def staging_delete_file(filename: str):
     """Delete a single file from the staging folder."""
     safe_name = Path(filename).name  # strip any path components
     f = settings.staging_path / safe_name
+    print(f"[staging-delete] Attempting to delete: {f}")
     if not f.exists():
-        raise HTTPException(status_code=404, detail="File not found in staging")
-    f.unlink()
+        print(f"[staging-delete] File not found: {f}")
+        raise HTTPException(status_code=404, detail=f"File not found in staging: {safe_name}")
+    try:
+        f.unlink()
+        print(f"[staging-delete] Deleted: {f}")
+    except PermissionError as e:
+        print(f"[staging-delete] Permission denied: {f} — {e}")
+        raise HTTPException(status_code=500, detail=f"Permission denied: {safe_name}. File may be locked or read-only.")
+    except OSError as e:
+        print(f"[staging-delete] OS error: {f} — {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete {safe_name}: {e}")
     return {"deleted": safe_name}
 
 
@@ -4176,6 +4217,10 @@ def staging_scan():
         return []
 
     results = []
+    # Track slide hashes seen within staging to detect duplicates
+    seen_hashes: dict[str, str] = {}  # slide_hash -> first filename
+    print(f"[staging-scan] Cache has {len(indexer.slide_hash_to_path)} indexed slides, slides_path={settings.slides_path}")
+
     # os.scandir caches DirEntry.stat() from the directory listing on SMB,
     # avoiding a separate stat() network call per file.
     with os.scandir(staging) as it:
@@ -4201,12 +4246,41 @@ def staging_scan():
             "year": None,
             "destination": None,
             "conflict": False,
+            "conflict_reason": None,
         }
 
         parsed = indexer.parser.parse(entry.name)
         if parsed:
             canonical_name = parsed.full_stem + ".svs"
             slide_hash = indexer.hasher.hash_slide_stem(parsed.full_stem)
+
+            # Check for conflict: already indexed OR duplicate within staging
+            is_indexed_conflict = slide_hash in indexer.slide_hash_to_path
+            is_staging_duplicate = slide_hash in seen_hashes
+
+            # Filesystem fallback: check if destination file already exists
+            # (catches cases where hash cache is stale)
+            year_dir = settings.slides_path / str(parsed.year)
+            dest = year_dir / canonical_name
+            is_dest_conflict = not is_indexed_conflict and dest.exists()
+
+            conflict = is_indexed_conflict or is_staging_duplicate or is_dest_conflict
+            conflict_reason = None
+            if is_indexed_conflict:
+                conflict_reason = "already indexed"
+                print(f"[staging-scan] CONFLICT (indexed): {entry.name} -> hash={slide_hash[:12]}... stem={parsed.full_stem}")
+            elif is_dest_conflict:
+                conflict_reason = "already indexed"
+                print(f"[staging-scan] CONFLICT (dest exists): {entry.name} -> {dest}")
+            elif is_staging_duplicate:
+                conflict_reason = f"duplicate of {seen_hashes[slide_hash]}"
+                print(f"[staging-scan] CONFLICT (staging dup): {entry.name} -> duplicate of {seen_hashes[slide_hash]}")
+            else:
+                print(f"[staging-scan] OK: {entry.name} -> hash={slide_hash[:12]}... stem={parsed.full_stem}")
+
+            if not is_staging_duplicate:
+                seen_hashes[slide_hash] = entry.name
+
             result_entry.update({
                 "parsed": True,
                 "accession": parsed.accession,
@@ -4215,11 +4289,14 @@ def staging_scan():
                 "stain_type": parsed.stain_type,
                 "year": parsed.year,
                 "destination": f"slides/{parsed.year}/{canonical_name}",
-                "conflict": slide_hash in indexer.slide_hash_to_path,
+                "conflict": conflict,
+                "conflict_reason": conflict_reason,
             })
 
         results.append(result_entry)
 
+    conflicts = sum(1 for r in results if r["conflict"])
+    print(f"[staging-scan] Done: {len(results)} files, {conflicts} conflicts")
     return results
 
 
@@ -4247,7 +4324,7 @@ def staging_sort(req: SortRequest):
     if not filenames:
         return {"started": False, "total": 0, "message": "No files to sort"}
 
-    threading.Thread(target=_run_sort_background, args=(filenames,), daemon=True).start()
+    threading.Thread(target=_run_sort_background, args=(filenames, req.tags, req.tag_color), daemon=True).start()
     return {"started": True, "total": len(filenames)}
 
 
@@ -4454,6 +4531,332 @@ def dashboard_summary(db: Session = Depends(get_db)):
             "staging_size_mb": dir_size_mb(settings.staging_path),
         },
     }
+
+
+# ============================================================
+# Request Tracker
+# ============================================================
+
+class RequestSheetCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    created_by: Optional[str] = None
+
+class RequestSheetUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+
+class RequestRowCreate(BaseModel):
+    accession_number: str
+    case_status: Optional[str] = 'Not Started'
+    all_blocks: Optional[str] = None
+    blocks_available: Optional[str] = None
+    order_id: Optional[str] = None
+    is_consult: bool = False
+    blocks_hes_requested: Optional[str] = None
+    hes_requested: int = 0
+    non_hes_requested: int = 0
+    ihc_stains_requested: Optional[str] = None
+    block_hes_received: Optional[str] = None
+    hes_received: int = 0
+    unaccounted_blocks: Optional[str] = None
+    non_hes_received: int = 0
+    fs_received: int = 0
+    uss_received: int = 0
+    ihc_received: int = 0
+    ihc_stains_received: Optional[str] = None
+    recut_blocks: Optional[str] = None
+    recut_status: Optional[str] = None
+    hes_scanned: Optional[str] = None
+    he_scanning_status: Optional[str] = None
+    non_hes_scanned: Optional[str] = None
+    slide_location: Optional[str] = None
+    notes: Optional[str] = None
+
+class RequestRowUpdate(BaseModel):
+    accession_number: Optional[str] = None
+    case_status: Optional[str] = None
+    all_blocks: Optional[str] = None
+    blocks_available: Optional[str] = None
+    order_id: Optional[str] = None
+    is_consult: Optional[bool] = None
+    blocks_hes_requested: Optional[str] = None
+    hes_requested: Optional[int] = None
+    non_hes_requested: Optional[int] = None
+    ihc_stains_requested: Optional[str] = None
+    block_hes_received: Optional[str] = None
+    hes_received: Optional[int] = None
+    unaccounted_blocks: Optional[str] = None
+    non_hes_received: Optional[int] = None
+    fs_received: Optional[int] = None
+    uss_received: Optional[int] = None
+    ihc_received: Optional[int] = None
+    ihc_stains_received: Optional[str] = None
+    recut_blocks: Optional[str] = None
+    recut_status: Optional[str] = None
+    hes_scanned: Optional[str] = None
+    he_scanning_status: Optional[str] = None
+    non_hes_scanned: Optional[str] = None
+    slide_location: Optional[str] = None
+    notes: Optional[str] = None
+
+class ImportCohortRequest(BaseModel):
+    cohort_id: int
+
+
+def _normalize_accession(acc: str) -> str:
+    """Normalize accession: BS-26-D12345 → BS26-D12345."""
+    return re.sub(r'^([A-Z]{2})-(\d{2})-', r'\1\2-', acc.strip().upper())
+
+
+def _serialize_request_row(r: RequestRow) -> dict:
+    return {
+        "id": r.id,
+        "sheet_id": r.sheet_id,
+        "accession_number": r.accession_number,
+        "case_status": r.case_status,
+        "all_blocks": r.all_blocks,
+        "blocks_available": r.blocks_available,
+        "order_id": r.order_id,
+        "is_consult": r.is_consult,
+        "blocks_hes_requested": r.blocks_hes_requested,
+        "hes_requested": r.hes_requested,
+        "non_hes_requested": r.non_hes_requested,
+        "ihc_stains_requested": r.ihc_stains_requested,
+        "block_hes_received": r.block_hes_received,
+        "hes_received": r.hes_received,
+        "unaccounted_blocks": r.unaccounted_blocks,
+        "non_hes_received": r.non_hes_received,
+        "fs_received": r.fs_received,
+        "uss_received": r.uss_received,
+        "ihc_received": r.ihc_received,
+        "ihc_stains_received": r.ihc_stains_received,
+        "recut_blocks": r.recut_blocks,
+        "recut_status": r.recut_status,
+        "hes_scanned": r.hes_scanned,
+        "he_scanning_status": r.he_scanning_status,
+        "non_hes_scanned": r.non_hes_scanned,
+        "slide_location": r.slide_location,
+        "notes": r.notes,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+        "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+    }
+
+
+@app.get("/request-sheets")
+def list_request_sheets(db: Session = Depends(get_db)):
+    sheets = db.query(RequestSheet).order_by(RequestSheet.updated_at.desc()).all()
+    return [{
+        "id": s.id,
+        "name": s.name,
+        "description": s.description,
+        "case_count": s.case_count,
+        "created_by": s.created_by,
+        "created_at": s.created_at.isoformat() if s.created_at else None,
+        "updated_at": s.updated_at.isoformat() if s.updated_at else None,
+    } for s in sheets]
+
+
+@app.post("/request-sheets")
+def create_request_sheet(req: RequestSheetCreate, db: Session = Depends(get_db)):
+    sheet = RequestSheet(name=req.name, description=req.description, created_by=req.created_by)
+    db.add(sheet)
+    db.flush()
+    return {
+        "id": sheet.id,
+        "name": sheet.name,
+        "description": sheet.description,
+        "case_count": 0,
+        "created_by": sheet.created_by,
+        "created_at": sheet.created_at.isoformat() if sheet.created_at else None,
+        "updated_at": sheet.updated_at.isoformat() if sheet.updated_at else None,
+    }
+
+
+@app.get("/request-sheets/{sheet_id}")
+def get_request_sheet(sheet_id: int, db: Session = Depends(get_db)):
+    sheet = db.query(RequestSheet).options(joinedload(RequestSheet.rows)).filter_by(id=sheet_id).first()
+    if not sheet:
+        raise HTTPException(404, "Sheet not found")
+    return {
+        "id": sheet.id,
+        "name": sheet.name,
+        "description": sheet.description,
+        "case_count": sheet.case_count,
+        "created_by": sheet.created_by,
+        "created_at": sheet.created_at.isoformat() if sheet.created_at else None,
+        "updated_at": sheet.updated_at.isoformat() if sheet.updated_at else None,
+        "rows": [_serialize_request_row(r) for r in sheet.rows],
+    }
+
+
+@app.patch("/request-sheets/{sheet_id}")
+def update_request_sheet(sheet_id: int, req: RequestSheetUpdate, db: Session = Depends(get_db)):
+    sheet = db.query(RequestSheet).filter_by(id=sheet_id).first()
+    if not sheet:
+        raise HTTPException(404, "Sheet not found")
+    if req.name is not None:
+        sheet.name = req.name
+    if req.description is not None:
+        sheet.description = req.description
+    sheet.updated_at = datetime.utcnow()
+    db.flush()
+    return {"ok": True}
+
+
+@app.delete("/request-sheets/{sheet_id}")
+def delete_request_sheet(sheet_id: int, db: Session = Depends(get_db)):
+    sheet = db.query(RequestSheet).filter_by(id=sheet_id).first()
+    if not sheet:
+        raise HTTPException(404, "Sheet not found")
+    db.delete(sheet)
+    return {"ok": True}
+
+
+@app.post("/request-sheets/{sheet_id}/rows")
+def create_request_row(sheet_id: int, req: RequestRowCreate, db: Session = Depends(get_db)):
+    sheet = db.query(RequestSheet).filter_by(id=sheet_id).first()
+    if not sheet:
+        raise HTTPException(404, "Sheet not found")
+    normalized = _normalize_accession(req.accession_number)
+    existing = db.query(RequestRow).filter_by(sheet_id=sheet_id, accession_number=normalized).first()
+    if existing:
+        raise HTTPException(409, f"Accession {normalized} already exists in this sheet")
+    data = req.model_dump()
+    data['accession_number'] = normalized
+    row = RequestRow(sheet_id=sheet_id, **data)
+    db.add(row)
+    sheet.updated_at = datetime.utcnow()
+    db.flush()
+    return _serialize_request_row(row)
+
+
+@app.patch("/request-sheets/{sheet_id}/rows/{row_id}")
+def update_request_row(sheet_id: int, row_id: int, req: RequestRowUpdate, db: Session = Depends(get_db)):
+    row = db.query(RequestRow).filter_by(id=row_id, sheet_id=sheet_id).first()
+    if not row:
+        raise HTTPException(404, "Row not found")
+    updates = req.model_dump(exclude_unset=True)
+    for field, value in updates.items():
+        setattr(row, field, value)
+    row.updated_at = datetime.utcnow()
+    sheet = db.query(RequestSheet).filter_by(id=sheet_id).first()
+    if sheet:
+        sheet.updated_at = datetime.utcnow()
+    db.flush()
+    return _serialize_request_row(row)
+
+
+@app.delete("/request-sheets/{sheet_id}/rows/{row_id}")
+def delete_request_row(sheet_id: int, row_id: int, db: Session = Depends(get_db)):
+    row = db.query(RequestRow).filter_by(id=row_id, sheet_id=sheet_id).first()
+    if not row:
+        raise HTTPException(404, "Row not found")
+    db.delete(row)
+    sheet = db.query(RequestSheet).filter_by(id=sheet_id).first()
+    if sheet:
+        sheet.updated_at = datetime.utcnow()
+    return {"ok": True}
+
+
+@app.post("/request-sheets/{sheet_id}/import-cohort")
+def import_cohort_to_sheet(sheet_id: int, req: ImportCohortRequest, db: Session = Depends(get_db)):
+    """Import cases from a cohort into a request sheet."""
+    sheet = db.query(RequestSheet).filter_by(id=sheet_id).first()
+    if not sheet:
+        raise HTTPException(404, "Sheet not found")
+    cohort = db.query(Cohort).options(joinedload(Cohort.slides).joinedload(Slide.case)).filter_by(id=req.cohort_id).first()
+    if not cohort:
+        raise HTTPException(404, "Cohort not found")
+
+    # Group slides by case
+    case_slides: dict = {}
+    for slide in cohort.slides:
+        case = slide.case
+        if not case:
+            continue
+        if case.accession_hash not in case_slides:
+            case_slides[case.accession_hash] = {"case": case, "slides": []}
+        case_slides[case.accession_hash]["slides"].append(slide)
+
+    added = 0
+    skipped = 0
+    for acc_hash, data in case_slides.items():
+        accession_number = None
+        block_ids = set()
+        for slide in data["slides"]:
+            filepath = indexer.get_filepath(slide.slide_hash) if indexer else None
+            if filepath:
+                parsed = indexer.parser.parse(Path(filepath).name)
+                if parsed and parsed.accession:
+                    accession_number = parsed.accession
+                if parsed and parsed.block_id:
+                    block_ids.add(parsed.block_id)
+            elif slide.block_id:
+                block_ids.add(slide.block_id)
+
+        if not accession_number:
+            accession_number = f"HASH:{acc_hash[:12]}"
+        else:
+            accession_number = _normalize_accession(accession_number)
+
+        existing = db.query(RequestRow).filter_by(sheet_id=sheet_id, accession_number=accession_number).first()
+        if existing:
+            skipped += 1
+            continue
+
+        blocks_str = ";".join(sorted(block_ids)) if block_ids else None
+        row = RequestRow(
+            sheet_id=sheet_id,
+            accession_number=accession_number,
+            case_status="Not Started",
+            all_blocks=blocks_str,
+            blocks_available=blocks_str,
+            hes_requested=len(block_ids),
+        )
+        db.add(row)
+        added += 1
+
+    sheet.updated_at = datetime.utcnow()
+    db.flush()
+    return {"added": added, "skipped": skipped}
+
+
+@app.get("/request-sheets/{sheet_id}/export.csv")
+def export_request_sheet_csv(sheet_id: int, db: Session = Depends(get_db)):
+    sheet = db.query(RequestSheet).options(joinedload(RequestSheet.rows)).filter_by(id=sheet_id).first()
+    if not sheet:
+        raise HTTPException(404, "Sheet not found")
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "Accession Number", "Case Status",
+        "All Blocks", "Blocks Available", "Order ID", "Consult?",
+        "Blocks H&Es Requested", "H&Es Requested", "Non H&Es Requested", "IHC Stains Requested",
+        "Block H&Es Received", "H&Es Received", "Unaccounted Blocks",
+        "Non H&Es Received", "FS Received", "USS Received", "IHC Received", "IHC Stains Received",
+        "Recut Blocks", "Recut Status",
+        "H&Es Scanned?", "H&E Scanning Status", "Non H&Es Scanned?",
+        "Slide Location", "Notes",
+    ])
+    for r in sheet.rows:
+        writer.writerow([
+            r.accession_number, r.case_status,
+            r.all_blocks, r.blocks_available, r.order_id, "Yes" if r.is_consult else "No",
+            r.blocks_hes_requested, r.hes_requested, r.non_hes_requested, r.ihc_stains_requested,
+            r.block_hes_received, r.hes_received, r.unaccounted_blocks,
+            r.non_hes_received, r.fs_received, r.uss_received, r.ihc_received, r.ihc_stains_received,
+            r.recut_blocks, r.recut_status,
+            r.hes_scanned, r.he_scanning_status, r.non_hes_scanned,
+            r.slide_location, r.notes,
+        ])
+
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={sheet.name.replace(' ', '_')}_requests.csv"},
+    )
 
 
 # ============================================================

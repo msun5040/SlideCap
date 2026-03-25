@@ -120,6 +120,7 @@ class SlideIndexer:
             'slides_indexed': 0,
             'slides_updated': 0,
             'files_skipped': 0,
+            'skipped_files': [],
             'errors': []
         }
 
@@ -164,6 +165,7 @@ class SlideIndexer:
                     if not parsed:
                         year_skipped += 1
                         stats['files_skipped'] += 1
+                        stats['skipped_files'].append(filepath.name)
                         continue
 
                     accession_hash = self.hasher.hash_accession(parsed.accession)
@@ -258,6 +260,7 @@ class SlideIndexer:
             'new_slides_indexed': 0,
             'files_already_indexed': 0,
             'files_skipped': 0,
+            'skipped_files': [],
             'errors': []
         }
 
@@ -300,6 +303,7 @@ class SlideIndexer:
                     parsed = self.parser.parse(filepath.name)
                     if not parsed:
                         stats['files_skipped'] += 1
+                        stats['skipped_files'].append(filepath.name)
                         continue
 
                     slide_hash = self.hasher.hash_slide_stem(parsed.full_stem)

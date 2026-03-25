@@ -33,7 +33,9 @@ import {
 import type { Slide, CohortSlide, CohortDetail, CaseGroup, CohortFlag, CohortPatient } from '@/types/slide'
 import { PatientTracker } from '@/components/PatientTracker'
 
-import { getApiBase } from '@/api'
+import { getApiBase, normalizeAccession } from '@/api'
+import { SortableHeader } from '@/components/SortableHeader'
+import { useSortable } from '@/hooks/useSortable'
 const SLIDE_FLAG_TAG = 'flagged'
 
 interface CohortBuilderProps {
@@ -86,6 +88,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
   const [availableTags, setAvailableTags] = useState<{ id: number; name: string; color?: string; slide_count?: number }[]>([])
   const [resultsTruncated, setResultsTruncated] = useState(false)
   const [selectedHashes, setSelectedHashes] = useState<Set<string>>(new Set())
+  const { sorted: sortedSearchResults, sortConfig: cbSearchSortConfig, handleSort: handleCbSearchSort } = useSortable(searchResults)
 
   // ── Cases tab: multi-select ──────────────────────────────────────────
   const [collapsedCases, setCollapsedCases] = useState<Set<string>>(new Set())
@@ -545,7 +548,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
     setSelectedHashes(new Set())
     try {
       const params = new URLSearchParams()
-      if (searchTerm.trim()) params.append('q', searchTerm.trim())
+      if (searchTerm.trim()) params.append('q', normalizeAccession(searchTerm))
       if (yearFilter !== 'all') params.append('year', yearFilter)
       if (stainFilter !== 'all') params.append('stain', stainFilter)
       if (tagFilter !== 'all') params.append('tag', tagFilter)
@@ -1282,20 +1285,20 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                           onCheckedChange={toggleSelectAllSearch}
                         />
                       </TableHead>
-                      <TableHead>Accession</TableHead>
-                      <TableHead>Block</TableHead>
+                      <TableHead><SortableHeader label="Accession" sortKey="accession_number" sortConfig={cbSearchSortConfig} onSort={handleCbSearchSort} /></TableHead>
+                      <TableHead><SortableHeader label="Block" sortKey="block_id" sortConfig={cbSearchSortConfig} onSort={handleCbSearchSort} /></TableHead>
                       <TableHead className="w-20"></TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {searchResults.length === 0 ? (
+                    {sortedSearchResults.length === 0 ? (
                       <TableRow>
                         <TableCell colSpan={4} className="h-24 text-center text-muted-foreground text-sm">
                           {searchLoading ? 'Searching…' : 'Search to find slides to add.'}
                         </TableCell>
                       </TableRow>
                     ) : (
-                      searchResults.map((slide) => {
+                      sortedSearchResults.map((slide) => {
                         const inCohort = cohortHashSet.has(slide.slide_hash)
                         return (
                           <TableRow

@@ -1106,22 +1106,21 @@ export function AnalysisResults() {
       {/* Content */}
       {view === 'jobs' ? renderJobList() : renderSearchResults()}
 
-      {/* Image preview */}
-      {previewUrl && (
-        <div className="rounded-lg border p-4">
-          <div className="flex justify-between mb-2">
-            <h4 className="text-sm font-medium">Preview</h4>
-            <Button variant="ghost" size="sm" onClick={() => setPreviewUrl(null)}>
-              Close
-            </Button>
-          </div>
-          <img
-            src={previewUrl}
-            alt="Result preview"
-            className="max-w-full max-h-125 rounded"
-          />
-        </div>
-      )}
+      {/* Image preview dialog */}
+      <Dialog open={!!previewUrl} onOpenChange={(open) => { if (!open) setPreviewUrl(null) }}>
+        <DialogContent className="max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>Preview</DialogTitle>
+          </DialogHeader>
+          {previewUrl && (
+            <img
+              src={previewUrl}
+              alt="Result preview"
+              className="max-w-full max-h-[70vh] rounded object-contain mx-auto"
+            />
+          )}
+        </DialogContent>
+      </Dialog>
 
       {/* Cart bar */}
       {cart.size > 0 && (

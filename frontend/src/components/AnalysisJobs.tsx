@@ -14,6 +14,8 @@ import {
 import type { AnalysisJob, JobSlide } from '@/types/slide'
 
 import { getApiBase } from '@/api'
+import { SortableHeader } from '@/components/SortableHeader'
+import { useSortable } from '@/hooks/useSortable'
 
 const STATUS_COLORS: Record<string, string> = {
   pending: 'bg-gray-500/10 text-gray-600 border-gray-300',
@@ -34,6 +36,7 @@ export function AnalysisJobs() {
   const [expandedSlides, setExpandedSlides] = useState<JobSlide[]>([])
   const [loadingSlides, setLoadingSlides] = useState(false)
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const { sorted: sortedJobs, sortConfig: jobsSortConfig, handleSort: handleJobsSort } = useSortable(jobs, { key: 'id', direction: 'desc' })
 
   useEffect(() => {
     fetchJobs()
@@ -195,7 +198,7 @@ export function AnalysisJobs() {
             <option value="completed">Completed</option>
             <option value="failed">Failed</option>
           </select>
-          <span className="text-sm text-muted-foreground">{jobs.length} jobs</span>
+          <span className="text-sm text-muted-foreground">{sortedJobs.length} jobs</span>
         </div>
         <Button variant="outline" size="sm" onClick={handleRefresh} disabled={isRefreshing}>
           <RefreshCw className={`mr-2 h-4 w-4 ${isRefreshing ? 'animate-spin' : ''}`} />
@@ -208,12 +211,12 @@ export function AnalysisJobs() {
           <TableHeader>
             <TableRow>
               <TableHead className="w-8" />
-              <TableHead>ID</TableHead>
-              <TableHead>Analysis</TableHead>
-              <TableHead>Status</TableHead>
+              <TableHead><SortableHeader label="ID" sortKey="id" sortConfig={jobsSortConfig} onSort={handleJobsSort} /></TableHead>
+              <TableHead><SortableHeader label="Analysis" sortKey="model_name" sortConfig={jobsSortConfig} onSort={handleJobsSort} /></TableHead>
+              <TableHead><SortableHeader label="Status" sortKey="status" sortConfig={jobsSortConfig} onSort={handleJobsSort} /></TableHead>
               <TableHead>Progress</TableHead>
-              <TableHead>GPU</TableHead>
-              <TableHead>Submitted</TableHead>
+              <TableHead><SortableHeader label="GPU" sortKey="gpu_index" sortConfig={jobsSortConfig} onSort={handleJobsSort} /></TableHead>
+              <TableHead><SortableHeader label="Submitted" sortKey="submitted_at" sortConfig={jobsSortConfig} onSort={handleJobsSort} /></TableHead>
               <TableHead>Runtime</TableHead>
               <TableHead className="w-16">Actions</TableHead>
             </TableRow>
@@ -225,14 +228,14 @@ export function AnalysisJobs() {
                   Loading jobs...
                 </TableCell>
               </TableRow>
-            ) : jobs.length === 0 ? (
+            ) : sortedJobs.length === 0 ? (
               <TableRow>
                 <TableCell colSpan={9} className="h-24 text-center text-muted-foreground">
                   No jobs found. Submit an analysis from the Submit tab.
                 </TableCell>
               </TableRow>
             ) : (
-              jobs.map((job) => (
+              sortedJobs.map((job) => (
                 <>
                   <TableRow key={job.id} className="cursor-pointer" onClick={() => toggleExpand(job.id)}>
                     <TableCell>

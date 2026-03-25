@@ -414,6 +414,90 @@ class JobSlide(Base):
         return f"<JobSlide(id={self.id}, job_id={self.job_id}, status={self.status})>"
 
 
+class RequestSheet(Base):
+    """
+    A tracking sheet for managing slide requests.
+    Each sheet tracks multiple cases through the request/receipt/scanning lifecycle.
+    """
+    __tablename__ = 'request_sheets'
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(200), nullable=False)
+    description = Column(String(1000))
+    created_by = Column(String(100))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    rows = relationship('RequestRow', back_populates='sheet', cascade='all, delete-orphan',
+                        order_by='RequestRow.accession_number')
+
+    @property
+    def case_count(self) -> int:
+        return len(self.rows)
+
+    def __repr__(self):
+        return f"<RequestSheet(name={self.name})>"
+
+
+class RequestRow(Base):
+    """
+    A single case row in a request tracking sheet.
+    Tracks blocks, slides, and status through the full request lifecycle.
+    """
+    __tablename__ = 'request_rows'
+
+    id = Column(Integer, primary_key=True)
+    sheet_id = Column(Integer, ForeignKey('request_sheets.id', ondelete='CASCADE'), nullable=False, index=True)
+
+    # Case identification
+    accession_number = Column(String(100), nullable=False)
+
+    # Case Status
+    case_status = Column(String(100), default='Not Started')
+
+    # Requests
+    all_blocks = Column(String(2000))
+    blocks_available = Column(String(2000))
+    order_id = Column(String(100))
+    is_consult = Column(Boolean, default=False)
+    blocks_hes_requested = Column(String(2000))
+    hes_requested = Column(Integer, default=0)
+    non_hes_requested = Column(Integer, default=0)
+    ihc_stains_requested = Column(String(2000))
+
+    # Receipts
+    block_hes_received = Column(String(2000))
+    hes_received = Column(Integer, default=0)
+    unaccounted_blocks = Column(String(2000))
+    non_hes_received = Column(Integer, default=0)
+    fs_received = Column(Integer, default=0)
+    uss_received = Column(Integer, default=0)
+    ihc_received = Column(Integer, default=0)
+    ihc_stains_received = Column(String(2000))
+
+    # Recuts
+    recut_blocks = Column(String(2000))
+    recut_status = Column(String(100))
+
+    # Scanning
+    hes_scanned = Column(String(50))
+    he_scanning_status = Column(String(100))
+    non_hes_scanned = Column(String(50))
+
+    # Other
+    slide_location = Column(String(200))
+    notes = Column(Text)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    sheet = relationship('RequestSheet', back_populates='rows')
+
+    __table_args__ = (
+        UniqueConstraint('sheet_id', 'accession_number', name='uq_sheet_accession'),
+    )
+
+
 # ============================================================
 # Indexes for common queries
 # ============================================================
@@ -425,6 +509,7 @@ Index('idx_jobs_status', AnalysisJob.status)
 Index('idx_jobs_model_status', AnalysisJob.model_name, AnalysisJob.status)
 Index('idx_job_slides_job_id', JobSlide.job_id)
 Index('idx_job_slides_status', JobSlide.status)
+Index('idx_request_rows_status', RequestRow.case_status)
 
 
 # ============================================================

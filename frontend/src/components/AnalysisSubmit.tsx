@@ -25,7 +25,9 @@ import {
 import type { Analysis, AnalysisJob, Cohort, CohortDetail, CohortPatient, Slide, GpuInfo } from '@/types/slide'
 import { signalClusterDisconnected } from '@/components/ClusterConnect'
 
-import { getApiBase } from '@/api'
+import { getApiBase, normalizeAccession } from '@/api'
+import { SortableHeader } from '@/components/SortableHeader'
+import { useSortable } from '@/hooks/useSortable'
 
 interface AnalysisSubmitProps {
   clusterConnected?: boolean
@@ -65,6 +67,9 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
   const [tagSlides, setTagSlides] = useState<Slide[]>([])
   const [tagSelectedHashes, setTagSelectedHashes] = useState<Set<string>>(new Set())
   const [loadingTagSlides, setLoadingTagSlides] = useState(false)
+
+  const { sorted: sortedSearchResults, sortConfig: searchSortConfig, handleSort: handleSearchSort } = useSortable(searchResults)
+  const { sorted: sortedTagSlides, sortConfig: tagSortConfig, handleSort: handleTagSort } = useSortable(tagSlides)
 
   // ── Step 2 — analysis + cluster config ──────────────────────────────
   const [analyses, setAnalyses] = useState<Analysis[]>([])
@@ -263,10 +268,34 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
   const handleSearch = async () => {
     if (!searchQuery.trim()) return
     try {
-      const res = await fetch(`${getApiBase()}/search?q=${encodeURIComponent(searchQuery)}&limit=100`)
-      if (res.ok) {
-        const data = await res.json()
-        setSearchResults(data.results)
+      const queries = searchQuery.includes(',')
+        ? searchQuery.split(',').map(s => s.trim()).filter(Boolean)
+        : [searchQuery.trim()]
+
+      if (queries.length <= 1) {
+        const q = normalizeAccession(queries[0])
+        const res = await fetch(`${getApiBase()}/search?q=${encodeURIComponent(q)}&limit=100`)
+        if (res.ok) {
+          const data = await res.json()
+          setSearchResults(data.results)
+        }
+      } else {
+        const allResults: Slide[] = []
+        const seen = new Set<string>()
+        for (const raw of queries) {
+          const q = normalizeAccession(raw)
+          const res = await fetch(`${getApiBase()}/search?q=${encodeURIComponent(q)}&limit=100`)
+          if (res.ok) {
+            const data = await res.json()
+            for (const slide of data.results || []) {
+              if (!seen.has(slide.slide_hash)) {
+                seen.add(slide.slide_hash)
+                allResults.push(slide)
+              }
+            }
+          }
+        }
+        setSearchResults(allResults)
       }
     } catch (e) { console.error(e) }
   }
@@ -569,13 +598,13 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
                             </button>
                           </div>
                         </TableHead>
-                        <TableHead>Block</TableHead>
-                        <TableHead>Stain</TableHead>
-                        <TableHead>Year</TableHead>
+                        <TableHead><SortableHeader label="Block" sortKey="block_id" sortConfig={searchSortConfig} onSort={handleSearchSort} /></TableHead>
+                        <TableHead><SortableHeader label="Stain" sortKey="stain_type" sortConfig={searchSortConfig} onSort={handleSearchSort} /></TableHead>
+                        <TableHead><SortableHeader label="Year" sortKey="year" sortConfig={searchSortConfig} onSort={handleSearchSort} /></TableHead>
                       </TableRow>
                     </TableHeader>
                     <TableBody>
-                      {searchResults.map(s => (
+                      {sortedSearchResults.map(s => (
                         <TableRow key={s.slide_hash} className="cursor-pointer" onClick={() => toggleSlide(s.slide_hash)}>
                           <TableCell>
                             <input
@@ -813,13 +842,13 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
                                 <input type="checkbox" checked={tagSelectedHashes.size === tagSlides.length && tagSlides.length > 0} onChange={toggleAllTagSlides} className="h-4 w-4" />
                               </TableHead>
                               <TableHead>Slide</TableHead>
-                              <TableHead>Block</TableHead>
-                              <TableHead>Stain</TableHead>
-                              <TableHead>Year</TableHead>
+                              <TableHead><SortableHeader label="Block" sortKey="block_id" sortConfig={tagSortConfig} onSort={handleTagSort} /></TableHead>
+                              <TableHead><SortableHeader label="Stain" sortKey="stain_type" sortConfig={tagSortConfig} onSort={handleTagSort} /></TableHead>
+                              <TableHead><SortableHeader label="Year" sortKey="year" sortConfig={tagSortConfig} onSort={handleTagSort} /></TableHead>
                             </TableRow>
                           </TableHeader>
                           <TableBody>
-                            {tagSlides.map(s => (
+                            {sortedTagSlides.map(s => (
                               <TableRow key={s.slide_hash} className="cursor-pointer" onClick={() => toggleTagSlide(s.slide_hash)}>
                                 <TableCell>
                                   <input type="checkbox" checked={tagSelectedHashes.has(s.slide_hash)} onChange={() => toggleTagSlide(s.slide_hash)} className="h-4 w-4" />

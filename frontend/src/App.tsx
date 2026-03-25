@@ -4,14 +4,19 @@ import {
   Microscope,
   Users,
   FlaskConical,
-  Menu,
+  ClipboardList,
+  Package,
+  PanelLeftClose,
+  PanelLeft,
   X,
+  Circle,
 } from 'lucide-react'
-import { Button } from '@/components/ui/button'
 import { Dashboard } from '@/components/Dashboard'
 import { SlideLibrary } from '@/components/SlideLibrary'
 import { CohortDashboard } from '@/components/CohortDashboard'
 import { AnalysisDashboard } from '@/components/AnalysisDashboard'
+import { RequestTracker } from '@/components/RequestTracker'
+import { SlidePull } from '@/components/SlidePull'
 import { LauncherScreen } from '@/components/LauncherScreen'
 import { LoadingSpinner } from '@/components/LoadingSpinner'
 import { setApiBase, getApiBase } from '@/api'
@@ -27,7 +32,7 @@ interface SortStatus {
   errors: string[]
 }
 
-type View = 'dashboard' | 'slides' | 'cohorts' | 'analysis'
+type View = 'dashboard' | 'slides' | 'cohorts' | 'requests' | 'pull' | 'analysis'
 
 // Re-export for backward compat
 export { getApiBase as getAPI } from '@/api'
@@ -42,11 +47,9 @@ export default function App() {
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const healthPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
-  // Auto-launch in dev/browser mode if no Electron
   useEffect(() => {
     const isElectron = !!(window as any).electronAPI?.isElectron
     if (!isElectron) {
-      // In browser mode, try connecting directly
       fetch('http://127.0.0.1:8000/health', { signal: AbortSignal.timeout(3000) })
         .then((res) => {
           if (res.ok) {
@@ -54,9 +57,7 @@ export default function App() {
             setLaunched(true)
           }
         })
-        .catch(() => {
-          // Show launcher so user can configure
-        })
+        .catch(() => {})
     }
   }, [])
 
@@ -77,11 +78,10 @@ export default function App() {
           clearInterval(pollRef.current!)
           pollRef.current = null
         }
-      } catch { /* network error, keep polling */ }
+      } catch {}
     }, 800)
   }, [])
 
-  // On mount: check if a sort is already running (e.g. page reload mid-sort)
   useEffect(() => {
     if (!launched) return
     setIsLoading(true)
@@ -97,7 +97,6 @@ export default function App() {
       .finally(() => setIsLoading(false))
   }, [launched, startPolling])
 
-  // Health check polling - check backend every 20 seconds
   useEffect(() => {
     if (!launched) return
     const checkHealth = async () => {
@@ -108,13 +107,8 @@ export default function App() {
         setBackendStatus('disconnected')
       }
     }
-
-    // Check immediately on mount
     checkHealth()
-
-    // Then poll every 20 seconds
     healthPollRef.current = setInterval(checkHealth, 20000)
-
     return () => {
       if (healthPollRef.current) clearInterval(healthPollRef.current)
     }
@@ -124,7 +118,6 @@ export default function App() {
     startPolling()
   }, [startPolling])
 
-  // Show launcher if not yet connected
   if (!launched) {
     return <LauncherScreen onReady={handleLaunchReady} />
   }
@@ -133,38 +126,39 @@ export default function App() {
     { id: 'dashboard' as View, label: 'Dashboard', icon: LayoutDashboard },
     { id: 'slides' as View, label: 'Slide Library', icon: Microscope },
     { id: 'cohorts' as View, label: 'Cohorts', icon: Users },
+    { id: 'requests' as View, label: 'Requests', icon: ClipboardList },
+    { id: 'pull' as View, label: 'Slide Pull', icon: Package },
     { id: 'analysis' as View, label: 'Analysis', icon: FlaskConical },
   ]
 
-  // All views stay mounted so data persists across navigation
   const viewClass = (view: View) =>
     currentView === view ? '' : 'hidden'
 
   return (
     <div className="flex h-screen bg-background">
-      {/* macOS traffic light spacer — draggable titlebar area */}
+      {/* macOS traffic light spacer */}
       <div className="fixed top-0 left-0 right-0 h-8 z-50" style={{ WebkitAppRegion: 'drag' } as React.CSSProperties} />
 
-      {/* Sidebar */}
+      {/* Sidebar — dark, minimal */}
       <aside
         className={`${
-          isSidebarOpen ? 'w-64' : 'w-0'
-        } shrink-0 border-r bg-card transition-all duration-300 overflow-hidden`}
+          isSidebarOpen ? 'w-56' : 'w-0'
+        } shrink-0 transition-all duration-200 ease-out overflow-hidden`}
+        style={{ backgroundColor: 'var(--sidebar-bg)' }}
       >
         <div className="flex h-full flex-col pt-8">
-          {/* Logo */}
-          <div className="flex h-16 items-center gap-3 border-b px-6">
-            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary text-primary-foreground">
-              <Microscope className="h-6 w-6" />
+          {/* Brand */}
+          <div className="flex items-center gap-2.5 px-5 h-14">
+            <div className="flex h-7 w-7 items-center justify-center rounded-sm" style={{ backgroundColor: 'var(--sidebar-accent)' }}>
+              <Microscope className="h-4 w-4 text-white" />
             </div>
             <div>
-              <h1 className="font-semibold">SlideCap</h1>
-              <p className="text-xs text-muted-foreground">Slide Management</p>
+              <span className="text-sm font-semibold text-white tracking-tight">SlideCap</span>
             </div>
           </div>
 
           {/* Navigation */}
-          <nav className="flex-1 space-y-1 p-4">
+          <nav className="flex-1 px-3 mt-2 space-y-0.5">
             {navigationItems.map((item) => {
               const Icon = item.icon
               const isActive = currentView === item.id
@@ -172,26 +166,27 @@ export default function App() {
                 <button
                   key={item.id}
                   onClick={() => setCurrentView(item.id)}
-                  className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm transition-colors ${
+                  className={`flex w-full items-center gap-2.5 rounded-sm px-2.5 py-2 text-[13px] transition-all duration-150 ${
                     isActive
-                      ? 'bg-primary text-primary-foreground'
-                      : 'text-muted-foreground hover:bg-muted hover:text-foreground'
+                      ? 'text-white bg-white/10'
+                      : 'hover:bg-white/5'
                   }`}
+                  style={{ color: isActive ? 'var(--sidebar-active)' : 'var(--sidebar-foreground)' }}
                 >
-                  <Icon className="h-5 w-5" />
+                  <Icon className="h-4 w-4" style={isActive ? { color: 'var(--sidebar-accent)' } : {}} />
                   {item.label}
                 </button>
               )
             })}
           </nav>
 
-          {/* Footer */}
-          <div className="border-t p-4">
-            <div className="rounded-lg bg-muted p-3">
-              <p className="text-xs font-medium">SlideCap</p>
-              <p className="text-xs text-muted-foreground mt-1">
-                Organize and search pathology slides
-              </p>
+          {/* Status footer */}
+          <div className="px-4 py-3 border-t border-white/10">
+            <div className="flex items-center gap-2 text-[11px]" style={{ color: 'var(--sidebar-foreground)' }}>
+              <Circle
+                className={`h-2 w-2 fill-current ${backendStatus === 'connected' ? 'text-emerald-400' : 'text-red-400'}`}
+              />
+              {backendStatus === 'connected' ? 'Connected' : 'Offline'}
             </div>
           </div>
         </div>
@@ -199,82 +194,84 @@ export default function App() {
 
       {/* Main Content */}
       <div className="flex flex-1 flex-col overflow-hidden pt-8">
-        {/* Header */}
-        <header className="flex h-16 items-center gap-4 border-b bg-card px-6">
-          <Button
-            variant="ghost"
-            size="sm"
+        {/* Header — lightweight */}
+        <header className="flex h-11 items-center gap-3 border-b px-5 bg-background shrink-0">
+          <button
             onClick={() => setIsSidebarOpen(!isSidebarOpen)}
+            className="text-muted-foreground hover:text-foreground transition-colors duration-150 p-0.5"
           >
             {isSidebarOpen ? (
-              <X className="h-5 w-5" />
+              <PanelLeftClose className="h-4 w-4" />
             ) : (
-              <Menu className="h-5 w-5" />
+              <PanelLeft className="h-4 w-4" />
             )}
-          </Button>
-          <div className="flex-1">
-            <h2 className="font-semibold">
-              {navigationItems.find((item) => item.id === currentView)?.label}
-            </h2>
-            <p className="text-sm text-muted-foreground">
-              SlideCap Management System
-            </p>
-          </div>
-          {/* Connection status dot */}
-          <div className="flex items-center gap-2 text-xs text-muted-foreground">
-            <div className={`h-2 w-2 rounded-full ${backendStatus === 'connected' ? 'bg-green-500' : 'bg-red-500'}`} />
-            {backendStatus === 'connected' ? 'Connected' : 'Offline'}
-          </div>
+          </button>
+          <div className="h-4 w-px bg-border" />
+          <span className="text-[13px] font-medium text-foreground">
+            {navigationItems.find((item) => item.id === currentView)?.label}
+          </span>
         </header>
 
         {/* Backend status banner */}
         {backendStatus === 'disconnected' && (
-          <div className="border-b bg-red-50 px-6 py-3">
-            <div className="flex items-center gap-2 text-sm text-red-700">
-              <div className="h-2 w-2 rounded-full bg-red-600" />
+          <div className="border-b bg-red-50 px-5 py-2">
+            <div className="flex items-center gap-2 text-[12px] text-red-700">
+              <Circle className="h-1.5 w-1.5 fill-red-600 text-red-600" />
               <span className="font-medium">Backend offline — reconnecting...</span>
             </div>
           </div>
         )}
 
-        {/* Sort progress banner — persists across navigation */}
+        {/* Sort progress banner */}
         {sortStatus && (sortStatus.running || sortStatus.done) && (
-          <div className="border-b bg-muted/40 px-6 py-2">
+          <div className="border-b px-5 py-2 bg-secondary/50">
             {sortStatus.running ? (
-              <div className="space-y-1">
-                <div className="flex items-center justify-between text-xs text-muted-foreground">
-                  <span className="font-medium text-foreground">Sorting slides…</span>
-                  <span>{sortStatus.current} / {sortStatus.total}</span>
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between text-[12px] text-muted-foreground">
+                  <span className="font-medium text-foreground">Sorting slides</span>
+                  <span className="tabular-nums">{sortStatus.current} / {sortStatus.total}</span>
                 </div>
-                <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+                <div className="h-1 w-full overflow-hidden bg-border">
                   <div
-                    className="h-full bg-primary transition-all duration-300"
+                    className="h-full bg-primary transition-all duration-300 ease-out"
                     style={{ width: sortStatus.total > 0 ? `${(sortStatus.current / sortStatus.total) * 100}%` : '0%' }}
                   />
                 </div>
                 {sortStatus.current_file && (
-                  <p className="truncate text-xs text-muted-foreground">{sortStatus.current_file}</p>
+                  <p className="truncate text-[11px] text-muted-foreground font-mono">{sortStatus.current_file}</p>
                 )}
               </div>
             ) : (
-              <div className="flex items-center justify-between text-xs">
-                <span className="text-green-700 font-medium">
-                  Sort complete — {sortStatus.sorted} moved
-                  {sortStatus.skipped > 0 && `, ${sortStatus.skipped} skipped`}
-                </span>
-                <button
-                  className="text-muted-foreground hover:text-foreground"
-                  onClick={() => setSortStatus(null)}
-                >
-                  <X className="h-3.5 w-3.5" />
-                </button>
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between text-[12px]">
+                  <span className="text-emerald-700 font-medium">
+                    Sort complete — {sortStatus.sorted} moved
+                    {sortStatus.skipped > 0 && `, ${sortStatus.skipped} skipped`}
+                  </span>
+                  <button
+                    className="text-muted-foreground hover:text-foreground transition-colors"
+                    onClick={() => setSortStatus(null)}
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                </div>
+                {sortStatus.errors.length > 0 && (
+                  <div className="space-y-0.5">
+                    {sortStatus.errors.slice(0, 5).map((err, i) => (
+                      <p key={i} className="text-[11px] font-mono text-yellow-700">{err}</p>
+                    ))}
+                    {sortStatus.errors.length > 5 && (
+                      <p className="text-[11px] text-yellow-600">+{sortStatus.errors.length - 5} more</p>
+                    )}
+                  </div>
+                )}
               </div>
             )}
           </div>
         )}
 
         {/* Content Area */}
-        <main className="flex-1 overflow-y-auto p-6">
+        <main className="flex-1 overflow-y-auto p-5">
           <div className="mx-auto max-w-[1600px]">
             {isLoading ? (
               <div className="flex items-center justify-center h-64">
@@ -290,6 +287,12 @@ export default function App() {
                 </div>
                 <div className={viewClass('cohorts')}>
                   <CohortDashboard />
+                </div>
+                <div className={viewClass('requests')}>
+                  <RequestTracker />
+                </div>
+                <div className={viewClass('pull')}>
+                  <SlidePull />
                 </div>
                 <div className={viewClass('analysis')}>
                   <AnalysisDashboard />

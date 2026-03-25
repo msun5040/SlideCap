@@ -22,6 +22,8 @@ import { CohortBuilder } from '@/components/CohortBuilder'
 import type { Cohort } from '@/types/slide'
 
 import { getApiBase } from '@/api'
+import { SortableHeader } from '@/components/SortableHeader'
+import { useSortable } from '@/hooks/useSortable'
 
 export function CohortDashboard() {
   const [subView, setSubView] = useState<'list' | 'builder'>('list')
@@ -36,6 +38,7 @@ export function CohortDashboard() {
   const [tagName, setTagName] = useState('')
   const [isCreating, setIsCreating] = useState(false)
   const [createResult, setCreateResult] = useState<{ success: boolean; message: string } | null>(null)
+  const { sorted: sortedCohorts, sortConfig: cohortSortConfig, handleSort: handleCohortSort } = useSortable(cohorts)
 
   useEffect(() => {
     fetchCohorts()
@@ -254,11 +257,11 @@ export function CohortDashboard() {
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead>Name</TableHead>
-              <TableHead>Source</TableHead>
-              <TableHead>Slides</TableHead>
-              <TableHead>Cases</TableHead>
-              <TableHead>Created</TableHead>
+              <TableHead><SortableHeader label="Name" sortKey="name" sortConfig={cohortSortConfig} onSort={handleCohortSort} /></TableHead>
+              <TableHead><SortableHeader label="Source" sortKey="source_type" sortConfig={cohortSortConfig} onSort={handleCohortSort} /></TableHead>
+              <TableHead><SortableHeader label="Slides" sortKey="slide_count" sortConfig={cohortSortConfig} onSort={handleCohortSort} /></TableHead>
+              <TableHead><SortableHeader label="Cases" sortKey="case_count" sortConfig={cohortSortConfig} onSort={handleCohortSort} /></TableHead>
+              <TableHead><SortableHeader label="Created" sortKey="created_at" sortConfig={cohortSortConfig} onSort={handleCohortSort} /></TableHead>
               <TableHead className="w-25">Actions</TableHead>
             </TableRow>
           </TableHeader>
@@ -269,14 +272,14 @@ export function CohortDashboard() {
                   Loading cohorts...
                 </TableCell>
               </TableRow>
-            ) : cohorts.length === 0 ? (
+            ) : sortedCohorts.length === 0 ? (
               <TableRow>
                 <TableCell colSpan={6} className="h-24 text-center">
                   No cohorts yet. Create one to get started.
                 </TableCell>
               </TableRow>
             ) : (
-              cohorts.map((cohort) => (
+              sortedCohorts.map((cohort) => (
                 <TableRow
                   key={cohort.id}
                   className="cursor-pointer hover:bg-muted/50"
