@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import {
   Plus,
   Trash2,
@@ -16,6 +16,8 @@ import {
   ListPlus,
   Copy,
   ClipboardCheck,
+  AlertTriangle,
+  Microscope,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -57,7 +59,6 @@ const CASE_STATUSES = [
   'Missing',
   'No Blocks/Slides',
   'Recut Blocks Requested',
-  'Complete',
   'Scanned',
 ] as const
 
@@ -182,9 +183,9 @@ const DETAIL_SECTIONS: DetailSection[] = [
     label: 'Scanning',
     accentColor: 'border-violet-400',
     fields: [
-      { key: 'hes_scanned', label: 'H&Es Scanned?', type: 'scan', options: SCAN_STATUSES },
-      { key: 'he_scanning_status', label: 'H&E Scan Status', type: 'text' },
-      { key: 'non_hes_scanned', label: 'Non-H&Es Scanned?', type: 'scan', options: SCAN_STATUSES },
+      { key: 'hes_scanned', label: 'Blocks H&Es Scanned', type: 'blocks', span: 2 },
+      { key: 'he_scanning_status', label: 'H&E Scan Status', type: 'select', options: ['Complete', 'Partial', 'Not Scanned'] as const },
+      { key: 'non_hes_scanned', label: 'Blocks Non-H&Es Scanned', type: 'blocks', span: 2 },
     ],
   },
   {
@@ -484,6 +485,7 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
   const [filter, setFilter] = useState('')
   const [selectedRowId, setSelectedRowId] = useState<number | null>(null)
   const [statusFilter, setStatusFilter] = useState<string>('all')
+  const [consultFilter, setConsultFilter] = useState(false)
 
   // Expanded detail sections
   const [expandedSections, setExpandedSections] = useState<Set<string>>(
@@ -499,6 +501,24 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
   const [selectedCohortId, setSelectedCohortId] = useState<string>('')
   const [importing, setImporting] = useState(false)
   const [importResult, setImportResult] = useState<{ added: number; skipped: number } | null>(null)
+
+  // CSV import
+  const [isCsvImportOpen, setIsCsvImportOpen] = useState(false)
+  const [csvImportFile, setCsvImportFile] = useState<File | null>(null)
+  const [csvImporting, setCsvImporting] = useState(false)
+  const [csvImportMode, setCsvImportMode] = useState<'skip' | 'upsert'>('skip')
+  const [csvImportResult, setCsvImportResult] = useState<{ added: number; updated: number; skipped: number; errors: string[] } | null>(null)
+  const csvFileRef = useRef<HTMLInputElement>(null)
+
+  // Undo stack
+  type UndoEntry =
+    | { type: 'field'; rowId: number; field: string; prev: unknown }
+    | { type: 'add_rows'; ids: number[] }
+    | { type: 'delete_row'; snapshot: RequestRow }
+  const [undoStack, setUndoStack] = useState<UndoEntry[]>([])
+  const [undoToast, setUndoToast] = useState<string | null>(null)
+  const pushUndo = (entry: UndoEntry) => setUndoStack(s => [...s.slice(-49), entry])
+
   const [isEditingName, setIsEditingName] = useState(false)
   const [editName, setEditName] = useState('')
   const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null)
@@ -516,14 +536,40 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
   const [batchIsConsult, setBatchIsConsult] = useState(false)
   const [batchApplying, setBatchApplying] = useState(false)
 
+  // Case warnings (already scanned, duplicate across sheets)
+  interface CaseWarning {
+    type: 'already_scanned' | 'duplicate_request'
+    message: string
+    slide_count?: number
+    stain_breakdown?: Record<string, number>
+    sheets?: { sheet_id: number; sheet_name: string; case_status: string }[]
+  }
+  const [caseWarnings, setCaseWarnings] = useState<CaseWarning[]>([])
+  const [loadingWarnings, setLoadingWarnings] = useState(false)
+
   const fetchSheet = useCallback(async () => {
     try {
       const res = await fetch(`${getApiBase()}/request-sheets/${sheetId}`)
       if (res.ok) {
         const data: RequestSheetDetail = await res.json()
         setSheet(data)
+
+        // Auto-fix: any row with he_scanning_status=Complete should have case_status=Scanned
+        const needsSync = data.rows.filter(
+          r => r.he_scanning_status === 'Complete' && r.case_status !== 'Scanned'
+        )
+        if (needsSync.length > 0) {
+          await Promise.all(needsSync.map(r =>
+            fetch(`${getApiBase()}/request-sheets/${sheetId}/rows/${r.id}`, {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ case_status: 'Scanned' }),
+            }).catch(() => {})
+          ))
+          needsSync.forEach(r => { r.case_status = 'Scanned' })
+        }
+
         setRows(data.rows)
-        // Select first row if nothing selected
         if (data.rows.length > 0 && !selectedRowId) {
           setSelectedRowId(data.rows[0].id)
         }
@@ -536,6 +582,21 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
   }, [sheetId])
 
   useEffect(() => { fetchSheet() }, [fetchSheet])
+
+  // Fetch warnings when selected row changes
+  useEffect(() => {
+    if (!selectedRowId) { setCaseWarnings([]); return }
+    const row = rows.find(r => r.id === selectedRowId)
+    if (!row) { setCaseWarnings([]); return }
+    let cancelled = false
+    setLoadingWarnings(true)
+    fetch(`${getApiBase()}/request-sheets/case-warnings?accession=${encodeURIComponent(row.accession_number)}&sheet_id=${sheetId}`)
+      .then(res => res.ok ? res.json() : { warnings: [] })
+      .then(data => { if (!cancelled) setCaseWarnings(data.warnings || []) })
+      .catch(() => { if (!cancelled) setCaseWarnings([]) })
+      .finally(() => { if (!cancelled) setLoadingWarnings(false) })
+    return () => { cancelled = true }
+  }, [selectedRowId, rows, sheetId])
 
   // ── Section toggle ────────────────────────────────────────────
   const toggleSection = (id: string) => {
@@ -551,12 +612,20 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
   const updateField = async (rowId: number, field: string, value: unknown) => {
     const row = rows.find(r => r.id === rowId)
     if (!row) return
-    setRows(prev => prev.map(r => r.id === rowId ? { ...r, [field]: value } : r))
+    pushUndo({ type: 'field', rowId, field, prev: row[field as keyof RequestRow] })
+
+    const patch: Record<string, unknown> = { [field]: value }
+    if (field === 'he_scanning_status' && value === 'Complete') {
+      patch.case_status = 'Scanned'
+      pushUndo({ type: 'field', rowId, field: 'case_status', prev: row.case_status })
+    }
+
+    setRows(prev => prev.map(r => r.id === rowId ? { ...r, ...patch } : r))
     try {
       const res = await fetch(`${getApiBase()}/request-sheets/${sheetId}/rows/${rowId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ [field]: value }),
+        body: JSON.stringify(patch),
       })
       if (!res.ok) {
         setRows(prev => prev.map(r => r.id === rowId ? { ...r, [field]: row[field as keyof RequestRow] } : r))
@@ -579,6 +648,7 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
       if (res.ok) {
         const row: RequestRow = await res.json()
         setRows(prev => [...prev, row])
+        pushUndo({ type: 'add_rows', ids: [row.id] })
         setSelectedRowId(row.id)
         setNewAccession('')
         setIsAddOpen(false)
@@ -628,6 +698,7 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
     setBatchRowIds(newIds)
     setBatchAddResult({ added, skipped })
     if (newIds.length > 0) {
+      pushUndo({ type: 'add_rows', ids: newIds })
       setSelectedRowId(newIds[0])
       setBatchStep('staging')
     }
@@ -675,6 +746,8 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
 
   // ── Delete row ────────────────────────────────────────────────
   const handleDeleteRow = async (rowId: number) => {
+    const snapshot = rows.find(r => r.id === rowId)
+    if (snapshot) pushUndo({ type: 'delete_row', snapshot })
     const wasSelected = selectedRowId === rowId
     setRows(prev => prev.filter(r => r.id !== rowId))
     setDeleteConfirmId(null)
@@ -688,6 +761,60 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
       fetchSheet()
     }
   }
+
+  // ── Undo ──────────────────────────────────────────────────────
+  const handleUndo = useCallback(async () => {
+    if (undoStack.length === 0) return
+    const entry = undoStack[undoStack.length - 1]
+    setUndoStack(s => s.slice(0, -1))
+
+    if (entry.type === 'field') {
+      setRows(prev => prev.map(r => r.id === entry.rowId ? { ...r, [entry.field]: entry.prev } : r))
+      await fetch(`${getApiBase()}/request-sheets/${sheetId}/rows/${entry.rowId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ [entry.field]: entry.prev }),
+      }).catch(() => fetchSheet())
+      setUndoToast('Undid field edit')
+
+    } else if (entry.type === 'add_rows') {
+      setRows(prev => prev.filter(r => !entry.ids.includes(r.id)))
+      await Promise.all(entry.ids.map(id =>
+        fetch(`${getApiBase()}/request-sheets/${sheetId}/rows/${id}`, { method: 'DELETE' }).catch(() => {})
+      ))
+      setUndoToast(`Undid adding ${entry.ids.length} case${entry.ids.length !== 1 ? 's' : ''}`)
+
+    } else if (entry.type === 'delete_row') {
+      const { id: _id, sheet_id: _sid, created_at: _ca, updated_at: _ua, ...fields } = entry.snapshot as any
+      const res = await fetch(`${getApiBase()}/request-sheets/${sheetId}/rows`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(fields),
+      }).catch(() => null)
+      if (res?.ok) {
+        const restored: RequestRow = await res.json()
+        setRows(prev => [...prev, restored])
+      } else {
+        fetchSheet()
+      }
+      setUndoToast('Undid delete')
+    }
+
+    setTimeout(() => setUndoToast(null), 2500)
+  }, [undoStack, sheetId, fetchSheet])
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
+        const tag = (e.target as HTMLElement)?.tagName
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement)?.isContentEditable) return
+        e.preventDefault()
+        handleUndo()
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [handleUndo])
 
   // ── Import cohort ─────────────────────────────────────────────
   const openImport = async () => {
@@ -727,6 +854,35 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
     window.open(`${getApiBase()}/request-sheets/${sheetId}/export.csv`, '_blank')
   }
 
+  // ── CSV import ────────────────────────────────────────────────
+  const openCsvImport = () => {
+    setCsvImportFile(null)
+    setCsvImportResult(null)
+    setCsvImportMode('skip')
+    setIsCsvImportOpen(true)
+  }
+
+  const handleCsvImport = async () => {
+    if (!csvImportFile) return
+    setCsvImporting(true)
+    try {
+      const form = new FormData()
+      form.append('file', csvImportFile)
+      const res = await fetch(`${getApiBase()}/request-sheets/${sheetId}/import-csv?mode=${csvImportMode}`, {
+        method: 'POST',
+        body: form,
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || 'Import failed')
+      setCsvImportResult(data)
+      fetchSheet()
+    } catch (e: any) {
+      setCsvImportResult({ added: 0, updated: 0, skipped: 0, errors: [e.message || 'Upload failed'] })
+    } finally {
+      setCsvImporting(false)
+    }
+  }
+
   const saveSheetName = async () => {
     if (!editName.trim() || !sheet) return
     try {
@@ -744,7 +900,8 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
   const filteredRows = rows.filter(r => {
     const matchesText = !filter || r.accession_number.toLowerCase().includes(filter.toLowerCase()) || (r.notes && r.notes.toLowerCase().includes(filter.toLowerCase()))
     const matchesStatus = statusFilter === 'all' || r.case_status === statusFilter
-    return matchesText && matchesStatus
+    const matchesConsult = !consultFilter || r.is_consult
+    return matchesText && matchesStatus && matchesConsult
   })
 
   const selectedRow = rows.find(r => r.id === selectedRowId) || null
@@ -880,6 +1037,12 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
 
   return (
     <div className="flex flex-col h-full" style={{ minHeight: 0 }}>
+      {/* Undo toast */}
+      {undoToast && (
+        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-50 bg-gray-800 text-white text-[13px] px-4 py-2 rounded-lg shadow-lg pointer-events-none">
+          {undoToast}
+        </div>
+      )}
       {/* Header */}
       <div className="flex items-center gap-3 mb-3">
         <Button size="sm" variant="ghost" onClick={onBack} className="h-8 px-2">
@@ -911,6 +1074,9 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
           <Button size="sm" variant="outline" className="h-7 text-[12px]" onClick={openImport}>
             <Upload className="h-3 w-3 mr-1" />Import
           </Button>
+          <Button size="sm" variant="outline" className="h-7 text-[12px]" onClick={openCsvImport}>
+            <Upload className="h-3 w-3 mr-1" />Import CSV
+          </Button>
           <Button size="sm" variant="outline" className="h-7 text-[12px]" onClick={handleExport}>
             <Download className="h-3 w-3 mr-1" />CSV
           </Button>
@@ -941,6 +1107,13 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
             <div className="text-[11px] text-muted-foreground leading-tight">{s.label}</div>
           </button>
         ))}
+        <button
+          onClick={() => setConsultFilter(p => !p)}
+          className={`rounded-md border px-2.5 py-1 text-center min-w-[60px] transition-all border-orange-300 bg-orange-50/70 text-orange-700 ${consultFilter ? 'ring-2 ring-primary/30 ring-offset-1' : 'hover:shadow-sm'}`}
+        >
+          <div className="text-base font-semibold tabular-nums">{rows.filter(r => r.is_consult).length}</div>
+          <div className="text-[11px] text-muted-foreground leading-tight">Consult</div>
+        </button>
       </div>
 
       {/* Main content: split panel */}
@@ -993,19 +1166,28 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
                         : 'hover:bg-muted/40 border-l-[3px] border-l-transparent'
                     }`}
                   >
-                    <div className="flex items-start justify-between gap-2">
-                      <span className="font-mono text-[13px] font-semibold tracking-tight text-foreground">
-                        {row.accession_number}
-                      </span>
+                    <div className="flex items-start justify-between gap-2 group/acc">
+                      <div className="flex items-center gap-1 min-w-0">
+                        <span className="font-mono text-[13px] font-semibold tracking-tight text-foreground">
+                          {row.accession_number}
+                        </span>
+                        <button
+                          className="opacity-0 group-hover/acc:opacity-60 hover:!opacity-100 transition-opacity shrink-0"
+                          onClick={(e) => { e.stopPropagation(); navigator.clipboard.writeText(row.accession_number) }}
+                          title="Copy accession number"
+                        >
+                          <Copy className="h-3 w-3" />
+                        </button>
+                      </div>
                       <Circle className={`h-2 w-2 shrink-0 mt-1.5 fill-current ${statusDot(row.case_status)}`} />
                     </div>
                     <div className="flex items-center gap-1.5 mt-1">
                       <span className={`inline-flex items-center rounded-sm px-1.5 py-0.5 text-[10px] font-medium border ${statusColor(row.case_status || 'Not Started')}`}>
                         {row.case_status || 'Not Started'}
                       </span>
-                      {row.hes_scanned === 'Yes' && (
-                        <span className="inline-flex items-center rounded-sm px-1 py-0.5 text-[10px] font-medium border border-violet-200 bg-violet-50 text-violet-700">
-                          Scanned
+                      {row.is_consult && (
+                        <span className="inline-flex items-center rounded-sm px-1.5 py-0.5 text-[10px] font-medium border border-orange-300 bg-orange-50 text-orange-700">
+                          Consult
                         </span>
                       )}
                       {row.slide_location && (
@@ -1048,6 +1230,46 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
                     </Button>
                   </div>
                 </div>
+
+                {/* Case warnings */}
+                {caseWarnings.length > 0 && (
+                  <div className="mb-4 space-y-2">
+                    {caseWarnings.map((w, i) => (
+                      <div
+                        key={i}
+                        className={`flex items-start gap-2.5 px-3 py-2.5 rounded-md border text-[13px] ${
+                          w.type === 'already_scanned'
+                            ? 'bg-amber-50 border-amber-300 text-amber-900'
+                            : 'bg-blue-50 border-blue-300 text-blue-900'
+                        }`}
+                      >
+                        {w.type === 'already_scanned' ? (
+                          <Microscope className="h-4 w-4 shrink-0 mt-0.5 text-amber-600" />
+                        ) : (
+                          <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5 text-blue-600" />
+                        )}
+                        <div>
+                          <p className="font-medium">{w.message}</p>
+                          {w.type === 'already_scanned' && w.stain_breakdown && (
+                            <p className="text-[12px] mt-0.5 opacity-80">
+                              {Object.entries(w.stain_breakdown).map(([stain, count]) => `${count} ${stain}`).join(', ')}
+                            </p>
+                          )}
+                          {w.type === 'duplicate_request' && w.sheets && (
+                            <div className="text-[12px] mt-0.5 opacity-80">
+                              {w.sheets.map((s, j) => (
+                                <span key={j}>
+                                  {j > 0 && ', '}
+                                  {s.sheet_name} ({s.case_status})
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
 
                 {/* Status + Location (always visible) */}
                 <div className="mb-4 p-3 rounded-md bg-muted/30 border border-gray-300 grid grid-cols-2 gap-4">
@@ -1171,6 +1393,80 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
             <Button variant="outline" size="sm" onClick={() => setIsImportOpen(false)}>{importResult ? 'Done' : 'Cancel'}</Button>
             {!importResult && (
               <Button size="sm" onClick={handleImport} disabled={!selectedCohortId || importing}>{importing ? 'Importing...' : 'Import'}</Button>
+            )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Import CSV dialog */}
+      <Dialog open={isCsvImportOpen} onOpenChange={setIsCsvImportOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Import from CSV / Excel</DialogTitle>
+            <DialogDescription>
+              Upload a .csv or .xlsx file. Columns are matched by header name — export a sheet first to see the expected format.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3 py-2">
+            <input
+              ref={csvFileRef}
+              type="file"
+              accept=".csv,.xlsx"
+              className="hidden"
+              onChange={e => setCsvImportFile(e.target.files?.[0] ?? null)}
+            />
+            <div className="flex items-center gap-2">
+              <Button size="sm" variant="outline" onClick={() => csvFileRef.current?.click()}>
+                Choose file
+              </Button>
+              <span className="text-[13px] text-muted-foreground truncate">
+                {csvImportFile ? csvImportFile.name : 'No file selected'}
+              </span>
+            </div>
+            {!csvImportResult && (
+              <div className="rounded-md border border-gray-200 p-3 space-y-2">
+                <p className="text-[12px] font-medium text-gray-700">If accession already exists:</p>
+                <div className="flex flex-col gap-1.5">
+                  <label className="flex items-start gap-2 cursor-pointer">
+                    <input type="radio" className="mt-0.5" checked={csvImportMode === 'skip'} onChange={() => setCsvImportMode('skip')} />
+                    <span className="text-[13px]">
+                      <span className="font-medium">Skip</span>
+                      <span className="text-muted-foreground"> — keep existing data, only add new cases</span>
+                    </span>
+                  </label>
+                  <label className="flex items-start gap-2 cursor-pointer">
+                    <input type="radio" className="mt-0.5" checked={csvImportMode === 'upsert'} onChange={() => setCsvImportMode('upsert')} />
+                    <span className="text-[13px]">
+                      <span className="font-medium">Merge</span>
+                      <span className="text-muted-foreground"> — update existing rows with non-empty CSV values</span>
+                    </span>
+                  </label>
+                </div>
+              </div>
+            )}
+            {csvImportResult && (
+              <div className={`rounded-md border px-3 py-2 text-[13px] ${(csvImportResult.added + csvImportResult.updated) > 0 ? 'bg-emerald-50 border-emerald-200 text-emerald-700' : 'bg-amber-50 border-amber-200 text-amber-700'}`}>
+                {csvImportResult.added > 0 && <span>Added {csvImportResult.added} new case{csvImportResult.added !== 1 ? 's' : ''}</span>}
+                {csvImportResult.added > 0 && (csvImportResult.updated > 0 || csvImportResult.skipped > 0) && <span>, </span>}
+                {csvImportResult.updated > 0 && <span>updated {csvImportResult.updated} existing</span>}
+                {csvImportResult.skipped > 0 && <span>{csvImportResult.updated > 0 ? ', ' : ''}skipped {csvImportResult.skipped} duplicate{csvImportResult.skipped !== 1 ? 's' : ''}</span>}
+                {csvImportResult.errors.length > 0 && (
+                  <ul className="mt-1 list-disc pl-4 text-[12px] text-red-600">
+                    {csvImportResult.errors.slice(0, 5).map((e, i) => <li key={i}>{e}</li>)}
+                    {csvImportResult.errors.length > 5 && <li>...and {csvImportResult.errors.length - 5} more</li>}
+                  </ul>
+                )}
+              </div>
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" size="sm" onClick={() => setIsCsvImportOpen(false)}>
+              {csvImportResult ? 'Done' : 'Cancel'}
+            </Button>
+            {!csvImportResult && (
+              <Button size="sm" onClick={handleCsvImport} disabled={!csvImportFile || csvImporting}>
+                {csvImporting ? 'Importing...' : 'Import'}
+              </Button>
             )}
           </DialogFooter>
         </DialogContent>

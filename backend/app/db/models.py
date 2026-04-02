@@ -36,6 +36,115 @@ Base = declarative_base()
 
 
 # ============================================================
+# SlideCap ID Generation
+# ============================================================
+
+class IdCounter(Base):
+    """
+    Auto-incrementing counter for human-readable SlideCap IDs.
+
+    Each prefix (PT, CS, SL, JB, CO, etc.) gets its own counter.
+    IDs are formatted as PREFIX + zero-padded number: PT00001, SL00042, etc.
+    """
+    __tablename__ = 'id_counters'
+
+    prefix = Column(String(4), primary_key=True)  # PT, CS, SL, JB
+    next_number = Column(Integer, nullable=False, default=1)
+
+
+def generate_slidecap_id(db, prefix: str) -> str:
+    """
+    Generate the next SlideCap ID for a given prefix.
+    Thread-safe via DB-level row locking.
+
+    Usage:
+        sid = generate_slidecap_id(db, "SL")  # → "SL00001"
+    """
+    counter = db.query(IdCounter).filter_by(prefix=prefix).first()
+    if not counter:
+        counter = IdCounter(prefix=prefix, next_number=1)
+        db.add(counter)
+        db.flush()
+    sid = f"{prefix}{counter.next_number:05d}"
+    counter.next_number += 1
+    return sid
+
+
+# ============================================================
+# Global Patient Model
+# ============================================================
+
+class Patient(Base):
+    """
+    A real-world patient (de-identified within SlideCap).
+
+    Patients are NOT created automatically by the indexer — they are created
+    when a user links cases (surgeries) to a patient. This is because the
+    indexer only knows accession numbers, not which accessions belong to the
+    same person.
+
+    The slidecap_id (PT00001) is the only identifier stored. No name, no MRN.
+    External trial IDs are linked via ExternalMapping.
+    """
+    __tablename__ = 'patients'
+
+    id = Column(Integer, primary_key=True)
+    slidecap_id = Column(String(10), unique=True, nullable=False, index=True)  # PT00001
+    note = Column(String(500))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # Relationships
+    cases = relationship('Case', back_populates='patient', order_by='Case.year')
+    external_mappings = relationship('ExternalMapping', back_populates='patient',
+                                    cascade='all, delete-orphan')
+
+    @property
+    def case_count(self) -> int:
+        return len(self.cases)
+
+    @property
+    def slide_count(self) -> int:
+        return sum(len(c.slides) for c in self.cases)
+
+    def __repr__(self):
+        return f"<Patient(slidecap_id={self.slidecap_id})>"
+
+
+class ExternalMapping(Base):
+    """
+    Maps a SlideCap patient to an external system identifier.
+
+    Primary use case: linking PT00001 to a REDCap trial ID like "REC-0045"
+    so researchers can cross-reference SlideCap data with clinical trial data
+    without exposing PHI.
+
+    Supports multiple external systems per patient (REDCap, EPIC, etc.)
+    and multiple projects within a system.
+    """
+    __tablename__ = 'external_mappings'
+
+    id = Column(Integer, primary_key=True)
+    patient_id = Column(Integer, ForeignKey('patients.id', ondelete='CASCADE'), nullable=False, index=True)
+    external_system = Column(String(100), nullable=False)   # "redcap", "epic", "ctms"
+    external_project = Column(String(200))                  # REDCap project name or ID
+    external_id = Column(String(200), nullable=False)       # The trial/subject ID
+    note = Column(String(500))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    patient = relationship('Patient', back_populates='external_mappings')
+
+    __table_args__ = (
+        UniqueConstraint('external_system', 'external_project', 'external_id',
+                         name='uq_external_mapping'),
+        Index('idx_external_lookup', 'external_system', 'external_id'),
+    )
+
+    def __repr__(self):
+        return f"<ExternalMapping({self.external_system}:{self.external_id} → {self.patient.slidecap_id if self.patient else '?'})>"
+
+
+# ============================================================
 # Association Tables (many-to-many relationships)
 # ============================================================
 
@@ -78,24 +187,28 @@ cohort_slides = Table(
 class Case(Base):
     """
     Represents a surgical case (accession number).
-    
+
     No PHI stored - only the hashed accession identifier.
     A case can have multiple slides (different blocks, stains).
+    Optionally linked to a Patient (multiple cases per patient).
     """
     __tablename__ = 'cases'
-    
+
     id = Column(Integer, primary_key=True)
+    slidecap_id = Column(String(10), unique=True, index=True)  # CS00001
     accession_hash = Column(String(64), unique=True, nullable=False, index=True)
+    patient_id = Column(Integer, ForeignKey('patients.id', ondelete='SET NULL'), nullable=True, index=True)
     year = Column(Integer, nullable=False, index=True)
     indexed_at = Column(DateTime, default=datetime.utcnow)
-    
+
     # Relationships
+    patient = relationship('Patient', back_populates='cases')
     slides = relationship('Slide', back_populates='case', cascade='all, delete-orphan')
     tags = relationship('Tag', secondary=case_tags, back_populates='cases')
     projects = relationship('Project', secondary=project_cases, back_populates='cases')
-    
+
     def __repr__(self):
-        return f"<Case(id={self.id}, hash={self.accession_hash[:8]}..., year={self.year})>"
+        return f"<Case(id={self.id}, slidecap_id={self.slidecap_id}, hash={self.accession_hash[:8]}..., year={self.year})>"
 
 
 class Slide(Base):
@@ -106,10 +219,11 @@ class Slide(Base):
     The slide_hash is derived from the full filename stem (minus extension).
     """
     __tablename__ = 'slides'
-    
+
     id = Column(Integer, primary_key=True)
+    slidecap_id = Column(String(10), unique=True, index=True)  # SL00001
     case_id = Column(Integer, ForeignKey('cases.id', ondelete='CASCADE'), nullable=False)
-    
+
     # Hashed full filename for lookups
     slide_hash = Column(String(64), unique=True, nullable=False, index=True)
     
@@ -348,6 +462,7 @@ class AnalysisJob(Base):
     __tablename__ = 'analysis_jobs'
 
     id = Column(Integer, primary_key=True)
+    slidecap_id = Column(String(10), unique=True, index=True)  # JB00001
     analysis_id = Column(Integer, ForeignKey('analyses.id', ondelete='SET NULL'), nullable=True)
 
     # Job info
@@ -480,9 +595,9 @@ class RequestRow(Base):
     recut_status = Column(String(100))
 
     # Scanning
-    hes_scanned = Column(String(50))
+    hes_scanned = Column(String(2000))
     he_scanning_status = Column(String(100))
-    non_hes_scanned = Column(String(50))
+    non_hes_scanned = Column(String(2000))
 
     # Other
     slide_location = Column(String(200))
@@ -499,6 +614,87 @@ class RequestRow(Base):
 
 
 # ============================================================
+# Study Models
+# ============================================================
+
+study_slides = Table(
+    'study_slides', Base.metadata,
+    Column('study_id', Integer, ForeignKey('studies.id', ondelete='CASCADE'), primary_key=True),
+    Column('slide_id', Integer, ForeignKey('slides.id', ondelete='CASCADE'), primary_key=True),
+    Column('added_at', DateTime, default=datetime.utcnow)
+)
+
+study_group_slides = Table(
+    'study_group_slides', Base.metadata,
+    Column('group_id', Integer, ForeignKey('study_groups.id', ondelete='CASCADE'), primary_key=True),
+    Column('slide_id', Integer, ForeignKey('slides.id', ondelete='CASCADE'), primary_key=True),
+    Column('added_at', DateTime, default=datetime.utcnow)
+)
+
+
+class Study(Base):
+    """
+    A research study containing non-clinical (and optionally clinical) slides.
+    Each study maps to a folder on the network drive under slides/studies/{folder_name}.
+    """
+    __tablename__ = 'studies'
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(200), nullable=False)
+    description = Column(String(2000))
+    folder_name = Column(String(200), nullable=False, unique=True)  # filesystem folder name
+    created_by = Column(String(100))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # Relationships
+    slides = relationship('Slide', secondary=study_slides, backref='studies')
+    groups = relationship('StudyGroup', back_populates='study', cascade='all, delete-orphan',
+                         order_by='StudyGroup.sort_order')
+
+    # Unlinked files: slides in the study folder that aren't in the DB
+    # (tracked at runtime, not stored)
+
+    @property
+    def slide_count(self) -> int:
+        return len(self.slides)
+
+    @property
+    def group_count(self) -> int:
+        return len(self.groups)
+
+    def __repr__(self):
+        return f"<Study(name={self.name})>"
+
+
+class StudyGroup(Base):
+    """
+    A named group within a study for organizing slides.
+    Groups can represent patients, cohorts, experimental conditions, etc.
+    Groups can optionally have a parent_id for nesting (cohort > patient).
+    """
+    __tablename__ = 'study_groups'
+
+    id = Column(Integer, primary_key=True)
+    study_id = Column(Integer, ForeignKey('studies.id', ondelete='CASCADE'), nullable=False, index=True)
+    parent_id = Column(Integer, ForeignKey('study_groups.id', ondelete='SET NULL'), nullable=True, index=True)
+    name = Column(String(200), nullable=False)
+    label = Column(String(50))  # Short label like "P001", "Cohort A"
+    color = Column(String(7))   # Hex color for UI
+    note = Column(String(1000))
+    sort_order = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    study = relationship('Study', back_populates='groups')
+    children = relationship('StudyGroup', backref='parent', remote_side='StudyGroup.id',
+                           cascade='all, delete-orphan', single_parent=True)
+    slides = relationship('Slide', secondary=study_group_slides)
+
+    def __repr__(self):
+        return f"<StudyGroup(name={self.name}, study_id={self.study_id})>"
+
+
+# ============================================================
 # Indexes for common queries
 # ============================================================
 
@@ -510,6 +706,8 @@ Index('idx_jobs_model_status', AnalysisJob.model_name, AnalysisJob.status)
 Index('idx_job_slides_job_id', JobSlide.job_id)
 Index('idx_job_slides_status', JobSlide.status)
 Index('idx_request_rows_status', RequestRow.case_status)
+Index('idx_study_groups_study', StudyGroup.study_id)
+Index('idx_study_groups_parent', StudyGroup.parent_id)
 
 
 # ============================================================
@@ -708,16 +906,121 @@ def _migrate_analysis_jobs(engine):
         print(f"[DB Migration] Skipping job_slides migration: {e}")
 
 
+def _migrate_slidecap_ids(engine):
+    """Add slidecap_id columns and backfill existing records with auto-generated IDs."""
+    from sqlalchemy import text
+
+    try:
+        insp = inspect(engine)
+        # Clear cached schema info so we see columns added by create_all
+        insp.clear_cache()
+    except Exception as e:
+        print(f"[DB Migration] Skipping SlideCap ID migration (cannot inspect DB): {e}")
+        return
+
+    # SQLite cannot ADD COLUMN with UNIQUE constraint — add column first, index after backfill
+    migrations = {
+        'cases': {
+            'slidecap_id': "ALTER TABLE cases ADD COLUMN slidecap_id VARCHAR(10)",
+            'patient_id': "ALTER TABLE cases ADD COLUMN patient_id INTEGER REFERENCES patients(id) ON DELETE SET NULL",
+        },
+        'slides': {
+            'slidecap_id': "ALTER TABLE slides ADD COLUMN slidecap_id VARCHAR(10)",
+        },
+        'analysis_jobs': {
+            'slidecap_id': "ALTER TABLE analysis_jobs ADD COLUMN slidecap_id VARCHAR(10)",
+        },
+    }
+
+    with engine.connect() as conn:
+        for table_name, cols in migrations.items():
+            if not insp.has_table(table_name):
+                continue
+            existing = {col['name'] for col in insp.get_columns(table_name)}
+            for col_name, ddl in cols.items():
+                if col_name not in existing:
+                    try:
+                        print(f"[DB Migration] Adding column: {table_name}.{col_name}")
+                        conn.execute(text(ddl))
+                    except Exception as e:
+                        print(f"[DB Migration] Skipping {table_name}.{col_name}: {e}")
+        conn.commit()
+
+    # Backfill slidecap_ids for existing records
+    with engine.connect() as conn:
+        # Ensure id_counters table exists
+        conn.execute(text(
+            "CREATE TABLE IF NOT EXISTS id_counters ("
+            "prefix VARCHAR(4) PRIMARY KEY, "
+            "next_number INTEGER NOT NULL DEFAULT 1)"
+        ))
+        conn.commit()
+
+        for table_name, prefix in [('cases', 'CS'), ('slides', 'SL'), ('analysis_jobs', 'JB')]:
+            try:
+                if not insp.has_table(table_name):
+                    continue
+                rows = conn.execute(text(
+                    f"SELECT id FROM {table_name} WHERE slidecap_id IS NULL ORDER BY id"
+                )).fetchall()
+                if not rows:
+                    continue
+
+                # Get current counter
+                counter_row = conn.execute(text(
+                    "SELECT next_number FROM id_counters WHERE prefix = :p"
+                ), {"p": prefix}).fetchone()
+                next_num = counter_row[0] if counter_row else 1
+
+                print(f"[DB Migration] Backfilling {len(rows)} {prefix} IDs...")
+                for row in rows:
+                    sid = f"{prefix}{next_num:05d}"
+                    conn.execute(text(
+                        f"UPDATE {table_name} SET slidecap_id = :sid WHERE id = :id"
+                    ), {"sid": sid, "id": row[0]})
+                    next_num += 1
+
+                # Upsert counter
+                conn.execute(text(
+                    "INSERT INTO id_counters (prefix, next_number) VALUES (:p, :n) "
+                    "ON CONFLICT(prefix) DO UPDATE SET next_number = :n"
+                ), {"p": prefix, "n": next_num})
+                conn.commit()
+                print(f"[DB Migration] Assigned {prefix}00001–{prefix}{next_num-1:05d}")
+            except Exception as e:
+                print(f"[DB Migration] Skipping {prefix} backfill: {e}")
+
+    # Create unique indexes on slidecap_id columns + patient_id index
+    with engine.connect() as conn:
+        for idx_sql in [
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_cases_slidecap_id ON cases(slidecap_id)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_slides_slidecap_id ON slides(slidecap_id)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_slidecap_id ON analysis_jobs(slidecap_id)",
+            "CREATE INDEX IF NOT EXISTS idx_cases_patient ON cases(patient_id)",
+        ]:
+            try:
+                conn.execute(text(idx_sql))
+            except Exception as e:
+                print(f"[DB Migration] Index skipped: {e}")
+        conn.commit()
+
+
 def init_db(db_path: Path):
     """
     Initialize database schema and session factory.
     Call this once at startup before handling requests.
+
+    Order matters:
+    1. Run legacy migrations (ALTER TABLE for old columns)
+    2. Create all new tables (patients, external_mappings, id_counters, etc.)
+    3. Run SlideCap ID migration (ALTER TABLE to add slidecap_id/patient_id to existing tables + backfill)
     """
     global _SessionLocal, _engine
     db_path.parent.mkdir(parents=True, exist_ok=True)
     _engine = get_engine(db_path)
     _migrate_analysis_jobs(_engine)
-    Base.metadata.create_all(_engine)
+    Base.metadata.create_all(_engine)  # Creates new tables (patients, id_counters, external_mappings)
+    _migrate_slidecap_ids(_engine)     # Adds columns to existing tables + backfills IDs
     _SessionLocal = sessionmaker(bind=_engine)
 
 

@@ -12,7 +12,8 @@ from sqlalchemy.orm import Session, joinedload
 
 from .filename_parser import FilenameParser
 from .hasher import SlideHasher
-from ..db.models import Case, Slide, JobSlide, AnalysisJob
+import re
+from ..db.models import Case, Slide, JobSlide, AnalysisJob, Patient, generate_slidecap_id
 
 
 class SlideIndexer:
@@ -66,6 +67,7 @@ class SlideIndexer:
         case = db.query(Case).filter_by(accession_hash=accession_hash).first()
         if not case:
             case = Case(
+                slidecap_id=generate_slidecap_id(db, "CS"),
                 accession_hash=accession_hash,
                 year=parsed.year,
                 indexed_at=datetime.now(timezone.utc)
@@ -87,6 +89,7 @@ class SlideIndexer:
             file_size = None
 
         slide = Slide(
+            slidecap_id=generate_slidecap_id(db, "SL"),
             case_id=case.id,
             slide_hash=slide_hash,
             block_id=parsed.block_id,
@@ -174,6 +177,7 @@ class SlideIndexer:
                     # Check if case exists, if not queue for creation
                     if accession_hash not in existing_case_hashes:
                         case = Case(
+                            slidecap_id=generate_slidecap_id(db, "CS"),
                             accession_hash=accession_hash,
                             year=parsed.year,
                             indexed_at=datetime.now(timezone.utc)
@@ -191,6 +195,7 @@ class SlideIndexer:
                         stats['slides_updated'] += 1
                     else:
                         slide = Slide(
+                            slidecap_id=generate_slidecap_id(db, "SL"),
                             case_id=case_id,
                             slide_hash=slide_hash,
                             block_id=parsed.block_id,
@@ -318,6 +323,7 @@ class SlideIndexer:
                     # Create case if needed
                     if accession_hash not in existing_case_hashes:
                         case = Case(
+                            slidecap_id=generate_slidecap_id(db, "CS"),
                             accession_hash=accession_hash,
                             year=parsed.year,
                             indexed_at=datetime.now(timezone.utc)
@@ -330,6 +336,7 @@ class SlideIndexer:
 
                     # Create new slide
                     slide = Slide(
+                        slidecap_id=generate_slidecap_id(db, "SL"),
                         case_id=case_id,
                         slide_hash=slide_hash,
                         block_id=parsed.block_id,
@@ -423,6 +430,163 @@ class SlideIndexer:
         """Get all slide filepaths for a case (accession hash)."""
         return self.accession_hash_to_paths.get(accession_hash, [])
     
+    def _search_by_slidecap_id(
+        self,
+        db: Session,
+        query: str,
+        year: Optional[int] = None,
+        stain_type: Optional[str] = None,
+        tags: Optional[list[str]] = None,
+        limit: int = 100,
+    ) -> Optional[list[dict]]:
+        """
+        Search by SlideCap ID (SL, CS, or PT prefix).
+        Returns slide results or None if no match found (falls through to filename search).
+        Supports partial matching: "SL1" matches SL00001, SL00010, SL00100, etc.
+        """
+        prefix = query[:2]
+        # Build LIKE pattern: "SL1" → match slidecap_id containing "1" after prefix
+        number_part = query[2:]
+
+        if prefix == "SL":
+            # Direct slide lookup — partial match on the number portion
+            slides = db.query(Slide).options(
+                joinedload(Slide.tags),
+                joinedload(Slide.case).joinedload(Case.patient),
+                joinedload(Slide.case).joinedload(Case.tags),
+                joinedload(Slide.case).joinedload(Case.projects),
+                joinedload(Slide.job_slides).joinedload(JobSlide.job),
+            ).filter(
+                Slide.slidecap_id.like(f"SL%{number_part}%")
+            ).limit(limit).all()
+            if not slides:
+                return None
+            return [self._slide_to_result(s) for s in slides if self._slide_passes_filters(s, year, stain_type, tags)]
+
+        elif prefix == "CS":
+            # Find all slides belonging to matching cases
+            cases = db.query(Case).filter(
+                Case.slidecap_id.like(f"CS%{number_part}%")
+            ).all()
+            if not cases:
+                return None
+            case_ids = [c.id for c in cases]
+            slides = db.query(Slide).options(
+                joinedload(Slide.tags),
+                joinedload(Slide.case).joinedload(Case.patient),
+                joinedload(Slide.case).joinedload(Case.tags),
+                joinedload(Slide.case).joinedload(Case.projects),
+                joinedload(Slide.job_slides).joinedload(JobSlide.job),
+            ).filter(
+                Slide.case_id.in_(case_ids)
+            ).limit(limit).all()
+            return [self._slide_to_result(s) for s in slides if self._slide_passes_filters(s, year, stain_type, tags)]
+
+        elif prefix == "PT":
+            # Find all slides belonging to matching patients
+            patients = db.query(Patient).filter(
+                Patient.slidecap_id.like(f"PT%{number_part}%")
+            ).all()
+            if not patients:
+                return None
+            patient_ids = [p.id for p in patients]
+            cases = db.query(Case).filter(Case.patient_id.in_(patient_ids)).all()
+            if not cases:
+                return []
+            case_ids = [c.id for c in cases]
+            slides = db.query(Slide).options(
+                joinedload(Slide.tags),
+                joinedload(Slide.case).joinedload(Case.patient),
+                joinedload(Slide.case).joinedload(Case.tags),
+                joinedload(Slide.case).joinedload(Case.projects),
+                joinedload(Slide.job_slides).joinedload(JobSlide.job),
+            ).filter(
+                Slide.case_id.in_(case_ids)
+            ).limit(limit).all()
+            return [self._slide_to_result(s) for s in slides if self._slide_passes_filters(s, year, stain_type, tags)]
+
+        elif prefix == "JB":
+            # Find all slides that were part of matching jobs
+            jobs = db.query(AnalysisJob).filter(
+                AnalysisJob.slidecap_id.like(f"JB%{number_part}%")
+            ).all()
+            if not jobs:
+                return None
+            job_ids = [j.id for j in jobs]
+            job_slides = db.query(JobSlide).filter(
+                JobSlide.job_id.in_(job_ids)
+            ).all()
+            if not job_slides:
+                return []
+            slide_ids = list(set(js.slide_id for js in job_slides))
+            slides = db.query(Slide).options(
+                joinedload(Slide.tags),
+                joinedload(Slide.case).joinedload(Case.patient),
+                joinedload(Slide.case).joinedload(Case.tags),
+                joinedload(Slide.case).joinedload(Case.projects),
+                joinedload(Slide.job_slides).joinedload(JobSlide.job),
+            ).filter(
+                Slide.id.in_(slide_ids)
+            ).limit(limit).all()
+            return [self._slide_to_result(s) for s in slides if self._slide_passes_filters(s, year, stain_type, tags)]
+
+        return None
+
+    def _slide_to_result(self, slide: Slide) -> dict:
+        """Convert a Slide ORM object to a search result dict."""
+        filepath = self.slide_hash_to_path.get(slide.slide_hash)
+        parsed = self.parser.parse(filepath.name) if filepath else None
+
+        # Accession number comes from the filename (PHI, not stored in DB).
+        # If the file is missing from the path cache, we can't recover it.
+        accession = parsed.accession if parsed else "(file not found)"
+
+        return {
+            'slide_hash': slide.slide_hash,
+            'slide_id': slide.slidecap_id,
+            'case_id': slide.case.slidecap_id if slide.case else None,
+            'patient_id': slide.case.patient.slidecap_id if slide.case and slide.case.patient else None,
+            'accession_number': accession,
+            'block_id': parsed.block_id if parsed else slide.block_id,
+            'slide_number': parsed.slide_number if parsed else None,
+            'year': parsed.year if parsed else (slide.case.year if slide.case else None),
+            'stain_type': parsed.stain_type if parsed else slide.stain_type,
+            'random_id': parsed.random_id if parsed else slide.random_id,
+            'case_hash': slide.case.accession_hash if slide.case else None,
+            'slide_tags': [t.name for t in slide.tags],
+            'case_tags': [t.name for t in slide.case.tags] if slide.case else [],
+            'projects': [p.name for p in slide.case.projects] if slide.case else [],
+            'file_size_bytes': slide.file_size_bytes,
+            'completed_analyses': list(set(
+                js.job.model_name for js in slide.job_slides
+                if js.status == "completed" and js.job
+            )),
+        }
+
+    def _slide_passes_filters(
+        self, slide: Slide,
+        year: Optional[int], stain_type: Optional[str], tags: Optional[list[str]]
+    ) -> bool:
+        """Check if a slide passes year/stain/tag filters."""
+        if year and slide.case and slide.case.year != year:
+            return False
+        if stain_type:
+            st = (slide.stain_type or "").lower()
+            ft = stain_type.lower()
+            if ft == 'he' and st != 'he':
+                return False
+            elif ft == 'ihc' and not st.startswith('ihc'):
+                return False
+            elif ft == 'special' and (st == 'he' or st.startswith('ihc')):
+                return False
+            elif ft not in ('he', 'ihc', 'special') and st != ft:
+                return False
+        if tags and slide.case:
+            all_tag_names = {t.name.lower() for t in slide.tags} | {t.name.lower() for t in slide.case.tags}
+            if not any(t.lower() in all_tag_names for t in tags):
+                return False
+        return True
+
     def search(
         self,
         db: Session,
@@ -451,6 +615,14 @@ class SlideIndexer:
         """
         t_start = time.time()
         query_lower = query.lower().strip()
+        query_upper = query.upper().strip()
+
+        # Step 0: Check if query is a SlideCap ID (SL00001, CS00001, PT00001, JB00001)
+        sid_match = re.match(r'^(SL|CS|PT|JB)\d+$', query_upper)
+        if sid_match:
+            sid_results = self._search_by_slidecap_id(db, query_upper, year, stain_type, tags, limit)
+            if sid_results is not None:
+                return sid_results
 
         # Step 1: Filter in-memory cache (fast)
         t0 = time.time()
@@ -499,8 +671,10 @@ class SlideIndexer:
         # Step 2: Batch fetch all slides from DB with eager loading
         t0 = time.time()
         matching_hashes = [m[0] for m in matching]
+        from ..db.models import Patient
         slides_db = db.query(Slide).options(
             joinedload(Slide.tags),
+            joinedload(Slide.case).joinedload(Case.patient),
             joinedload(Slide.case).joinedload(Case.tags),
             joinedload(Slide.case).joinedload(Case.projects),
             joinedload(Slide.job_slides).joinedload(JobSlide.job),
@@ -531,6 +705,9 @@ class SlideIndexer:
 
             result = {
                 'slide_hash': slide_hash,
+                'slide_id': slide.slidecap_id,
+                'case_id': slide.case.slidecap_id,
+                'patient_id': slide.case.patient.slidecap_id if slide.case.patient else None,
                 'accession_number': parsed.accession,
                 'block_id': parsed.block_id,
                 'slide_number': parsed.slide_number,

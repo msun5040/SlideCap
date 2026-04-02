@@ -9,6 +9,9 @@ export interface Tag {
 
 export interface Slide {
   slide_hash: string
+  slide_id?: string          // SlideCap ID: SL00001
+  case_id?: string           // SlideCap ID: CS00001
+  patient_id?: string | null // SlideCap ID: PT00001 (null if unassigned)
   accession_number: string
   block_id: string           // Block ID like A1, B2
   slide_number: string       // Slide number (1, 2, 3)
@@ -214,4 +217,51 @@ export interface ClusterStatus {
   username?: string
   gpus?: GpuInfo[]
   gpu_error?: string
+}
+
+// Studies
+export interface Study {
+  id: number
+  name: string
+  description?: string
+  folder_name: string
+  folder_path?: string
+  created_by?: string
+  created_at?: string
+  updated_at?: string
+  slide_count: number
+  group_count: number
+}
+
+export interface StudySlide {
+  id: number
+  slide_hash: string
+  block_id?: string
+  stain_type?: string
+  random_id?: string
+  file_size_bytes?: number
+  file_exists: boolean
+  accession_number?: string
+  slide_number?: string
+  year?: number
+  file_path?: string
+}
+
+export interface StudyGroup {
+  id: number
+  study_id: number
+  parent_id?: number | null
+  name: string
+  label?: string
+  color?: string
+  note?: string
+  sort_order: number
+  slide_count: number
+  slide_hashes: string[]
+  children: StudyGroup[]
+}
+
+export interface StudyDetail extends Study {
+  groups: StudyGroup[]
+  slides: StudySlide[]
 }

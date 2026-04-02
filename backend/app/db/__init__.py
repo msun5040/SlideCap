@@ -1,5 +1,9 @@
 from .models import (
     Base,
+    IdCounter,
+    generate_slidecap_id,
+    Patient,
+    ExternalMapping,
     Case,
     Slide,
     Tag,
@@ -13,6 +17,8 @@ from .models import (
     JobSlide,
     RequestSheet,
     RequestRow,
+    Study,
+    StudyGroup,
     get_engine,
     init_db,
     get_db,
@@ -23,6 +29,10 @@ from .lock import DatabaseLock, init_lock, get_lock
 
 __all__ = [
     'Base',
+    'IdCounter',
+    'generate_slidecap_id',
+    'Patient',
+    'ExternalMapping',
     'Case',
     'Slide',
     'Tag',
@@ -36,6 +46,8 @@ __all__ = [
     'JobSlide',
     'RequestSheet',
     'RequestRow',
+    'Study',
+    'StudyGroup',
     'get_engine',
     'init_db',
     'get_db',

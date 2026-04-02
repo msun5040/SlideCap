@@ -94,6 +94,8 @@ export function SlidePull() {
 
   // Export
   const [copied, setCopied] = useState(false)
+  const [downloading, setDownloading] = useState(false)
+  const [downloadError, setDownloadError] = useState('')
 
   // ── Add slides from search results (grouped by accession) ─────
   const addSlidesFromResults = useCallback((slides: Slide[]) => {
@@ -337,13 +339,43 @@ export function SlidePull() {
     URL.revokeObjectURL(url)
   }
 
+  const downloadFiles = async () => {
+    const hashes = cases.flatMap(c => c.slides.filter(s => s.selected).map(s => s.slide_hash))
+    if (hashes.length === 0) return
+    setDownloading(true)
+    setDownloadError('')
+    try {
+      const res = await fetch(`${getApiBase()}/slides/pull-download`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ slide_hashes: hashes }),
+      })
+      if (!res.ok) {
+        const detail = await res.json().catch(() => null)
+        throw new Error(detail?.detail || `Download failed (${res.status})`)
+      }
+      const blob = await res.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `slide-pull-${new Date().toISOString().slice(0, 10)}.zip`
+      a.click()
+      URL.revokeObjectURL(url)
+    } catch (e: any) {
+      console.error('Download failed:', e)
+      setDownloadError(e.message || 'Download failed')
+    } finally {
+      setDownloading(false)
+    }
+  }
+
   // ── Empty state ───────────────────────────────────────────────
   if (cases.length === 0 && !loading) {
     return (
       <div className="h-full flex flex-col">
         <div className="flex items-center justify-between mb-4">
           <div>
-            <h2 className="text-lg font-semibold">Slide Pull</h2>
+            <h2 className="text-lg font-semibold">WSI Pull</h2>
             <p className="text-[13px] text-muted-foreground">Select slides from cases to create a pull request</p>
           </div>
         </div>
@@ -354,7 +386,7 @@ export function SlidePull() {
               <Package className="h-7 w-7 text-primary" />
             </div>
             <div>
-              <p className="text-[14px] font-medium mb-1">Start a slide pull</p>
+              <p className="text-[14px] font-medium mb-1">Start a WSI Pull</p>
               <p className="text-[13px] text-muted-foreground">Add cases to select which slides you need pulled</p>
             </div>
             <div className="grid grid-cols-2 gap-2 max-w-xs mx-auto">
@@ -542,7 +574,7 @@ export function SlidePull() {
       {/* Header row */}
       <div className="flex items-center justify-between mb-3">
         <div>
-          <h2 className="text-lg font-semibold">Slide Pull</h2>
+          <h2 className="text-lg font-semibold">WSI Pull</h2>
           <p className="text-[12px] text-muted-foreground">{cases.length} cases · {selectedSlides} of {totalSlides} slides selected · {formatBytes(totalSize)}</p>
         </div>
         <div className="flex items-center gap-1.5">
@@ -710,6 +742,19 @@ export function SlidePull() {
             <p className="text-[11px] font-medium text-muted-foreground uppercase tracking-wide">Export</p>
             <Button
               size="sm"
+              className="w-full h-8 text-[12px]"
+              onClick={downloadFiles}
+              disabled={selectedSlides === 0 || downloading}
+            >
+              <Package className="h-3 w-3 mr-1.5" />
+              {downloading ? 'Preparing ZIP...' : 'Download Files'}
+            </Button>
+            {downloadError && (
+              <p className="text-[11px] text-red-600">{downloadError}</p>
+            )}
+            <Button
+              size="sm"
+              variant="outline"
               className="w-full h-8 text-[12px]"
               onClick={downloadPullList}
               disabled={selectedSlides === 0}

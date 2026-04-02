@@ -55,6 +55,10 @@ class Settings(BaseSettings):
         return Path(self.NETWORK_ROOT) / "slides"
 
     @property
+    def studies_path(self) -> Path:
+        return Path(self.NETWORK_ROOT) / "slides" / "studies"
+
+    @property
     def analyses_path(self) -> Path:
         return Path(self.NETWORK_ROOT) / "analyses"
 

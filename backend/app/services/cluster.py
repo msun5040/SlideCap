@@ -206,10 +206,16 @@ class ClusterService:
         # No -z: SVS/NDPI are already compressed; compression wastes CPU with no size benefit
         if shutil.which("sshpass") and shutil.which("rsync"):
             try:
+                ssh_opts = (
+                    f"ssh -p {self._port}"
+                    " -o StrictHostKeyChecking=no"
+                    " -o ServerAliveInterval=30"
+                    " -o ServerAliveCountMax=6"
+                )
                 cmd = [
                     "sshpass", "-p", self._password,
-                    "rsync", "-avP", "--no-perms",
-                    "-e", f"ssh -p {self._port} -o StrictHostKeyChecking=no",
+                    "rsync", "-avP", "--no-perms", "--timeout=120",
+                    "-e", ssh_opts,
                     str(local_path),
                     f"{self._username}@{self._host}:{remote_dir}/",
                 ]

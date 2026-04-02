@@ -15,13 +15,14 @@ import subprocess
 import zipfile
 import queue
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 from datetime import datetime
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import text as sa_text
 
 from .config import settings
-from .db import init_db, get_db, get_session, Case, Slide, Tag, Project, Cohort, CohortFlag, CohortPatient, CohortPatientCase, Analysis, AnalysisJob, JobSlide, RequestSheet, RequestRow, init_lock, get_lock
+from .db import init_db, get_db, get_session, Case, Slide, Tag, Project, Cohort, CohortFlag, CohortPatient, CohortPatientCase, Analysis, AnalysisJob, JobSlide, RequestSheet, RequestRow, Study, StudyGroup, init_lock, get_lock, Patient, ExternalMapping, generate_slidecap_id
 from .services import SlideHasher, SlideIndexer, ClusterService, JobStatusPoller
 
 
@@ -287,6 +288,140 @@ def refresh_cache():
 
     count = indexer.build_path_cache()
     return {"cached_slides": count}
+
+
+@app.get("/index/ghost-slides")
+def list_ghost_slides(db: Session = Depends(get_db)):
+    """
+    List slide records in the DB whose files no longer exist on disk.
+
+    These are orphaned records — typically caused by filename changes,
+    parser updates, or deleted files. Shows what would be removed by
+    POST /index/cleanup.
+    """
+    if not indexer:
+        raise HTTPException(status_code=503, detail="Indexer not initialized")
+
+    all_slides = db.query(Slide).options(
+        joinedload(Slide.case),
+        joinedload(Slide.tags),
+        joinedload(Slide.job_slides),
+    ).all()
+
+    ghosts = []
+    for slide in all_slides:
+        if slide.slide_hash not in indexer.slide_hash_to_path:
+            has_jobs = any(js.status in ("running", "transferring", "pending") for js in slide.job_slides)
+            ghosts.append({
+                "slidecap_id": slide.slidecap_id,
+                "slide_hash": slide.slide_hash[:16] + "...",
+                "block_id": slide.block_id,
+                "stain_type": slide.stain_type,
+                "case_slidecap_id": slide.case.slidecap_id if slide.case else None,
+                "case_year": slide.case.year if slide.case else None,
+                "tag_count": len(slide.tags),
+                "tags": [t.name for t in slide.tags],
+                "job_count": len(slide.job_slides),
+                "has_active_jobs": has_jobs,
+                "completed_analyses": [
+                    js.job.model_name for js in slide.job_slides
+                    if js.status == "completed" and js.job
+                ],
+            })
+
+    # Group by case for readability
+    by_case: dict[str, list] = {}
+    for g in ghosts:
+        key = g["case_slidecap_id"] or "unknown"
+        by_case.setdefault(key, []).append(g)
+
+    return {
+        "ghost_count": len(ghosts),
+        "total_slides_in_db": len(all_slides),
+        "cached_slides": len(indexer.slide_hash_to_path),
+        "by_case": {
+            case_id: {
+                "year": slides[0]["case_year"],
+                "ghost_slides": slides,
+            }
+            for case_id, slides in sorted(by_case.items())
+        },
+    }
+
+
+@app.post("/index/cleanup")
+def cleanup_ghost_slides(
+    dry_run: bool = Query(True, description="If true, only report what would be deleted. Set to false to actually delete."),
+    db: Session = Depends(get_db),
+):
+    """
+    Remove slide records from the DB whose files no longer exist on disk.
+
+    Skips slides that have active (running/pending/transferring) analysis jobs.
+    Also removes empty cases (cases with no remaining slides after cleanup).
+
+    Use dry_run=true (default) to preview, dry_run=false to execute.
+    """
+    if not indexer:
+        raise HTTPException(status_code=503, detail="Indexer not initialized")
+
+    all_slides = db.query(Slide).options(
+        joinedload(Slide.case),
+        joinedload(Slide.job_slides),
+    ).all()
+
+    to_delete = []
+    skipped = []
+    for slide in all_slides:
+        if slide.slide_hash in indexer.slide_hash_to_path:
+            continue  # File exists, keep it
+
+        has_active = any(js.status in ("running", "transferring", "pending") for js in slide.job_slides)
+        if has_active:
+            skipped.append({
+                "slidecap_id": slide.slidecap_id,
+                "reason": "has active analysis jobs",
+            })
+            continue
+
+        to_delete.append(slide)
+
+    # Find cases that would become empty
+    case_slide_counts: dict[int, int] = {}
+    for slide in all_slides:
+        case_slide_counts[slide.case_id] = case_slide_counts.get(slide.case_id, 0) + 1
+    for slide in to_delete:
+        case_slide_counts[slide.case_id] -= 1
+
+    empty_case_ids = [cid for cid, count in case_slide_counts.items() if count <= 0]
+    empty_cases = db.query(Case).filter(Case.id.in_(empty_case_ids)).all() if empty_case_ids else []
+
+    result = {
+        "dry_run": dry_run,
+        "slides_to_remove": len(to_delete),
+        "slides_skipped": skipped,
+        "cases_to_remove": len(empty_cases),
+        "removed_slides": [
+            {"slidecap_id": s.slidecap_id, "block_id": s.block_id, "stain_type": s.stain_type}
+            for s in to_delete
+        ],
+        "removed_cases": [
+            {"slidecap_id": c.slidecap_id, "year": c.year}
+            for c in empty_cases
+        ],
+    }
+
+    if not dry_run:
+        for slide in to_delete:
+            db.delete(slide)
+        for case in empty_cases:
+            db.delete(case)
+        db.flush()
+        result["status"] = "deleted"
+    else:
+        result["status"] = "dry_run — POST with dry_run=false to execute"
+
+    return result
 
 
 # ============================================================
@@ -1664,6 +1799,69 @@ def export_cohort(cohort_id: int, db: Session = Depends(get_db)):
     )
 
 
+class SlidePullRequest(BaseModel):
+    slide_hashes: List[str]
+
+
+@app.post("/slides/pull-download")
+def pull_download(data: SlidePullRequest):
+    """Stream a ZIP of selected slides, organized by accession number."""
+    if not indexer:
+        raise HTTPException(status_code=503, detail="Indexer not initialized")
+
+    if not data.slide_hashes:
+        raise HTTPException(status_code=400, detail="No slides requested")
+
+    # Gather (filesystem_path, archive_name) pairs, skip missing files
+    slides_info: list[tuple[str, str]] = []
+    for slide_hash in data.slide_hashes:
+        filepath = indexer.get_filepath(slide_hash)
+        if not filepath or not filepath.exists():
+            continue
+        parsed = indexer.parser.parse(filepath.name)
+        folder = parsed.accession if parsed else slide_hash[:12]
+        arcname = f"{folder}/{filepath.name}"
+        slides_info.append((str(filepath), arcname))
+
+    if not slides_info:
+        raise HTTPException(status_code=404, detail="No slide files available for download")
+
+    def generate():
+        q: queue.Queue = queue.Queue(maxsize=32)
+
+        def writer():
+            try:
+                stream = _ZipStreamWriter(q)
+                with zipfile.ZipFile(stream, 'w', zipfile.ZIP_STORED, allowZip64=True) as zf:
+                    for filepath, arcname in slides_info:
+                        zf.write(filepath, arcname)
+                stream.flush()
+            except Exception as e:
+                print(f"WSI Pull ZIP error: {e}")
+            finally:
+                q.put(None)
+
+        t = threading.Thread(target=writer, daemon=True)
+        t.start()
+
+        while True:
+            chunk = q.get()
+            if chunk is None:
+                break
+            yield chunk
+
+        t.join(timeout=5)
+
+    timestamp = datetime.now().strftime("%Y-%m-%d")
+    return StreamingResponse(
+        generate(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="slide-pull-{timestamp}.zip"',
+        },
+    )
+
+
 @app.post("/cohorts/{cohort_id}/export-analyses")
 def export_cohort_analyses(
     cohort_id: int,
@@ -2310,6 +2508,7 @@ def submit_jobs(data: JobSubmitRequest, db: Session = Depends(get_db)):
 
     # --- Phase 1: Create all DB records and commit (fast, releases DB) ---
     job = AnalysisJob(
+        slidecap_id=generate_slidecap_id(db, "JB"),
         analysis_id=analysis.id,
         model_name=analysis.name,
         model_version=analysis.version,
@@ -2409,25 +2608,33 @@ def submit_jobs(data: JobSubmitRequest, db: Session = Depends(get_db)):
         finally:
             bg_db.close()
 
-        # Rsync each slide — no DB session held during transfer
+        # Rsync slides in parallel — no DB session held during transfer
         transfer_ok: list[int] = []   # js_ids that rsynced successfully
         transfer_errors: dict[int, str] = {}  # js_id -> error message
 
-        for i, (js_id, _slide_hash, local_path_str, _remote_wsi_path) in enumerate(slides_to_process):
+        def _transfer_one(args):
+            idx, js_id, local_path_str = args
             local_path = Path(local_path_str)
             if not local_path.exists():
-                transfer_errors[js_id] = f"Local file not found: {local_path}"
-                continue
+                return js_id, f"Local file not found: {local_path}"
             try:
                 mb = local_path.stat().st_size / 1e6
-                print(f"[Job {job_id}/Transfer {i+1}/{n}] Rsyncing {local_path.name} ({mb:.0f} MB)")
+                print(f"[Job {job_id}/Transfer {idx+1}/{n}] Rsyncing {local_path.name} ({mb:.0f} MB)")
                 cluster_service.rsync_slide(local_path, remote_wsi_batch_dir)
-                print(f"[Job {job_id}/Transfer {i+1}/{n}] Done: {local_path.name}")
-                transfer_ok.append(js_id)
+                print(f"[Job {job_id}/Transfer {idx+1}/{n}] Done: {local_path.name}")
+                return js_id, None
             except Exception as e:
                 import traceback
                 traceback.print_exc()
-                transfer_errors[js_id] = f"Transfer failed: {e}"
+                return js_id, f"Transfer failed: {e}"
+
+        work = [(i, js_id, lp) for i, (js_id, _sh, lp, _rp) in enumerate(slides_to_process)]
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            for js_id, error in pool.map(_transfer_one, work):
+                if error:
+                    transfer_errors[js_id] = error
+                else:
+                    transfer_ok.append(js_id)
 
         # Commit rsync failures immediately so they show up
         if transfer_errors:
@@ -2993,11 +3200,11 @@ def retry_job(job_id: int, db: Session = Depends(get_db)):
         transfer_ok: list[int] = []
         transfer_errors: dict[int, str] = {}
 
-        for i, (js_id, _slide_hash, local_path_str, _remote) in enumerate(slides_to_process):
+        def _retry_one(args):
+            idx, js_id, local_path_str = args
             local_path = Path(local_path_str)
             if not local_path.exists():
-                transfer_errors[js_id] = f"Local file not found: {local_path}"
-                continue
+                return js_id, f"Local file not found: {local_path}"
             try:
                 local_size = local_path.stat().st_size
                 remote_path = f"{remote_wsi_batch_dir}/{local_path.name}"
@@ -3005,17 +3212,24 @@ def retry_job(job_id: int, db: Session = Depends(get_db)):
                     f"stat -c%s '{remote_path}' 2>/dev/null"
                 )
                 if rc == 0 and stdout.strip().isdigit() and int(stdout.strip()) == local_size:
-                    print(f"[Job {job_id}/Retry {i+1}/{n}] Already on cluster: {local_path.name} — skipping")
-                    transfer_ok.append(js_id)
-                    continue
+                    print(f"[Job {job_id}/Retry {idx+1}/{n}] Already on cluster: {local_path.name} — skipping")
+                    return js_id, None
                 mb = local_size / 1e6
-                print(f"[Job {job_id}/Retry {i+1}/{n}] Rsyncing {local_path.name} ({mb:.0f} MB)")
+                print(f"[Job {job_id}/Retry {idx+1}/{n}] Rsyncing {local_path.name} ({mb:.0f} MB)")
                 cluster_service.rsync_slide(local_path, remote_wsi_batch_dir)
-                print(f"[Job {job_id}/Retry {i+1}/{n}] Done: {local_path.name}")
-                transfer_ok.append(js_id)
+                print(f"[Job {job_id}/Retry {idx+1}/{n}] Done: {local_path.name}")
+                return js_id, None
             except Exception as e:
                 import traceback; traceback.print_exc()
-                transfer_errors[js_id] = f"Transfer failed: {e}"
+                return js_id, f"Transfer failed: {e}"
+
+        retry_work = [(i, js_id, lp) for i, (js_id, _sh, lp, _rp) in enumerate(slides_to_process)]
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            for js_id, error in pool.map(_retry_one, retry_work):
+                if error:
+                    transfer_errors[js_id] = error
+                else:
+                    transfer_ok.append(js_id)
 
         if transfer_errors:
             bg_db = get_session()
@@ -4657,6 +4871,61 @@ def list_request_sheets(db: Session = Depends(get_db)):
     } for s in sheets]
 
 
+@app.get("/request-sheets/case-warnings")
+def case_warnings(
+    accession: str = Query(...),
+    sheet_id: int = Query(...),
+    db: Session = Depends(get_db),
+):
+    """
+    Check if a case (by accession number) already has slides in the database
+    and/or appears in other request sheets.
+    """
+    warnings: list[dict] = []
+
+    # 1. Check if slides already exist in the database for this accession
+    if indexer:
+        results = indexer.search(db, query=accession, limit=50)
+        exact = [r for r in results if _normalize_accession(r.get('accession_number', '')) == _normalize_accession(accession)]
+        if exact:
+            stains = {}
+            for s in exact:
+                st = s.get('stain_type', 'Unknown')
+                stains[st] = stains.get(st, 0) + 1
+            warnings.append({
+                "type": "already_scanned",
+                "message": f"{len(exact)} slide(s) already in database",
+                "slide_count": len(exact),
+                "stain_breakdown": stains,
+            })
+
+    # 2. Check if this accession appears in other request sheets
+    normalized = _normalize_accession(accession)
+    other_rows = (
+        db.query(RequestRow)
+        .join(RequestSheet)
+        .filter(RequestRow.accession_number == normalized)
+        .filter(RequestRow.sheet_id != sheet_id)
+        .all()
+    )
+    if other_rows:
+        sheets_info = []
+        for r in other_rows:
+            sheet = db.query(RequestSheet).filter_by(id=r.sheet_id).first()
+            sheets_info.append({
+                "sheet_id": r.sheet_id,
+                "sheet_name": sheet.name if sheet else f"Sheet #{r.sheet_id}",
+                "case_status": r.case_status,
+            })
+        warnings.append({
+            "type": "duplicate_request",
+            "message": f"Also in {len(sheets_info)} other sheet(s)",
+            "sheets": sheets_info,
+        })
+
+    return {"warnings": warnings}
+
+
 @app.post("/request-sheets")
 def create_request_sheet(req: RequestSheetCreate, db: Session = Depends(get_db)):
     sheet = RequestSheet(name=req.name, description=req.description, created_by=req.created_by)
@@ -4857,6 +5126,953 @@ def export_request_sheet_csv(sheet_id: int, db: Session = Depends(get_db)):
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename={sheet.name.replace(' ', '_')}_requests.csv"},
     )
+
+
+@app.post("/request-sheets/{sheet_id}/import-csv")
+async def import_request_sheet_csv(
+    sheet_id: int,
+    file: UploadFile = File(...),
+    mode: str = Query("skip", pattern="^(skip|upsert)$"),
+    db: Session = Depends(get_db),
+):
+    """
+    Import rows from a CSV or XLSX file into a request sheet.
+    mode=skip (default): rows whose accession already exists are skipped.
+    mode=upsert: existing rows are updated with non-empty CSV values; new rows are inserted.
+    Returns {added, updated, skipped, errors}.
+    """
+    sheet = db.query(RequestSheet).filter_by(id=sheet_id).first()
+    if not sheet:
+        raise HTTPException(404, "Sheet not found")
+
+    content = await file.read()
+    if content.startswith(b'\xef\xbb\xbf'):
+        content = content[3:]
+    filename = file.filename or ""
+
+    rows: list[dict] = []
+    if filename.lower().endswith('.xlsx'):
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(BytesIO(content), read_only=True)
+            ws = wb.active
+            headers = None
+            for row in ws.iter_rows(values_only=True):
+                cells = [str(c).strip() if c is not None else "" for c in row]
+                if headers is None:
+                    headers = [h.lower() for h in cells]
+                else:
+                    if any(cells):
+                        rows.append(dict(zip(headers, cells)))
+        except ImportError:
+            raise HTTPException(400, "openpyxl not installed — Excel import unavailable")
+    else:
+        text = content.decode('utf-8', errors='replace')
+        reader = csv.DictReader(io.StringIO(text))
+        for row in reader:
+            rows.append({k.lower().strip(): (v or "").strip() for k, v in row.items()})
+
+    if not rows:
+        raise HTTPException(400, "File is empty or could not be parsed")
+
+    COL_MAP: dict[str, str] = {
+        "accession number": "accession_number",
+        "case status": "case_status",
+        "all blocks": "all_blocks",
+        "blocks available": "blocks_available",
+        "order id": "order_id",
+        "consult?": "is_consult",
+        "blocks h&es requested": "blocks_hes_requested",
+        "h&es requested": "hes_requested",
+        "non h&es requested": "non_hes_requested",
+        "ihc stains requested": "ihc_stains_requested",
+        "block h&es received": "block_hes_received",
+        "h&es received": "hes_received",
+        "unaccounted blocks": "unaccounted_blocks",
+        "non h&es received": "non_hes_received",
+        "fs received": "fs_received",
+        "uss received": "uss_received",
+        "ihc received": "ihc_received",
+        "ihc stains received": "ihc_stains_received",
+        "recut blocks": "recut_blocks",
+        "recut status": "recut_status",
+        "h&es scanned?": "hes_scanned",
+        "h&e scanning status": "he_scanning_status",
+        "non h&es scanned?": "non_hes_scanned",
+        "slide location": "slide_location",
+        "notes": "notes",
+        "accession": "accession_number",
+        "accession #": "accession_number",
+        "status": "case_status",
+    }
+    INT_FIELDS = {"hes_requested", "non_hes_requested", "hes_received", "non_hes_received",
+                  "fs_received", "uss_received", "ihc_received"}
+
+    existing_rows: dict[str, RequestRow] = {
+        r.accession_number: r
+        for r in db.query(RequestRow).filter_by(sheet_id=sheet_id).all()
+    }
+
+    added = 0
+    updated = 0
+    skipped = 0
+    errors: list[str] = []
+
+    def _coerce(field: str, val: str):
+        if field == "is_consult":
+            return val.lower() in ("yes", "true", "1")
+        if field in INT_FIELDS:
+            try:
+                return int(float(val)) if val else 0
+            except (ValueError, TypeError):
+                return 0
+        return val
+
+    for i, raw in enumerate(rows, start=2):
+        mapped: dict = {}
+        for raw_key, val in raw.items():
+            field = COL_MAP.get(raw_key.lower().strip())
+            if field and val != "":
+                mapped[field] = val
+
+        accession = mapped.get("accession_number", "").strip()
+        if not accession:
+            errors.append(f"Row {i}: missing accession number — skipped")
+            continue
+
+        accession = _normalize_accession(accession)
+
+        if accession in existing_rows:
+            if mode == "upsert":
+                row = existing_rows[accession]
+                for field, val in mapped.items():
+                    if field == "accession_number":
+                        continue
+                    setattr(row, field, _coerce(field, val))
+                updated += 1
+            else:
+                skipped += 1
+            continue
+
+        kwargs: dict = {"sheet_id": sheet_id, "accession_number": accession}
+        for field, val in mapped.items():
+            if field == "accession_number":
+                continue
+            kwargs[field] = _coerce(field, val)
+
+        if "case_status" not in kwargs:
+            kwargs["case_status"] = "Not Started"
+
+        new_row = RequestRow(**kwargs)
+        db.add(new_row)
+        existing_rows[accession] = new_row
+        added += 1
+
+    sheet.updated_at = datetime.utcnow()
+    db.commit()
+    return {"added": added, "updated": updated, "skipped": skipped, "errors": errors}
+
+
+# ============================================================
+# Study endpoints
+# ============================================================
+
+class StudyCreate(BaseModel):
+    name: str
+    description: str = ''
+    folder_name: str  # Will create slides/studies/{folder_name} on disk
+    created_by: str = ''
+
+class StudyGroupCreate(BaseModel):
+    name: str
+    label: str = ''
+    color: str = ''
+    note: str = ''
+    parent_id: int | None = None
+    sort_order: int = 0
+
+class StudyGroupUpdate(BaseModel):
+    name: str | None = None
+    label: str | None = None
+    color: str | None = None
+    note: str | None = None
+    parent_id: int | None = None
+    sort_order: int | None = None
+
+
+def _serialize_study(study, include_groups=False, include_slides=False):
+    d = {
+        'id': study.id,
+        'name': study.name,
+        'description': study.description,
+        'folder_name': study.folder_name,
+        'created_by': study.created_by,
+        'created_at': study.created_at.isoformat() if study.created_at else None,
+        'updated_at': study.updated_at.isoformat() if study.updated_at else None,
+        'slide_count': study.slide_count,
+        'group_count': study.group_count,
+        'folder_path': str(settings.slides_path / 'studies' / study.folder_name),
+    }
+    if include_groups:
+        d['groups'] = [_serialize_study_group(g) for g in study.groups]
+    if include_slides:
+        d['slides'] = [_serialize_study_slide(s) for s in study.slides]
+    return d
+
+
+def _serialize_study_slide(slide):
+    """Serialize a slide for study context, including resolved accession if clinical."""
+    d = {
+        'id': slide.id,
+        'slide_hash': slide.slide_hash,
+        'block_id': slide.block_id,
+        'stain_type': slide.stain_type,
+        'random_id': slide.random_id,
+        'file_size_bytes': slide.file_size_bytes,
+        'file_exists': bool(slide.file_exists),
+    }
+    # Try to resolve accession from indexer
+    if indexer:
+        fp = indexer.get_filepath(slide.slide_hash)
+        if fp:
+            parsed = indexer.parser.parse(fp.name)
+            if parsed:
+                d['accession_number'] = parsed.accession
+                d['slide_number'] = parsed.slide_number
+                d['year'] = parsed.year
+            d['file_path'] = str(fp)
+    return d
+
+
+def _serialize_study_group(group):
+    return {
+        'id': group.id,
+        'study_id': group.study_id,
+        'parent_id': group.parent_id,
+        'name': group.name,
+        'label': group.label,
+        'color': group.color,
+        'note': group.note,
+        'sort_order': group.sort_order,
+        'slide_count': len(group.slides),
+        'slide_hashes': [s.slide_hash for s in group.slides],
+        'children': [_serialize_study_group(c) for c in group.children] if group.children else [],
+    }
+
+
+@app.get("/studies")
+def list_studies(db: Session = Depends(get_db)):
+    studies = db.query(Study).order_by(Study.updated_at.desc()).all()
+    return [_serialize_study(s) for s in studies]
+
+
+@app.post("/studies")
+def create_study(data: StudyCreate, db: Session = Depends(get_db)):
+    # Sanitize folder name
+    safe_folder = data.folder_name.strip().replace(' ', '_')
+    safe_folder = ''.join(c for c in safe_folder if c.isalnum() or c in '-_')
+    if not safe_folder:
+        raise HTTPException(status_code=400, detail="Invalid folder name")
+
+    # Check for duplicate folder name
+    existing = db.query(Study).filter_by(folder_name=safe_folder).first()
+    if existing:
+        raise HTTPException(status_code=409, detail=f"Study folder '{safe_folder}' already exists")
+
+    # Create folder on disk
+    study_dir = settings.slides_path / 'studies' / safe_folder
+    try:
+        study_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not create folder: {e}")
+
+    study = Study(
+        name=data.name,
+        description=data.description,
+        folder_name=safe_folder,
+        created_by=data.created_by,
+    )
+    db.add(study)
+    db.flush()
+    return _serialize_study(study)
+
+
+@app.get("/studies/{study_id}")
+def get_study(study_id: int, db: Session = Depends(get_db)):
+    study = db.query(Study).filter_by(id=study_id).first()
+    if not study:
+        raise HTTPException(status_code=404, detail="Study not found")
+    return _serialize_study(study, include_groups=True, include_slides=True)
+
+
+@app.put("/studies/{study_id}")
+def update_study(study_id: int, data: StudyCreate, db: Session = Depends(get_db)):
+    study = db.query(Study).filter_by(id=study_id).first()
+    if not study:
+        raise HTTPException(status_code=404, detail="Study not found")
+    study.name = data.name
+    study.description = data.description
+    db.flush()
+    return _serialize_study(study)
+
+
+@app.delete("/studies/{study_id}")
+def delete_study(study_id: int, db: Session = Depends(get_db)):
+    study = db.query(Study).filter_by(id=study_id).first()
+    if not study:
+        raise HTTPException(status_code=404, detail="Study not found")
+    db.delete(study)
+    return {"ok": True}
+
+
+@app.post("/studies/{study_id}/slides")
+def add_slides_to_study(study_id: int, data: dict, db: Session = Depends(get_db)):
+    """Add slides to a study by slide_hash list."""
+    study = db.query(Study).filter_by(id=study_id).first()
+    if not study:
+        raise HTTPException(status_code=404, detail="Study not found")
+
+    hashes = data.get('slide_hashes', [])
+    existing_hashes = {s.slide_hash for s in study.slides}
+    added = 0
+    for h in hashes:
+        if h in existing_hashes:
+            continue
+        slide = db.query(Slide).filter_by(slide_hash=h).first()
+        if slide:
+            study.slides.append(slide)
+            existing_hashes.add(h)
+            added += 1
+    db.flush()
+    return {"added": added, "total": len(study.slides)}
+
+
+@app.delete("/studies/{study_id}/slides")
+def remove_slides_from_study(study_id: int, data: dict, db: Session = Depends(get_db)):
+    """Remove slides from a study by slide_hash list."""
+    study = db.query(Study).filter_by(id=study_id).first()
+    if not study:
+        raise HTTPException(status_code=404, detail="Study not found")
+
+    hashes = set(data.get('slide_hashes', []))
+    study.slides = [s for s in study.slides if s.slide_hash not in hashes]
+    db.flush()
+    return {"ok": True, "total": len(study.slides)}
+
+
+# ── Study Group endpoints ─────────────────────────────────────
+
+@app.post("/studies/{study_id}/groups")
+def create_study_group(study_id: int, data: StudyGroupCreate, db: Session = Depends(get_db)):
+    study = db.query(Study).filter_by(id=study_id).first()
+    if not study:
+        raise HTTPException(status_code=404, detail="Study not found")
+
+    group = StudyGroup(
+        study_id=study_id,
+        name=data.name,
+        label=data.label or None,
+        color=data.color or None,
+        note=data.note or None,
+        parent_id=data.parent_id,
+        sort_order=data.sort_order,
+    )
+    db.add(group)
+    db.flush()
+    return _serialize_study_group(group)
+
+
+@app.put("/studies/{study_id}/groups/{group_id}")
+def update_study_group(study_id: int, group_id: int, data: StudyGroupUpdate, db: Session = Depends(get_db)):
+    group = db.query(StudyGroup).filter_by(id=group_id, study_id=study_id).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+
+    for key, val in data.dict(exclude_unset=True).items():
+        setattr(group, key, val)
+    db.flush()
+    return _serialize_study_group(group)
+
+
+@app.delete("/studies/{study_id}/groups/{group_id}")
+def delete_study_group(study_id: int, group_id: int, db: Session = Depends(get_db)):
+    group = db.query(StudyGroup).filter_by(id=group_id, study_id=study_id).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    db.delete(group)
+    return {"ok": True}
+
+
+@app.post("/studies/{study_id}/groups/{group_id}/slides")
+def add_slides_to_group(study_id: int, group_id: int, data: dict, db: Session = Depends(get_db)):
+    """Add slides to a group within a study."""
+    group = db.query(StudyGroup).filter_by(id=group_id, study_id=study_id).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+
+    hashes = data.get('slide_hashes', [])
+    existing_hashes = {s.slide_hash for s in group.slides}
+    added = 0
+    for h in hashes:
+        if h in existing_hashes:
+            continue
+        slide = db.query(Slide).filter_by(slide_hash=h).first()
+        if slide:
+            group.slides.append(slide)
+            existing_hashes.add(h)
+            added += 1
+    db.flush()
+    return {"added": added, "total": len(group.slides)}
+
+
+@app.delete("/studies/{study_id}/groups/{group_id}/slides")
+def remove_slides_from_group(study_id: int, group_id: int, data: dict, db: Session = Depends(get_db)):
+    group = db.query(StudyGroup).filter_by(id=group_id, study_id=study_id).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+
+    hashes = set(data.get('slide_hashes', []))
+    group.slides = [s for s in group.slides if s.slide_hash not in hashes]
+    db.flush()
+    return {"ok": True, "total": len(group.slides)}
+
+
+@app.get("/studies/{study_id}/unlinked-files")
+def get_unlinked_files(study_id: int, db: Session = Depends(get_db)):
+    """List files in the study folder that aren't in the database."""
+    study = db.query(Study).filter_by(id=study_id).first()
+    if not study:
+        raise HTTPException(status_code=404, detail="Study not found")
+
+    study_dir = settings.slides_path / 'studies' / study.folder_name
+    if not study_dir.exists():
+        return {"files": []}
+
+    linked_hashes = {s.slide_hash for s in study.slides}
+    unlinked = []
+    for f in study_dir.iterdir():
+        if f.is_file() and f.suffix.lower() in ('.svs', '.tif', '.tiff', '.ndpi', '.mrxs'):
+            unlinked.append({
+                'filename': f.name,
+                'file_size_bytes': f.stat().st_size,
+                'extension': f.suffix.lower(),
+            })
+
+    return {"files": unlinked, "folder_path": str(study_dir)}
+
+
+# ============================================================
+# Patient Management & SlideCap ID System
+# ============================================================
+
+
+class PatientCreateRequest(BaseModel):
+    note: Optional[str] = None
+
+
+class PatientUpdateRequest(BaseModel):
+    note: Optional[str] = None
+
+
+class AssignCasesRequest(BaseModel):
+    case_hashes: List[str]  # accession_hashes to assign to this patient
+
+
+class ExternalMappingRequest(BaseModel):
+    external_system: str       # "redcap", "epic", etc.
+    external_project: Optional[str] = None  # REDCap project name
+    external_id: str           # The trial/subject ID
+
+
+class BulkPatientImportRow(BaseModel):
+    accession_number: str      # Raw accession (will be hashed for lookup)
+    patient_label: Optional[str] = None  # If provided, group by this label
+    external_system: Optional[str] = None
+    external_project: Optional[str] = None
+    external_id: Optional[str] = None
+
+
+class BulkPatientImportRequest(BaseModel):
+    rows: List[BulkPatientImportRow]
+
+
+# --- Patient CRUD ---
+
+@app.get("/patients")
+def list_patients(db: Session = Depends(get_db)):
+    """List all patients with case/slide counts and external mappings."""
+    patients = db.query(Patient).options(
+        joinedload(Patient.cases).joinedload(Case.slides),
+        joinedload(Patient.external_mappings),
+    ).all()
+
+    return [{
+        "id": p.id,
+        "slidecap_id": p.slidecap_id,
+        "note": p.note,
+        "case_count": p.case_count,
+        "slide_count": p.slide_count,
+        "cases": [{
+            "slidecap_id": c.slidecap_id,
+            "accession_hash": c.accession_hash[:12] + "...",
+            "year": c.year,
+            "slide_count": len(c.slides),
+        } for c in p.cases],
+        "external_mappings": [{
+            "id": m.id,
+            "system": m.external_system,
+            "project": m.external_project,
+            "external_id": m.external_id,
+        } for m in p.external_mappings],
+        "created_at": p.created_at.isoformat() if p.created_at else None,
+    } for p in patients]
+
+
+@app.post("/patients")
+def create_patient(data: PatientCreateRequest, db: Session = Depends(get_db)):
+    """Create a new patient. Auto-assigns PT ID."""
+    patient = Patient(
+        slidecap_id=generate_slidecap_id(db, "PT"),
+        note=data.note,
+    )
+    db.add(patient)
+    db.flush()
+    return {
+        "id": patient.id,
+        "slidecap_id": patient.slidecap_id,
+        "note": patient.note,
+    }
+
+
+@app.get("/patients/{patient_sid}")
+def get_patient(patient_sid: str, db: Session = Depends(get_db)):
+    """
+    Get full patient hierarchy: patient → cases → slides → analysis results.
+    Accepts SlideCap ID (PT00001) or numeric DB id.
+    """
+    patient = _resolve_patient(db, patient_sid)
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
+    cases_out = []
+    for case in patient.cases:
+        slides_out = []
+        for slide in case.slides:
+            # Get analysis results for this slide
+            analyses_out = []
+            for js in slide.job_slides:
+                if js.job:
+                    analyses_out.append({
+                        "job_slidecap_id": js.job.slidecap_id,
+                        "model_name": js.job.model_name,
+                        "status": js.status,
+                        "completed_at": js.completed_at.isoformat() if js.completed_at else None,
+                    })
+            slides_out.append({
+                "slidecap_id": slide.slidecap_id,
+                "slide_hash": slide.slide_hash,
+                "block_id": slide.block_id,
+                "stain_type": slide.stain_type,
+                "file_size_bytes": slide.file_size_bytes,
+                "tags": [t.name for t in slide.tags],
+                "analyses": analyses_out,
+            })
+        cases_out.append({
+            "slidecap_id": case.slidecap_id,
+            "accession_hash": case.accession_hash[:12] + "...",
+            "year": case.year,
+            "tags": [t.name for t in case.tags],
+            "slides": slides_out,
+        })
+
+    return {
+        "id": patient.id,
+        "slidecap_id": patient.slidecap_id,
+        "note": patient.note,
+        "external_mappings": [{
+            "id": m.id,
+            "system": m.external_system,
+            "project": m.external_project,
+            "external_id": m.external_id,
+        } for m in patient.external_mappings],
+        "cases": cases_out,
+        "created_at": patient.created_at.isoformat() if patient.created_at else None,
+    }
+
+
+@app.patch("/patients/{patient_sid}")
+def update_patient(patient_sid: str, data: PatientUpdateRequest, db: Session = Depends(get_db)):
+    """Update patient note."""
+    patient = _resolve_patient(db, patient_sid)
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+    if data.note is not None:
+        patient.note = data.note
+    return {"slidecap_id": patient.slidecap_id, "note": patient.note}
+
+
+@app.delete("/patients/{patient_sid}")
+def delete_patient(patient_sid: str, db: Session = Depends(get_db)):
+    """Delete a patient. Cases are unlinked (not deleted)."""
+    patient = _resolve_patient(db, patient_sid)
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+    # Unlink cases before deleting patient
+    for case in patient.cases:
+        case.patient_id = None
+    db.delete(patient)
+    return {"deleted": patient.slidecap_id}
+
+
+# --- Case ↔ Patient Assignment ---
+
+@app.post("/patients/{patient_sid}/cases")
+def assign_cases_to_patient(patient_sid: str, data: AssignCasesRequest, db: Session = Depends(get_db)):
+    """
+    Assign cases (by accession_hash) to a patient.
+    Cases already assigned to another patient will be reassigned.
+    """
+    patient = _resolve_patient(db, patient_sid)
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
+    assigned = []
+    not_found = []
+    for case_hash in data.case_hashes:
+        case = db.query(Case).filter_by(accession_hash=case_hash).first()
+        if not case:
+            not_found.append(case_hash[:12])
+            continue
+        case.patient_id = patient.id
+        assigned.append(case.slidecap_id)
+
+    return {
+        "patient": patient.slidecap_id,
+        "assigned": assigned,
+        "not_found": not_found,
+    }
+
+
+@app.delete("/patients/{patient_sid}/cases/{case_sid}")
+def unassign_case_from_patient(patient_sid: str, case_sid: str, db: Session = Depends(get_db)):
+    """Remove a case from a patient (unlink, not delete)."""
+    patient = _resolve_patient(db, patient_sid)
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+    case = _resolve_case(db, case_sid)
+    if not case or case.patient_id != patient.id:
+        raise HTTPException(status_code=404, detail="Case not found on this patient")
+    case.patient_id = None
+    return {"unassigned": case.slidecap_id, "from_patient": patient.slidecap_id}
+
+
+# --- External Mappings (REDCap Integration) ---
+
+@app.post("/patients/{patient_sid}/mappings")
+def add_external_mapping(patient_sid: str, data: ExternalMappingRequest, db: Session = Depends(get_db)):
+    """Add an external system mapping (e.g., REDCap trial ID) to a patient."""
+    patient = _resolve_patient(db, patient_sid)
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
+    # Check for duplicate
+    existing = db.query(ExternalMapping).filter_by(
+        external_system=data.external_system,
+        external_project=data.external_project,
+        external_id=data.external_id,
+    ).first()
+    if existing:
+        if existing.patient_id == patient.id:
+            return {"message": "Mapping already exists", "id": existing.id}
+        raise HTTPException(status_code=409,
+                            detail=f"External ID already mapped to {existing.patient.slidecap_id}")
+
+    mapping = ExternalMapping(
+        patient_id=patient.id,
+        external_system=data.external_system,
+        external_project=data.external_project,
+        external_id=data.external_id,
+    )
+    db.add(mapping)
+    db.flush()
+    return {
+        "id": mapping.id,
+        "patient": patient.slidecap_id,
+        "system": mapping.external_system,
+        "project": mapping.external_project,
+        "external_id": mapping.external_id,
+    }
+
+
+@app.delete("/patients/{patient_sid}/mappings/{mapping_id}")
+def remove_external_mapping(patient_sid: str, mapping_id: int, db: Session = Depends(get_db)):
+    """Remove an external mapping from a patient."""
+    patient = _resolve_patient(db, patient_sid)
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+    mapping = db.query(ExternalMapping).filter_by(id=mapping_id, patient_id=patient.id).first()
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Mapping not found")
+    db.delete(mapping)
+    return {"deleted": mapping_id}
+
+
+@app.get("/mappings/lookup")
+def lookup_by_external_id(
+    system: str,
+    external_id: str,
+    project: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Reverse lookup: given a REDCap trial ID, find the SlideCap patient.
+    Returns full patient hierarchy.
+    """
+    q = db.query(ExternalMapping).filter_by(
+        external_system=system,
+        external_id=external_id,
+    )
+    if project:
+        q = q.filter_by(external_project=project)
+    mapping = q.first()
+    if not mapping:
+        raise HTTPException(status_code=404, detail="No mapping found for this external ID")
+
+    # Redirect to full patient view
+    return get_patient(mapping.patient.slidecap_id, db)
+
+
+# --- Bulk Import (CSV-friendly) ---
+
+@app.post("/patients/import")
+def bulk_import_patients(data: BulkPatientImportRequest, db: Session = Depends(get_db)):
+    """
+    Bulk import patient-case assignments and optional external mappings.
+
+    Workflow for scanning:
+    1. Scan slides → auto-creates CS/SL IDs
+    2. Upload CSV with columns: accession_number, patient_label, [external_system, external_id]
+    3. This endpoint groups cases by patient_label, creates Patient records, assigns cases,
+       and optionally creates external mappings.
+
+    If patient_label is omitted, each case gets its own new patient.
+    """
+    if not hasher:
+        raise HTTPException(status_code=503, detail="Hasher not initialized")
+
+    # Group rows by patient_label
+    label_groups: dict[str, list[BulkPatientImportRow]] = {}
+    for row in data.rows:
+        label = row.patient_label or f"_auto_{row.accession_number}"
+        label_groups.setdefault(label, []).append(row)
+
+    results = {
+        "patients_created": 0,
+        "cases_assigned": 0,
+        "mappings_created": 0,
+        "errors": [],
+    }
+
+    for label, rows in label_groups.items():
+        # Create patient
+        patient = Patient(
+            slidecap_id=generate_slidecap_id(db, "PT"),
+            note=f"Imported: {label}" if not label.startswith("_auto_") else None,
+        )
+        db.add(patient)
+        db.flush()
+        results["patients_created"] += 1
+
+        for row in rows:
+            # Find case by accession hash
+            acc_hash = hasher.hash_accession(row.accession_number)
+            case = db.query(Case).filter_by(accession_hash=acc_hash).first()
+            if not case:
+                results["errors"].append(f"Case not found for accession: {row.accession_number}")
+                continue
+            case.patient_id = patient.id
+            results["cases_assigned"] += 1
+
+            # Create external mapping if provided
+            if row.external_system and row.external_id:
+                existing = db.query(ExternalMapping).filter_by(
+                    external_system=row.external_system,
+                    external_project=row.external_project,
+                    external_id=row.external_id,
+                ).first()
+                if not existing:
+                    mapping = ExternalMapping(
+                        patient_id=patient.id,
+                        external_system=row.external_system,
+                        external_project=row.external_project,
+                        external_id=row.external_id,
+                    )
+                    db.add(mapping)
+                    results["mappings_created"] += 1
+
+    return results
+
+
+@app.post("/patients/import-csv")
+def import_patients_csv(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """
+    Import patient assignments from a CSV file.
+
+    Expected columns:
+    - accession_number (required): The raw accession number (e.g., "S24-12345")
+    - patient_label (optional): Group rows with the same label into one patient
+    - external_system (optional): e.g., "redcap"
+    - external_project (optional): e.g., "Melanoma Trial 2024"
+    - external_id (optional): e.g., "REC-0045"
+
+    Example CSV:
+        accession_number,patient_label,external_system,external_id
+        S24-12345,Patient_A,redcap,REC-0045
+        S24-12346,Patient_A,redcap,REC-0045
+        S24-99999,Patient_B,redcap,REC-0101
+    """
+    content = file.file.read().decode("utf-8-sig")
+    reader = csv.DictReader(io.StringIO(content))
+
+    rows = []
+    for row in reader:
+        if "accession_number" not in row:
+            raise HTTPException(status_code=400, detail="CSV must have 'accession_number' column")
+        rows.append(BulkPatientImportRow(
+            accession_number=row["accession_number"].strip(),
+            patient_label=row.get("patient_label", "").strip() or None,
+            external_system=row.get("external_system", "").strip() or None,
+            external_project=row.get("external_project", "").strip() or None,
+            external_id=row.get("external_id", "").strip() or None,
+        ))
+
+    return bulk_import_patients(BulkPatientImportRequest(rows=rows), db)
+
+
+# --- Unassigned Cases View ---
+
+@app.get("/cases/unassigned")
+def list_unassigned_cases(db: Session = Depends(get_db)):
+    """List cases that have no patient assigned. Useful after scanning new slides."""
+    cases = db.query(Case).filter(
+        Case.patient_id.is_(None)
+    ).options(
+        joinedload(Case.slides),
+    ).order_by(Case.year.desc(), Case.id.desc()).all()
+
+    return [{
+        "slidecap_id": c.slidecap_id,
+        "accession_hash": c.accession_hash[:12] + "...",
+        "year": c.year,
+        "slide_count": len(c.slides),
+        "slides": [{
+            "slidecap_id": s.slidecap_id,
+            "block_id": s.block_id,
+            "stain_type": s.stain_type,
+        } for s in c.slides],
+    } for c in cases]
+
+
+# --- SlideCap ID Lookup ---
+
+@app.get("/lookup/{slidecap_id}")
+def lookup_slidecap_id(slidecap_id: str, db: Session = Depends(get_db)):
+    """
+    Universal lookup: given any SlideCap ID (PT/CS/SL/JB), return the object
+    and its connections.
+    """
+    prefix = slidecap_id[:2].upper()
+    if prefix == "PT":
+        return get_patient(slidecap_id, db)
+    elif prefix == "CS":
+        case = db.query(Case).filter_by(slidecap_id=slidecap_id).options(
+            joinedload(Case.patient),
+            joinedload(Case.slides),
+            joinedload(Case.tags),
+        ).first()
+        if not case:
+            raise HTTPException(status_code=404, detail="Case not found")
+        return {
+            "type": "case",
+            "slidecap_id": case.slidecap_id,
+            "patient_id": case.patient.slidecap_id if case.patient else None,
+            "accession_hash": case.accession_hash[:12] + "...",
+            "year": case.year,
+            "tags": [t.name for t in case.tags],
+            "slides": [{
+                "slidecap_id": s.slidecap_id,
+                "block_id": s.block_id,
+                "stain_type": s.stain_type,
+            } for s in case.slides],
+        }
+    elif prefix == "SL":
+        slide = db.query(Slide).filter_by(slidecap_id=slidecap_id).options(
+            joinedload(Slide.case).joinedload(Case.patient),
+            joinedload(Slide.tags),
+            joinedload(Slide.job_slides).joinedload(JobSlide.job),
+        ).first()
+        if not slide:
+            raise HTTPException(status_code=404, detail="Slide not found")
+        return {
+            "type": "slide",
+            "slidecap_id": slide.slidecap_id,
+            "case_id": slide.case.slidecap_id if slide.case else None,
+            "patient_id": slide.case.patient.slidecap_id if slide.case and slide.case.patient else None,
+            "slide_hash": slide.slide_hash,
+            "block_id": slide.block_id,
+            "stain_type": slide.stain_type,
+            "tags": [t.name for t in slide.tags],
+            "analyses": [{
+                "job_slidecap_id": js.job.slidecap_id if js.job else None,
+                "model_name": js.job.model_name if js.job else None,
+                "status": js.status,
+            } for js in slide.job_slides],
+        }
+    elif prefix == "JB":
+        job = db.query(AnalysisJob).filter_by(slidecap_id=slidecap_id).options(
+            joinedload(AnalysisJob.slides).joinedload(JobSlide.slide),
+        ).first()
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return {
+            "type": "job",
+            "slidecap_id": job.slidecap_id,
+            "model_name": job.model_name,
+            "status": job.status,
+            "slides": [{
+                "slide_slidecap_id": js.slide.slidecap_id if js.slide else None,
+                "status": js.status,
+            } for js in job.slides],
+        }
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown SlideCap ID prefix: {prefix}")
+
+
+# --- Helper functions ---
+
+def _resolve_patient(db: Session, sid: str) -> Optional[Patient]:
+    """Resolve a patient by SlideCap ID (PT00001) or numeric DB id."""
+    if sid.upper().startswith("PT"):
+        return db.query(Patient).filter_by(slidecap_id=sid.upper()).options(
+            joinedload(Patient.cases).joinedload(Case.slides).joinedload(Slide.tags),
+            joinedload(Patient.cases).joinedload(Case.slides).joinedload(Slide.job_slides).joinedload(JobSlide.job),
+            joinedload(Patient.cases).joinedload(Case.tags),
+            joinedload(Patient.external_mappings),
+        ).first()
+    try:
+        return db.query(Patient).filter_by(id=int(sid)).options(
+            joinedload(Patient.cases).joinedload(Case.slides),
+            joinedload(Patient.external_mappings),
+        ).first()
+    except ValueError:
+        return None
+
+
+def _resolve_case(db: Session, sid: str) -> Optional[Case]:
+    """Resolve a case by SlideCap ID (CS00001) or accession_hash."""
+    if sid.upper().startswith("CS"):
+        return db.query(Case).filter_by(slidecap_id=sid.upper()).first()
+    return db.query(Case).filter_by(accession_hash=sid).first()
 
 
 # ============================================================

@@ -936,6 +936,9 @@ export function SlideLibrary() {
                   </TableCell>
                   <TableCell>
                     <CopyableText className="font-medium text-sm" mono={false} text={slide.accession_number} />
+                    {slide.slide_id && (
+                      <span className="block text-[10px] font-mono text-muted-foreground/60 mt-0.5">{slide.slide_id}</span>
+                    )}
                   </TableCell>
                   <TableCell className="text-sm">{slide.block_id}</TableCell>
                   <TableCell className="text-sm">{slide.slide_number}</TableCell>
@@ -1107,6 +1110,23 @@ export function SlideLibrary() {
                 <div className="col-span-2">
                   <label className="text-sm text-muted-foreground">File Path</label>
                   <CopyableText className="text-sm break-all" text={selectedSlide.file_path} />
+                </div>
+              )}
+              {/* SlideCap IDs */}
+              {(selectedSlide.slide_id || selectedSlide.case_id || selectedSlide.patient_id) && (
+                <div className="col-span-2 border-t pt-3">
+                  <label className="text-sm text-muted-foreground">SlideCap IDs</label>
+                  <div className="flex flex-wrap gap-3 mt-1">
+                    {selectedSlide.slide_id && (
+                      <CopyableText className="text-xs font-mono px-2 py-1 bg-muted rounded" text={selectedSlide.slide_id} />
+                    )}
+                    {selectedSlide.case_id && (
+                      <CopyableText className="text-xs font-mono px-2 py-1 bg-muted rounded" text={selectedSlide.case_id} />
+                    )}
+                    {selectedSlide.patient_id && (
+                      <CopyableText className="text-xs font-mono px-2 py-1 bg-blue-50 dark:bg-blue-950 rounded text-blue-700 dark:text-blue-300" text={selectedSlide.patient_id} />
+                    )}
+                  </div>
                 </div>
               )}
               {selectedSlide.slide_tags && selectedSlide.slide_tags.length > 0 && (
