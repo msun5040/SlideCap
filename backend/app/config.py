@@ -39,7 +39,8 @@ class Settings(BaseSettings):
         return self.app_data_path / "thumbnails"
     
     # Server settings
-    HOST: str = "127.0.0.1"
+    # HOST: str = "127.0.0.1"
+    HOST: str = "0.0.0.0"
     PORT: int = 8000
     
     # Cluster settings (SSH + tmux, no Slurm)

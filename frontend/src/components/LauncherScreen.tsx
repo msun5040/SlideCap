@@ -84,19 +84,20 @@ export function LauncherScreen({ onReady }: LauncherScreenProps) {
       }
     } else {
       try {
-        const res = await fetch('http://127.0.0.1:8000/health', {
+        const backendUrl = `http://${window.location.hostname}:8000`
+        const res = await fetch(`${backendUrl}/health`, {
           signal: AbortSignal.timeout(5000),
         })
         if (res.ok) {
           setPhase('ready')
-          setTimeout(() => onReady('http://127.0.0.1:8000'), 500)
+          setTimeout(() => onReady(backendUrl), 500)
         } else {
           setPhase('error')
           setError('Backend responded but is not healthy')
         }
       } catch {
         setPhase('error')
-        setError('Cannot connect to backend at http://127.0.0.1:8000')
+        setError(`Cannot connect to backend at http://${window.location.hostname}:8000`)
       }
     }
   }

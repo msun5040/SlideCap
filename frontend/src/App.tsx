@@ -75,10 +75,10 @@ export default function App() {
   useEffect(() => {
     const isElectron = !!(window as any).electronAPI?.isElectron
     if (!isElectron) {
-      fetch('http://127.0.0.1:8000/health', { signal: AbortSignal.timeout(3000) })
+      fetch(`http://${window.location.hostname}:8000/health`, { signal: AbortSignal.timeout(3000) })
         .then((res) => {
           if (res.ok) {
-            setApiBase('http://127.0.0.1:8000')
+            setApiBase(`http://${window.location.hostname}:8000`)
             setLaunched(true)
           }
         })

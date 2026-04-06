@@ -1,5 +1,5 @@
-// Centralized API base URL - set dynamically by the launcher
-let _apiBase = 'http://127.0.0.1:8000'
+// Centralized API base URL - uses current hostname so it works over the network
+let _apiBase = `http://${window.location.hostname}:8000`
 
 export function setApiBase(url: string) {
   _apiBase = url
