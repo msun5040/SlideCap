@@ -13,7 +13,7 @@ import {
 } from '@/components/ui/table'
 import type { AnalysisJob, JobSlide } from '@/types/slide'
 
-import { getApiBase } from '@/api'
+import { getApiBase, isDemo } from '@/api'
 import { SortableHeader } from '@/components/SortableHeader'
 import { useSortable } from '@/hooks/useSortable'
 
@@ -51,7 +51,11 @@ export function AnalysisJobs() {
       j.status === 'running' || j.status === 'transferring' || j.status === 'pending'
     )
     if (hasActive) {
-      intervalRef.current = setInterval(fetchJobs, 15000)
+      const tick = () => {
+        fetchJobs()
+        if (expandedJobId) fetchJobDetail(expandedJobId)
+      }
+      intervalRef.current = setInterval(tick, isDemo() ? 1500 : 15000)
     } else if (intervalRef.current) {
       clearInterval(intervalRef.current)
       intervalRef.current = null
@@ -59,7 +63,7 @@ export function AnalysisJobs() {
     return () => {
       if (intervalRef.current) clearInterval(intervalRef.current)
     }
-  }, [jobs])
+  }, [jobs, expandedJobId])
 
   const fetchJobs = async () => {
     try {

@@ -543,6 +543,15 @@ class RequestSheet(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+    # Legacy single auto-tag column — superseded by the auto_tags
+    # many-to-many below. Kept nullable for backward compat; not read by the
+    # API anymore. Migration backfills the join table from this column.
+    auto_tag_id = Column(Integer, ForeignKey('tags.id', ondelete='SET NULL'), nullable=True)
+
+    # Auto-tags: every case whose accession appears in this sheet receives
+    # all of these tags. Applied on sheet save and row create.
+    auto_tags = relationship('Tag', secondary='request_sheet_auto_tags')
+
     rows = relationship('RequestRow', back_populates='sheet', cascade='all, delete-orphan',
                         order_by='RequestRow.accession_number')
 
@@ -552,6 +561,13 @@ class RequestSheet(Base):
 
     def __repr__(self):
         return f"<RequestSheet(name={self.name})>"
+
+
+request_sheet_auto_tags = Table(
+    'request_sheet_auto_tags', Base.metadata,
+    Column('sheet_id', Integer, ForeignKey('request_sheets.id', ondelete='CASCADE'), primary_key=True),
+    Column('tag_id',   Integer, ForeignKey('tags.id',           ondelete='CASCADE'), primary_key=True),
+)
 
 
 class RequestRow(Base):
@@ -1005,6 +1021,39 @@ def _migrate_slidecap_ids(engine):
         conn.commit()
 
 
+def _migrate_request_sheets(engine):
+    """Add new columns to request_sheets and backfill auto_tags join table."""
+    from sqlalchemy import text
+    try:
+        insp = inspect(engine)
+        if not insp.has_table('request_sheets'):
+            return
+        existing = {col['name'] for col in insp.get_columns('request_sheets')}
+        if 'auto_tag_id' not in existing:
+            print("[DB Migration] Adding column: request_sheets.auto_tag_id")
+            with engine.connect() as conn:
+                conn.execute(text(
+                    "ALTER TABLE request_sheets ADD COLUMN auto_tag_id INTEGER REFERENCES tags(id) ON DELETE SET NULL"
+                ))
+                conn.commit()
+        # Backfill request_sheet_auto_tags from legacy auto_tag_id values.
+        # The join table was created by create_all earlier; re-inspect since
+        # the original insp snapshot predates it.
+        insp2 = inspect(engine)
+        if insp2.has_table('request_sheet_auto_tags'):
+            with engine.connect() as conn:
+                conn.execute(text(
+                    """
+                    INSERT OR IGNORE INTO request_sheet_auto_tags (sheet_id, tag_id)
+                    SELECT id, auto_tag_id FROM request_sheets
+                    WHERE auto_tag_id IS NOT NULL
+                    """
+                ))
+                conn.commit()
+    except Exception as e:
+        print(f"[DB Migration] Skipping request_sheets migration: {e}")
+
+
 def init_db(db_path: Path):
     """
     Initialize database schema and session factory.
@@ -1021,6 +1070,7 @@ def init_db(db_path: Path):
     _migrate_analysis_jobs(_engine)
     Base.metadata.create_all(_engine)  # Creates new tables (patients, id_counters, external_mappings)
     _migrate_slidecap_ids(_engine)     # Adds columns to existing tables + backfills IDs
+    _migrate_request_sheets(_engine)   # Adds auto_tag_id to request_sheets
     _SessionLocal = sessionmaker(bind=_engine)
 
 

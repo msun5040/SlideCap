@@ -3,6 +3,7 @@ import {
   ArrowLeft, Search, Filter, X, Plus, ChevronDown, ChevronRight,
   Check, Download, FolderArchive, AlertTriangle, Users, FileText,
   CheckCircle2, Clock, XCircle, Loader2, Flag, BarChart2, Trash2, Stethoscope,
+  Microscope,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -33,10 +34,36 @@ import {
 import type { Slide, CohortSlide, CohortDetail, CaseGroup, CohortFlag, CohortPatient } from '@/types/slide'
 import { PatientTracker } from '@/components/PatientTracker'
 
-import { getApiBase, normalizeAccession } from '@/api'
+import { getApiBase, normalizeAccession, isDemo } from '@/api'
+import { displaySlide, displayCase } from '@/lib/display'
 import { SortableHeader } from '@/components/SortableHeader'
 import { useSortable } from '@/hooks/useSortable'
 const SLIDE_FLAG_TAG = 'flagged'
+
+// Visual hierarchy: patient accent colors (left border + header tint)
+const PATIENT_COLORS = [
+  { border: '#3b82f6', bg: 'rgba(59,130,246,0.06)', text: '#2563eb', badge: 'bg-blue-100 text-blue-700' },
+  { border: '#8b5cf6', bg: 'rgba(139,92,246,0.06)', text: '#7c3aed', badge: 'bg-violet-100 text-violet-700' },
+  { border: '#06b6d4', bg: 'rgba(6,182,212,0.06)', text: '#0891b2', badge: 'bg-cyan-100 text-cyan-700' },
+  { border: '#f59e0b', bg: 'rgba(245,158,11,0.06)', text: '#d97706', badge: 'bg-amber-100 text-amber-700' },
+  { border: '#10b981', bg: 'rgba(16,185,129,0.06)', text: '#059669', badge: 'bg-emerald-100 text-emerald-700' },
+  { border: '#ec4899', bg: 'rgba(236,72,153,0.06)', text: '#db2777', badge: 'bg-pink-100 text-pink-700' },
+  { border: '#f97316', bg: 'rgba(249,115,22,0.06)', text: '#ea580c', badge: 'bg-orange-100 text-orange-700' },
+  { border: '#6366f1', bg: 'rgba(99,102,241,0.06)', text: '#4f46e5', badge: 'bg-indigo-100 text-indigo-700' },
+]
+
+// Stain type → dot color for at-a-glance case composition
+const STAIN_DOT_COLORS: Record<string, string> = {
+  'HE': '#ec4899',      // pink
+  'IHC': '#3b82f6',     // blue
+  'Special': '#f59e0b', // amber
+}
+function getStainDotColor(stain: string): string {
+  if (stain === 'HE') return STAIN_DOT_COLORS['HE']
+  if (stain.startsWith('IHC')) return STAIN_DOT_COLORS['IHC']
+  if (stain === 'Special') return STAIN_DOT_COLORS['Special']
+  return '#94a3b8' // slate fallback
+}
 
 interface CohortBuilderProps {
   cohortId: number
@@ -907,27 +934,40 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
 
                   {/* Case list */}
                   <div className="flex-1 overflow-auto">
-                    <div className="divide-y divide-gray-300">
+                    <div className="p-2 space-y-1">
                       {(() => {
                         const { patientGroups, unassigned } = groupedCasesByPatient
 
-                        const renderCaseGroup = (group: CaseGroup) => {
-                          const isCollapsed = collapsedCases.has(group.case_hash)
+                        // ── Case card: compact inline card with stain dots ──
+                        const renderCaseCard = (group: CaseGroup, indent: boolean = false) => {
+                          const isExpanded = !collapsedCases.has(group.case_hash)
                           const caseStatuses = getCaseAnalysisStatuses(group.slides)
                           const caseFlagNames = getCaseFlagNames(group.case_hash)
                           const isSelected = selectedCaseHashes.has(group.case_hash)
-
                           const allSlidesFlagged = group.slides.length > 0 && group.slides.every(s => isSlideFlagged(s))
                           const anySlidesFlagged = group.slides.some(s => isSlideFlagged(s))
 
-                          return (
-                            <div key={group.case_hash} className={isSelected ? 'bg-blue-50/60' : ''}>
-                              {/* Case header row */}
-                              <div className="flex items-center group/case hover:bg-muted/40 transition-colors">
+                          // Group slides by stain for the dot summary
+                          const stainCounts: Record<string, number> = {}
+                          for (const s of group.slides) {
+                            const key = s.stain_type === 'HE' ? 'HE' : s.stain_type.startsWith('IHC') ? 'IHC' : s.stain_type
+                            stainCounts[key] = (stainCounts[key] || 0) + 1
+                          }
 
+                          return (
+                            <div
+                              key={group.case_hash}
+                              className={`rounded-lg border transition-all ${
+                                isSelected
+                                  ? 'border-blue-300 bg-blue-50/50 shadow-sm'
+                                  : 'border-gray-200 bg-white hover:border-gray-300 hover:shadow-sm'
+                              } ${indent ? 'ml-4' : ''}`}
+                            >
+                              {/* Case header */}
+                              <div className="flex items-center gap-2 px-3 py-2 group/case">
                                 {/* Checkbox */}
                                 <div
-                                  className="pl-3 pr-2 py-2.5 shrink-0"
+                                  className="shrink-0 cursor-pointer"
                                   onClick={e => { e.stopPropagation(); toggleCaseSelect(group.case_hash, e) }}
                                 >
                                   <Checkbox
@@ -937,106 +977,114 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                                   />
                                 </div>
 
-                                {/* Expand/collapse + case name */}
+                                {/* Expand toggle + accession */}
                                 <button
-                                  className="flex-1 flex items-center gap-2 pr-2 py-2.5 text-left min-w-0"
+                                  className="flex items-center gap-2 min-w-0 flex-1 text-left"
                                   onClick={() => toggleCaseCollapse(group.case_hash)}
                                 >
-                                  {isCollapsed
-                                    ? <ChevronRight className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-                                    : <ChevronDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-                                  }
-                                  <span className="text-sm font-medium truncate">
-                                    {group.accession_number || group.case_hash.slice(0, 8) + '…'}
+                                  <Microscope className="h-3.5 w-3.5 text-muted-foreground/60 shrink-0" />
+                                  <span className="text-sm font-semibold truncate">
+                                    {displayCase(group)}
                                   </span>
                                   {group.year && (
-                                    <span className="text-xs text-muted-foreground shrink-0">{group.year}</span>
-                                  )}
-                                  <span className="text-xs text-muted-foreground shrink-0 ml-1">
-                                    {group.slides.length} slide{group.slides.length !== 1 ? 's' : ''}
-                                  </span>
-                                  {/* Per-case aggregate analysis badges */}
-                                  {caseStatuses.length > 0 && (
-                                    <div className="flex items-center gap-1.5 ml-1">
-                                      {caseStatuses.map(cs => (
-                                        <div
-                                          key={cs.name}
-                                          className="flex items-center gap-1"
-                                          title={`${cs.name}: ${cs.completed}/${cs.total} slides`}
-                                        >
-                                          <span className="text-xs text-muted-foreground hidden sm:inline">
-                                            {cs.name.length > 8 ? cs.name.slice(0, 8) + '…' : cs.name}
-                                          </span>
-                                          <StatusIcon status={cs.status} title={`${cs.name}: ${cs.completed}/${cs.total}`} />
-                                        </div>
-                                      ))}
-                                    </div>
+                                    <span className="text-[11px] text-muted-foreground bg-muted/60 rounded px-1.5 py-0.5 shrink-0">
+                                      {group.year}
+                                    </span>
                                   )}
                                 </button>
 
-                                {/* Case-level flag button (distinct from per-slide) */}
+                                {/* Stain composition dots — at-a-glance view */}
+                                <div className="flex items-center gap-1 shrink-0" title={Object.entries(stainCounts).map(([s, n]) => `${s}: ${n}`).join(', ')}>
+                                  {group.slides.map((s, i) => (
+                                    <span
+                                      key={i}
+                                      className="inline-block h-2 w-2 rounded-full shrink-0"
+                                      style={{ backgroundColor: getStainDotColor(s.stain_type) }}
+                                      title={`${s.block_id} · ${s.stain_type}`}
+                                    />
+                                  ))}
+                                </div>
+
+                                {/* Slide count */}
+                                <span className="text-[11px] text-muted-foreground shrink-0 tabular-nums">
+                                  {group.slides.length}
+                                </span>
+
+                                {/* Analysis status indicators */}
+                                {caseStatuses.length > 0 && (
+                                  <div className="flex items-center gap-1 shrink-0">
+                                    {caseStatuses.map(cs => (
+                                      <StatusIcon key={cs.name} status={cs.status} title={`${cs.name}: ${cs.completed}/${cs.total}`} />
+                                    ))}
+                                  </div>
+                                )}
+
+                                {/* Flag button */}
                                 <button
-                                  className={`mr-1 inline-flex items-center gap-1 rounded-full border text-[11px] h-6 px-2 transition-colors ${
+                                  className={`shrink-0 inline-flex items-center justify-center h-6 w-6 rounded-full transition-colors ${
                                     allSlidesFlagged
-                                      ? 'text-red-500 border-red-300'
+                                      ? 'text-red-500'
                                       : anySlidesFlagged
-                                        ? 'text-red-400 border-red-200'
-                                        : 'text-muted-foreground border-transparent hover:text-red-400 hover:border-red-200'
+                                        ? 'text-red-400'
+                                        : 'text-muted-foreground/40 hover:text-red-400'
                                   }`}
-                                  title={
-                                    allSlidesFlagged
-                                      ? 'Unflag all slides in case'
-                                      : 'Flag all slides in case'
-                                  }
-                                  onClick={e => {
-                                    e.stopPropagation()
-                                    toggleCaseFlag(group)
-                                  }}
+                                  onClick={e => { e.stopPropagation(); toggleCaseFlag(group) }}
+                                  title={allSlidesFlagged ? 'Unflag all slides' : 'Flag all slides'}
                                 >
                                   <Flag className={`h-3 w-3 ${allSlidesFlagged || anySlidesFlagged ? 'fill-current' : ''}`} />
-                                  <span className="hidden sm:inline">Case</span>
                                 </button>
 
                                 {/* Cohort flag chips */}
                                 {caseFlagNames.length > 0 && (
-                                  <div className="flex items-center gap-1 pr-1 shrink-0">
+                                  <div className="flex items-center gap-1 shrink-0">
                                     {caseFlagNames.slice(0, 2).map(name => {
                                       const flag = cohortFlags.find(f => f.name === name)!
                                       return (
                                         <span
                                           key={name}
-                                          className="inline-flex items-center gap-1 bg-amber-100 text-amber-800 text-xs rounded-full pl-2 pr-1 py-0.5 border border-amber-200"
+                                          className="inline-flex items-center gap-0.5 bg-amber-50 text-amber-700 text-[10px] rounded-full pl-1.5 pr-1 py-0.5 border border-amber-200"
                                         >
-                                          <Flag className="h-2.5 w-2.5" />
+                                          <Flag className="h-2 w-2" />
                                           {name}
                                           <button
                                             className="hover:text-destructive ml-0.5 opacity-0 group-hover/case:opacity-100"
                                             onClick={e => { e.stopPropagation(); removeCaseFromFlag(flag.id, group.case_hash) }}
                                           >
-                                            <X className="h-3 w-3" />
+                                            <X className="h-2.5 w-2.5" />
                                           </button>
                                         </span>
                                       )
                                     })}
                                     {caseFlagNames.length > 2 && (
-                                      <span className="text-xs text-muted-foreground">+{caseFlagNames.length - 2}</span>
+                                      <span className="text-[10px] text-muted-foreground">+{caseFlagNames.length - 2}</span>
                                     )}
                                   </div>
                                 )}
 
-                                {/* Remove case button */}
+                                {/* Expand indicator */}
                                 <button
-                                  className="px-3 py-2.5 opacity-0 group-hover/case:opacity-100 text-muted-foreground hover:text-destructive transition-opacity shrink-0"
+                                  className="shrink-0 text-muted-foreground/40 hover:text-muted-foreground"
+                                  onClick={() => toggleCaseCollapse(group.case_hash)}
+                                >
+                                  {isExpanded
+                                    ? <ChevronDown className="h-3.5 w-3.5" />
+                                    : <ChevronRight className="h-3.5 w-3.5" />
+                                  }
+                                </button>
+
+                                {/* Remove */}
+                                <button
+                                  className="shrink-0 opacity-0 group-hover/case:opacity-100 text-muted-foreground hover:text-destructive transition-opacity"
                                   onClick={() => removeCase(group.slides)}
-                                  title="Remove entire case from cohort"
+                                  title="Remove case from cohort"
                                 >
                                   <X className="h-3.5 w-3.5" />
                                 </button>
                               </div>
 
-                              {/* Slide rows */}
-                              {!isCollapsed && (
-                                <div className="pb-1 bg-muted/10">
+                              {/* Expanded slide detail */}
+                              {isExpanded && (
+                                <div className="border-t border-gray-100 bg-gray-50/50 rounded-b-lg">
                                   {group.slides.map((slide) => {
                                     const slideStatus = slideAnalysisStatus[slide.slide_hash]
                                     const entries = slideStatus ? Object.values(slideStatus) : []
@@ -1044,17 +1092,24 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                                     return (
                                       <div
                                         key={slide.slide_hash}
-                                        className="flex items-center gap-2 pl-10 pr-3 py-1.5 text-sm group hover:bg-muted/30 transition-colors"
+                                        className="flex items-center gap-2.5 px-3 py-1.5 group/slide hover:bg-gray-100/60 transition-colors first:pt-2 last:pb-2"
                                       >
-                                        <span className="text-muted-foreground font-mono text-xs">{slide.block_id}</span>
-                                        <Badge variant="outline" className="text-xs h-5">{slide.stain_type}</Badge>
-                                        {/* Per-slide analysis badges (name + status for every entry) */}
+                                        {/* Stain dot */}
+                                        <span
+                                          className="inline-block h-2.5 w-2.5 rounded-full shrink-0 ring-1 ring-black/5"
+                                          style={{ backgroundColor: getStainDotColor(slide.stain_type) }}
+                                        />
+                                        {/* Block ID */}
+                                        <span className="text-xs font-mono text-muted-foreground w-16 truncate">{slide.block_id}</span>
+                                        {/* Stain badge */}
+                                        <Badge variant="outline" className="text-[10px] h-5 px-1.5 font-medium">{slide.stain_type}</Badge>
+                                        {/* Analysis badges */}
                                         {entries.length > 0 && (
-                                          <div className="flex items-center gap-1 flex-wrap ml-1">
+                                          <div className="flex items-center gap-1 flex-wrap">
                                             {entries.map(entry => (
                                               <span
                                                 key={entry.analysis_name}
-                                                className={`inline-flex items-center gap-1 rounded-full border text-[10px] h-5 px-1.5 ${
+                                                className={`inline-flex items-center gap-0.5 rounded-full border text-[10px] h-5 px-1.5 ${
                                                   entry.status === 'completed'
                                                     ? 'bg-green-50 border-green-200 text-green-700'
                                                     : entry.status === 'failed'
@@ -1066,30 +1121,29 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                                                 title={`${entry.analysis_name}: ${entry.status}`}
                                               >
                                                 <StatusIcon status={entry.status} />
-                                                {entry.analysis_name.length > 12
-                                                  ? entry.analysis_name.slice(0, 12) + '…'
-                                                  : entry.analysis_name}
+                                                {entry.analysis_name.length > 12 ? entry.analysis_name.slice(0, 12) + '…' : entry.analysis_name}
                                               </span>
                                             ))}
                                           </div>
                                         )}
+                                        <div className="flex-1" />
+                                        {/* Slide flag */}
                                         <button
-                                          className={`ml-auto inline-flex items-center justify-center rounded-full border text-xs h-6 w-6 transition-colors ${
-                                            flagged
-                                              ? 'text-red-500 border-red-300'
-                                              : 'text-muted-foreground border-transparent hover:text-red-400 hover:border-red-200'
+                                          className={`shrink-0 inline-flex items-center justify-center h-5 w-5 rounded-full transition-colors ${
+                                            flagged ? 'text-red-500' : 'text-muted-foreground/30 opacity-0 group-hover/slide:opacity-100 hover:text-red-400'
                                           }`}
                                           onClick={() => toggleSlideFlag(slide)}
-                                          title={flagged ? 'Unflag slide' : 'Flag slide for analysis'}
+                                          title={flagged ? 'Unflag slide' : 'Flag slide'}
                                         >
-                                          <Flag className={`h-3 w-3 ${flagged ? 'fill-current' : ''}`} />
+                                          <Flag className={`h-2.5 w-2.5 ${flagged ? 'fill-current' : ''}`} />
                                         </button>
+                                        {/* Remove slide */}
                                         <button
-                                          className="ml-1 opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-destructive transition-opacity"
+                                          className="shrink-0 opacity-0 group-hover/slide:opacity-100 text-muted-foreground hover:text-destructive transition-opacity"
                                           onClick={() => removeSlide(slide.slide_hash)}
-                                          title="Remove slide from cohort"
+                                          title="Remove slide"
                                         >
-                                          <X className="h-3.5 w-3.5" />
+                                          <X className="h-3 w-3" />
                                         </button>
                                       </div>
                                     )
@@ -1100,20 +1154,30 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                           )
                         }
 
+                        // ── No patients assigned: flat case list ──
                         if (groupedCasesByPatient.patientGroups.length === 0) {
-                          return caseGroups.map(renderCaseGroup)
+                          return <div className="space-y-1">{caseGroups.map(g => renderCaseCard(g))}</div>
                         }
 
+                        // ── Patient → Surgery → Case hierarchy ──
                         return (
-                          <>
-                            {patientGroups.map(pg => {
+                          <div className="space-y-3">
+                            {patientGroups.map((pg, pgIndex) => {
+                              const color = PATIENT_COLORS[pgIndex % PATIENT_COLORS.length]
                               const isPatientCollapsed = collapsedPatientGroups.has(pg.patientId)
+                              const totalSlides = pg.surgeries.reduce((n, sg) => n + sg.cases.reduce((m, c) => m + c.slides.length, 0), 0)
                               const totalCases = pg.surgeries.reduce((n, sg) => n + sg.cases.length, 0)
+
                               return (
-                                <div key={`patient-${pg.patientId}`} className="border-b border-gray-200 last:border-b-0">
-                                  {/* Patient header — collapsible */}
-                                  <div
-                                    className="flex items-center gap-2 px-3 py-2.5 bg-muted/30 hover:bg-muted/50 transition-colors cursor-pointer select-none"
+                                <div
+                                  key={`patient-${pg.patientId}`}
+                                  className="rounded-xl overflow-hidden border border-gray-200"
+                                  style={{ borderLeftWidth: '4px', borderLeftColor: color.border }}
+                                >
+                                  {/* Patient header */}
+                                  <button
+                                    className="w-full flex items-center gap-3 px-4 py-3 transition-colors cursor-pointer select-none"
+                                    style={{ backgroundColor: color.bg }}
                                     onClick={() =>
                                       setCollapsedPatientGroups(prev => {
                                         const next = new Set(prev)
@@ -1123,44 +1187,74 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                                       })
                                     }
                                   >
-                                    {isPatientCollapsed
-                                      ? <ChevronRight className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-                                      : <ChevronDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-                                    }
-                                    <Users className="h-3.5 w-3.5 text-blue-500 shrink-0" />
-                                    <span className="text-sm font-semibold flex-1">{pg.patientLabel}</span>
-                                    <span className="text-xs text-muted-foreground">
-                                      {pg.surgeries.length} {pg.surgeries.length === 1 ? 'surgery' : 'surgeries'} · {totalCases} {totalCases === 1 ? 'case' : 'cases'}
-                                    </span>
-                                  </div>
-
-                                  {/* Surgery groups */}
-                                  {!isPatientCollapsed && pg.surgeries.map(sg => (
-                                    <div key={`surgery-${sg.surgeryId}`} className="bg-muted/5">
-                                      <div className="flex items-center gap-2 pl-8 pr-3 py-1.5 bg-muted/20 text-[11px] text-muted-foreground border-b border-gray-100">
-                                        <Stethoscope className="h-3 w-3 shrink-0" />
-                                        <Badge variant="secondary" className="text-[10px] px-1.5 h-4 shrink-0">
-                                          {sg.surgeryLabel}
-                                        </Badge>
-                                        <span className="text-xs text-muted-foreground">
-                                          {sg.cases.length} {sg.cases.length === 1 ? 'case' : 'cases'}
-                                        </span>
-                                      </div>
-                                      {sg.cases.map(renderCaseGroup)}
+                                    {/* Patient avatar */}
+                                    <div
+                                      className="h-8 w-8 rounded-full flex items-center justify-center text-white text-xs font-bold shrink-0"
+                                      style={{ backgroundColor: color.border }}
+                                    >
+                                      {pg.patientLabel.slice(0, 2).toUpperCase()}
                                     </div>
-                                  ))}
+                                    <div className="flex-1 text-left min-w-0">
+                                      <div className="text-sm font-semibold" style={{ color: color.text }}>
+                                        {pg.patientLabel}
+                                      </div>
+                                      <div className="text-[11px] text-muted-foreground">
+                                        {pg.surgeries.length} {pg.surgeries.length === 1 ? 'surgery' : 'surgeries'} · {totalCases} {totalCases === 1 ? 'case' : 'cases'} · {totalSlides} slides
+                                      </div>
+                                    </div>
+                                    {isPatientCollapsed
+                                      ? <ChevronRight className="h-4 w-4 text-muted-foreground shrink-0" />
+                                      : <ChevronDown className="h-4 w-4 text-muted-foreground shrink-0" />
+                                    }
+                                  </button>
+
+                                  {/* Surgery sections — always visible when patient expanded */}
+                                  {!isPatientCollapsed && (
+                                    <div className="bg-white">
+                                      {pg.surgeries.map(sg => (
+                                        <div key={`surgery-${sg.surgeryId}`}>
+                                          {/* Surgery divider */}
+                                          <div className="flex items-center gap-2 px-4 py-1.5 bg-gray-50 border-t border-gray-100">
+                                            <Stethoscope className="h-3 w-3 text-muted-foreground/60" />
+                                            <span
+                                              className={`inline-flex items-center text-[11px] font-semibold rounded-md px-2 py-0.5 ${color.badge}`}
+                                            >
+                                              {sg.surgeryLabel}
+                                            </span>
+                                            <span className="text-[11px] text-muted-foreground">
+                                              {sg.cases.length} {sg.cases.length === 1 ? 'case' : 'cases'} · {sg.cases.reduce((n, c) => n + c.slides.length, 0)} slides
+                                            </span>
+                                          </div>
+                                          {/* Cases within this surgery */}
+                                          <div className="p-2 space-y-1">
+                                            {sg.cases.map(cg => renderCaseCard(cg))}
+                                          </div>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  )}
                                 </div>
                               )
                             })}
+
+                            {/* Unassigned cases */}
                             {unassigned.length > 0 && (
-                              <div className="border-t border-gray-200">
-                                <div className="px-3 py-1.5 bg-muted/40 text-xs font-semibold text-muted-foreground">
-                                  Unassigned · {unassigned.length} {unassigned.length === 1 ? 'case' : 'cases'}
+                              <div className="rounded-xl overflow-hidden border border-dashed border-gray-300">
+                                <div className="flex items-center gap-2 px-4 py-2.5 bg-gray-50/50">
+                                  <AlertTriangle className="h-3.5 w-3.5 text-muted-foreground/50" />
+                                  <span className="text-xs font-medium text-muted-foreground">
+                                    Unassigned
+                                  </span>
+                                  <span className="text-[11px] text-muted-foreground">
+                                    {unassigned.length} {unassigned.length === 1 ? 'case' : 'cases'}
+                                  </span>
                                 </div>
-                                {unassigned.map(renderCaseGroup)}
+                                <div className="p-2 space-y-1 bg-white">
+                                  {unassigned.map(g => renderCaseCard(g))}
+                                </div>
                               </div>
                             )}
-                          </>
+                          </div>
                         )
                       })()}
                     </div>
@@ -1311,7 +1405,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                                 onCheckedChange={() => toggleSlideSelection(slide.slide_hash)}
                               />
                             </TableCell>
-                            <TableCell className="text-sm font-medium">{slide.accession_number}</TableCell>
+                            <TableCell className="text-sm font-medium">{displaySlide(slide)}</TableCell>
                             <TableCell className="text-sm text-muted-foreground">{slide.block_id}</TableCell>
                             <TableCell>
                               {inCohort ? (
@@ -1536,10 +1630,12 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                 <p>{cohort?.name.replace(/\s+/g, '_')}.zip</p>
                 {caseGroups.slice(0, 3).map((g) => (
                   <div key={g.case_hash} className="pl-4">
-                    <p>{g.accession_number || '…'}/</p>
+                    <p>{displayCase(g)}/</p>
                     {g.slides.slice(0, 2).map((s) => (
                       <p key={s.slide_hash} className="pl-4 truncate">
-                        {s.accession_number}_{s.block_id}_{s.stain_type}.svs
+                        {isDemo()
+                          ? `${s.slide_hash.slice(0, 10)}.svs`
+                          : `${s.accession_number}_${s.block_id}_${s.stain_type}.svs`}
                       </p>
                     ))}
                     {g.slides.length > 2 && <p className="pl-4">… +{g.slides.length - 2} more</p>}

@@ -34,6 +34,7 @@ import type { Analysis } from '@/types/slide'
 import { signalClusterDisconnected } from '@/components/ClusterConnect'
 
 import { getApiBase } from '@/api'
+import { displaySlide } from '@/lib/display'
 
 // ---------- Types ----------
 
@@ -58,6 +59,8 @@ interface JobSummary {
 interface JobSlideDetail {
   id: number
   slide_hash: string | null
+  slide_id: string | null
+  case_id: string | null
   filename: string | null
   accession_number: string | null
   block_id: string | null
@@ -100,6 +103,8 @@ interface SlideResult {
 
 interface SlideWithResults {
   slide_hash: string
+  slide_id?: string | null
+  case_id?: string | null
   accession_number: string
   block_id: string
   stain_type: string
@@ -498,33 +503,46 @@ export function AnalysisResults() {
 
   // ---------- File download ----------
 
+  const downloadViaFetch = async (url: string, filename: string) => {
+    const res = await fetch(url)
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const blob = await res.blob()
+    const objUrl = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = objUrl
+    a.download = filename
+    a.click()
+    URL.revokeObjectURL(objUrl)
+  }
+
   const downloadFile = (jobId: number, slideHash: string, filePath: string) => {
     const url = `${getApiBase()}/results/${jobId}/file/${encodeFilePath(filePath)}?slide_hash=${encodeURIComponent(slideHash)}`
-    const a = document.createElement('a')
-    a.href = url
-    a.download = filePath.split('/').pop()!
-    a.click()
+    downloadViaFetch(url, filePath.split('/').pop()!).catch(e => console.error('Download failed:', e))
   }
 
   const downloadFolder = (jobId: number, slideHash: string, folderPath: string) => {
     const url = `${getApiBase()}/results/${jobId}/download-folder?slide_hash=${encodeURIComponent(slideHash)}&folder_path=${encodeURIComponent(folderPath)}`
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `${folderPath.split('/').pop()}.zip`
-    a.click()
+    downloadViaFetch(url, `${folderPath.split('/').pop()}.zip`).catch(e => console.error('Download failed:', e))
   }
 
   const downloadJobZip = (jobId: number) => {
-    const a = document.createElement('a')
-    a.href = `${getApiBase()}/jobs/${jobId}/download-zip`
-    a.download = `job_${jobId}_results.zip`
-    a.click()
+    const url = `${getApiBase()}/jobs/${jobId}/download-zip`
+    downloadViaFetch(url, `job_${jobId}_results.zip`).catch(e => console.error('Download failed:', e))
   }
 
-  const previewFile = (jobId: number, slideHash: string, filePath: string) => {
-    setPreviewUrl(
-      `${getApiBase()}/results/${jobId}/file/${encodeFilePath(filePath)}?slide_hash=${encodeURIComponent(slideHash)}`
-    )
+  const previewFile = async (jobId: number, slideHash: string, filePath: string) => {
+    try {
+      const res = await fetch(
+        `${getApiBase()}/results/${jobId}/file/${encodeFilePath(filePath)}?slide_hash=${encodeURIComponent(slideHash)}`
+      )
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const blob = await res.blob()
+      // Revoke any prior preview URL to avoid leaks
+      if (previewUrl?.startsWith('blob:')) URL.revokeObjectURL(previewUrl)
+      setPreviewUrl(URL.createObjectURL(blob))
+    } catch (e) {
+      console.error('Preview failed:', e)
+    }
   }
 
   // ---------- Cart ----------
@@ -907,10 +925,8 @@ export function AnalysisResults() {
                               className="text-sm max-w-75"
                               text={showHashes
                                 ? `${js.slide_hash!.substring(0, 12)}…`
-                                : js.accession_number
-                                  ? `${js.accession_number}${js.block_id ? ` ${js.block_id}` : ''}${js.stain_type ? ` ${js.stain_type}` : ''}`
-                                  : js.filename || `${js.slide_hash!.substring(0, 12)}…`}
-                              copyValue={showHashes ? js.slide_hash! : (js.accession_number || js.filename || js.slide_hash!)}
+                                : displaySlide(js)}
+                              copyValue={showHashes ? js.slide_hash! : displaySlide(js)}
                             />
                             {statusBadge(js.status)}
                             {js.status === 'completed' && (
@@ -982,7 +998,7 @@ export function AnalysisResults() {
                 <div className="flex-1">
                   <div className="flex items-center gap-2">
                     <span className="font-medium font-mono text-sm">
-                      {slide.accession_number}
+                      {displaySlide(slide)}
                     </span>
                     <Badge variant="secondary">{slide.block_id}</Badge>
                     <Badge variant="outline">{slide.stain_type}</Badge>
@@ -1107,7 +1123,7 @@ export function AnalysisResults() {
       {view === 'jobs' ? renderJobList() : renderSearchResults()}
 
       {/* Image preview dialog */}
-      <Dialog open={!!previewUrl} onOpenChange={(open) => { if (!open) setPreviewUrl(null) }}>
+      <Dialog open={!!previewUrl} onOpenChange={(open) => { if (!open) { if (previewUrl?.startsWith('blob:')) URL.revokeObjectURL(previewUrl); setPreviewUrl(null) } }}>
         <DialogContent className="max-w-3xl">
           <DialogHeader>
             <DialogTitle>Preview</DialogTitle>

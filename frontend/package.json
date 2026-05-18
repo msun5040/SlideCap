@@ -6,7 +6,9 @@
   "main": "electron/main.cjs",
   "scripts": {
     "dev": "vite",
+    "dev:demo": "VITE_APP_MODE=demo VITE_API_PORT=8001 vite --port 3001",
     "build": "vite build",
+    "build:demo": "VITE_APP_MODE=demo VITE_API_PORT=8001 vite build --outDir dist-demo",
     "electron": "electron .",
     "start": "concurrently \"vite\" \"wait-on http://localhost:5173 && electron .\"",
     "dist": "vite build && electron-builder",

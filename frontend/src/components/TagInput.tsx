@@ -217,8 +217,8 @@ export function TagInput({ slideHash, currentTags, onTagsChange }: TagInputProps
           {PRESET_COLORS.map((color) => (
             <button
               key={color}
-              className={`w-5 h-5 rounded-full border-2 transition-all ${
-                selectedColor === color ? 'border-black scale-110 ring-1 ring-black' : 'border-transparent hover:scale-105'
+              className={`w-5 h-5 rounded-full transition-all ring-offset-2 ring-offset-background ${
+                selectedColor === color ? 'ring-2 ring-foreground' : 'hover:scale-110'
               }`}
               style={{ backgroundColor: color }}
               onClick={() => setSelectedColor(color)}

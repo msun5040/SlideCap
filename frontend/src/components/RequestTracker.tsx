@@ -18,6 +18,8 @@ import {
   ClipboardCheck,
   AlertTriangle,
   Microscope,
+  Settings,
+  Tag as TagIcon,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -38,6 +40,7 @@ import {
   DialogTitle,
   DialogFooter,
 } from '@/components/ui/dialog'
+import { Popover, PopoverAnchor, PopoverContent } from '@/components/ui/popover'
 import {
   Select,
   SelectContent,
@@ -47,7 +50,7 @@ import {
 } from '@/components/ui/select'
 import { SortableHeader } from '@/components/SortableHeader'
 import { useSortable } from '@/hooks/useSortable'
-import { getApiBase, normalizeAccession } from '@/api'
+import { getApiBase, normalizeAccession, isDemo } from '@/api'
 import type { RequestSheet, RequestRow, RequestSheetDetail, Cohort } from '@/types/slide'
 
 // ── Status options ──────────────────────────────────────────────
@@ -468,7 +471,7 @@ function CaseProgressBar({ row }: { row: RequestRow }) {
     <div className="flex items-center gap-1.5 mt-1">
       <div className="flex-1 h-1 bg-gray-200 rounded-full overflow-hidden">
         <div
-          className={`h-full rounded-full transition-all ${pct >= 100 ? 'bg-emerald-500' : pct > 0 ? 'bg-blue-500' : 'bg-gray-300'}`}
+          className={`h-full rounded-full transition-all ${row.case_status === 'Scanned' ? 'bg-violet-500' : pct >= 100 ? 'bg-emerald-500' : pct > 0 ? 'bg-blue-500' : 'bg-gray-300'}`}
           style={{ width: `${pct}%` }}
         />
       </div>
@@ -476,6 +479,146 @@ function CaseProgressBar({ row }: { row: RequestRow }) {
     </div>
   )
 }
+
+// ── Coverage badge — shows scanned-vs-requested for a request row ─
+type CoverageData = {
+  requested_blocks: string[]
+  requested_covered: string[]
+  requested_missing: string[]
+  extra_blocks: string[]
+  slides_total: number
+}
+
+function BlockChips({ blocks, tone }: { blocks: string[]; tone: 'scanned' | 'missing' | 'extra' }) {
+  const cls = {
+    scanned: 'border-emerald-200 bg-emerald-50 text-emerald-700',
+    missing: 'border-rose-200 bg-rose-50 text-rose-700',
+    extra:   'border-blue-200 bg-blue-50 text-blue-700',
+  }[tone]
+  return (
+    <div className="flex flex-wrap gap-1">
+      {blocks.map((b) => (
+        <span key={b} className={`inline-flex items-center rounded px-1.5 py-0 text-[10px] font-mono font-medium border ${cls}`}>
+          {b}
+        </span>
+      ))}
+    </div>
+  )
+}
+
+function CoveragePanel({ cov }: { cov: CoverageData }) {
+  const sections: { label: string; blocks: string[]; tone: 'scanned' | 'missing' | 'extra' }[] = []
+  if (cov.requested_covered.length) sections.push({ label: 'Scanned', blocks: cov.requested_covered, tone: 'scanned' })
+  if (cov.requested_missing.length) sections.push({ label: 'Missing', blocks: cov.requested_missing, tone: 'missing' })
+  if (cov.extra_blocks.length)      sections.push({ label: 'Extra in system', blocks: cov.extra_blocks, tone: 'extra' })
+
+  return (
+    <div className="w-64 p-2.5 space-y-2 text-left">
+      <div className="flex items-center justify-between text-[11px] text-muted-foreground">
+        <span>Block coverage</span>
+        <span className="tabular-nums">{cov.slides_total} slide{cov.slides_total === 1 ? '' : 's'}</span>
+      </div>
+      {sections.length === 0 ? (
+        <p className="text-[11px] text-muted-foreground">No scanned slides for this accession.</p>
+      ) : (
+        sections.map((s) => (
+          <div key={s.label} className="space-y-1">
+            <p className="text-[10px] uppercase tracking-wide text-muted-foreground">{s.label}</p>
+            <BlockChips blocks={s.blocks} tone={s.tone} />
+          </div>
+        ))
+      )}
+    </div>
+  )
+}
+
+function CoverageBadge({ cov }: { cov: CoverageData }) {
+  const [open, setOpen] = useState(false)
+  const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const cancelClose = () => { if (closeTimer.current) { clearTimeout(closeTimer.current); closeTimer.current = null } }
+  const scheduleClose = () => {
+    cancelClose()
+    closeTimer.current = setTimeout(() => setOpen(false), 120)
+  }
+  const openNow = () => { cancelClose(); setOpen(true) }
+  useEffect(() => () => cancelClose(), [])
+  const requested = cov.requested_blocks.length
+  const covered = cov.requested_covered.length
+
+  let body: React.ReactNode
+  if (requested === 0) {
+    // No blocks listed — plain "N slides scanned" indicator
+    if (cov.slides_total === 0) {
+      body = (
+        <span className="inline-flex items-center rounded-sm px-1.5 py-0.5 text-[10px] font-medium border border-gray-200 bg-gray-50 text-gray-500">
+          <span className="h-1.5 w-1.5 rounded-full bg-gray-300 mr-1" />
+          not scanned
+        </span>
+      )
+    } else {
+      body = (
+        <span className="inline-flex items-center rounded-sm px-1.5 py-0.5 text-[10px] font-medium border border-blue-200 bg-blue-50 text-blue-700">
+          <span className="h-1.5 w-1.5 rounded-full bg-blue-500 mr-1" />
+          {cov.slides_total} scanned
+        </span>
+      )
+    }
+  } else {
+    const full = covered === requested
+    const none = covered === 0
+    const containerCls = full
+      ? 'border-emerald-300 bg-emerald-50 text-emerald-700'
+      : none
+        ? 'border-gray-300 bg-gray-50 text-gray-500'
+        : 'border-amber-300 bg-amber-50 text-amber-700'
+
+    const dotCovered = full ? 'bg-emerald-500' : 'bg-amber-500'
+    const dotMissing = full ? 'bg-emerald-200' : none ? 'bg-gray-300' : 'bg-amber-200'
+
+    // Cap visible dots — long requests would otherwise blow up the row width
+    const maxDots = 8
+    const totalDots = Math.min(requested, maxDots)
+    const coveredDots = Math.round((covered / requested) * totalDots)
+
+    body = (
+      <span className={`inline-flex items-center gap-1 rounded-sm pl-1 pr-1.5 py-0.5 text-[10px] font-medium border ${containerCls}`}>
+        <span className="inline-flex items-center gap-[2px]">
+          {Array.from({ length: totalDots }).map((_, i) => (
+            <span key={i} className={`h-1.5 w-1.5 rounded-[1px] ${i < coveredDots ? dotCovered : dotMissing}`} />
+          ))}
+        </span>
+        <span className="tabular-nums">{covered}/{requested}</span>
+        {full && <Check className="h-2.5 w-2.5" />}
+      </span>
+    )
+  }
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverAnchor asChild>
+        <span
+          className="inline-flex"
+          onMouseEnter={openNow}
+          onMouseLeave={scheduleClose}
+          onClick={(e) => e.stopPropagation()}
+        >
+          {body}
+        </span>
+      </PopoverAnchor>
+      <PopoverContent
+        side="bottom"
+        align="start"
+        sideOffset={6}
+        onOpenAutoFocus={(e) => e.preventDefault()}
+        onMouseEnter={openNow}
+        onMouseLeave={scheduleClose}
+      >
+        <CoveragePanel cov={cov} />
+      </PopoverContent>
+    </Popover>
+  )
+}
+
 
 // ── Sheet View (card-based split panel) ──────────────────────────
 function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void }) {
@@ -547,6 +690,42 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
   const [caseWarnings, setCaseWarnings] = useState<CaseWarning[]>([])
   const [loadingWarnings, setLoadingWarnings] = useState(false)
 
+  // Scanned slide lookup for auto-populating scanning fields
+  interface ScannedSlideInfo {
+    heBlocks: string[]    // block IDs of HE slides
+    nonHeBlocks: string[] // block IDs of non-HE slides (IHC, Special, etc.)
+    total: number
+  }
+  const [scannedSlides, setScannedSlides] = useState<ScannedSlideInfo | null>(null)
+
+  // Coverage badges — which requested blocks have any scanned slides per row
+  type RowCoverage = {
+    requested_blocks: string[]
+    scanned_blocks: string[]
+    requested_covered: string[]
+    requested_missing: string[]
+    extra_blocks: string[]
+    slides_total: number
+  }
+  const [coverage, setCoverage] = useState<Record<number, RowCoverage>>({})
+
+  // Settings dialog state (handlers defined after fetchSheet)
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false)
+  const [allTags, setAllTags] = useState<{ id: number; name: string; color?: string }[]>([])
+  const [settingsTagIds, setSettingsTagIds] = useState<Set<number>>(new Set())
+  const [savingSettings, setSavingSettings] = useState(false)
+  const [settingsMessage, setSettingsMessage] = useState<string | null>(null)
+
+  const fetchCoverage = useCallback(async () => {
+    try {
+      const res = await fetch(`${getApiBase()}/request-sheets/${sheetId}/coverage`)
+      if (res.ok) {
+        const data = await res.json()
+        setCoverage(data.coverage || {})
+      }
+    } catch (e) { console.error('Failed to fetch coverage:', e) }
+  }, [sheetId])
+
   const fetchSheet = useCallback(async () => {
     try {
       const res = await fetch(`${getApiBase()}/request-sheets/${sheetId}`)
@@ -582,19 +761,96 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
   }, [sheetId])
 
   useEffect(() => { fetchSheet() }, [fetchSheet])
+  useEffect(() => { fetchCoverage() }, [fetchCoverage])
 
-  // Fetch warnings when selected row changes
+  const openSettings = useCallback(async () => {
+    setSettingsTagIds(new Set(sheet?.auto_tags?.map(t => t.id) ?? []))
+    setSettingsMessage(null)
+    setIsSettingsOpen(true)
+    try {
+      const res = await fetch(`${getApiBase()}/tags`)
+      if (res.ok) setAllTags(await res.json())
+    } catch (e) { console.error('Failed to fetch tags:', e) }
+  }, [sheet])
+
+  const toggleSettingsTag = (id: number) => {
+    setSettingsTagIds(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  const saveSettings = useCallback(async () => {
+    setSavingSettings(true)
+    setSettingsMessage(null)
+    try {
+      const ids = Array.from(settingsTagIds)
+      const res = await fetch(`${getApiBase()}/request-sheets/${sheetId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ auto_tag_ids: ids }),
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json()
+      const applied = data.auto_tag_applied ?? 0
+      setSettingsMessage(
+        ids.length === 0
+          ? 'Auto-tags cleared.'
+          : applied > 0
+            ? `${applied} new tag assignment${applied === 1 ? '' : 's'} applied.`
+            : 'Auto-tags saved. All matching cases already had them.'
+      )
+      await fetchSheet()
+    } catch (e: any) {
+      setSettingsMessage(`Failed: ${e.message || 'error'}`)
+    } finally {
+      setSavingSettings(false)
+    }
+  }, [sheetId, settingsTagIds, fetchSheet])
+
+  // Fetch warnings + scanned slide data when selected row changes
   useEffect(() => {
-    if (!selectedRowId) { setCaseWarnings([]); return }
+    if (!selectedRowId) { setCaseWarnings([]); setScannedSlides(null); return }
     const row = rows.find(r => r.id === selectedRowId)
-    if (!row) { setCaseWarnings([]); return }
+    if (!row) { setCaseWarnings([]); setScannedSlides(null); return }
     let cancelled = false
     setLoadingWarnings(true)
+
+    // Fetch warnings
     fetch(`${getApiBase()}/request-sheets/case-warnings?accession=${encodeURIComponent(row.accession_number)}&sheet_id=${sheetId}`)
       .then(res => res.ok ? res.json() : { warnings: [] })
       .then(data => { if (!cancelled) setCaseWarnings(data.warnings || []) })
       .catch(() => { if (!cancelled) setCaseWarnings([]) })
       .finally(() => { if (!cancelled) setLoadingWarnings(false) })
+
+    // Fetch scanned slides for this accession to enable auto-populate
+    fetch(`${getApiBase()}/search?q=${encodeURIComponent(row.accession_number)}&limit=200`)
+      .then(res => res.ok ? res.json() : [])
+      .then((slides: { block_id?: string; stain_type?: string; accession_number?: string }[]) => {
+        if (cancelled) return
+        // Only include exact accession matches (search is prefix-based)
+        const exact = slides.filter(s => s.accession_number === row.accession_number)
+        const heBlocks: string[] = []
+        const nonHeBlocks: string[] = []
+        const seenHe = new Set<string>()
+        const seenNonHe = new Set<string>()
+        for (const s of exact) {
+          const block = s.block_id || ''
+          if (!block) continue
+          if (s.stain_type === 'HE') {
+            if (!seenHe.has(block)) { seenHe.add(block); heBlocks.push(block) }
+          } else {
+            if (!seenNonHe.has(block)) { seenNonHe.add(block); nonHeBlocks.push(block) }
+          }
+        }
+        heBlocks.sort()
+        nonHeBlocks.sort()
+        setScannedSlides({ heBlocks, nonHeBlocks, total: exact.length })
+      })
+      .catch(() => { if (!cancelled) setScannedSlides(null) })
+
     return () => { cancelled = true }
   }, [selectedRowId, rows, sheetId])
 
@@ -850,8 +1106,20 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
     }
   }
 
-  const handleExport = () => {
-    window.open(`${getApiBase()}/request-sheets/${sheetId}/export.csv`, '_blank')
+  const handleExport = async () => {
+    try {
+      const res = await fetch(`${getApiBase()}/request-sheets/${sheetId}/export.csv`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const blob = await res.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `request-sheet-${sheetId}.csv`
+      a.click()
+      URL.revokeObjectURL(url)
+    } catch (e) {
+      console.error('Export failed:', e)
+    }
   }
 
   // ── CSV import ────────────────────────────────────────────────
@@ -1080,6 +1348,26 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
           <Button size="sm" variant="outline" className="h-7 text-[12px]" onClick={handleExport}>
             <Download className="h-3 w-3 mr-1" />CSV
           </Button>
+          <Button size="sm" variant="outline" className="h-7 text-[12px]" onClick={openSettings} title="Sheet settings">
+            <Settings className="h-3 w-3 mr-1" />Settings
+            {sheet.auto_tags && sheet.auto_tags.length > 0 && (
+              <span className="ml-1.5 inline-flex items-center gap-1">
+                <TagIcon className="h-2.5 w-2.5 opacity-70" />
+                {sheet.auto_tags.slice(0, 3).map(t => (
+                  <span
+                    key={t.id}
+                    className="inline-flex items-center rounded-sm px-1 py-0.5 text-[10px] font-medium border"
+                    style={t.color ? { borderColor: t.color, color: t.color } : undefined}
+                  >
+                    {t.name}
+                  </span>
+                ))}
+                {sheet.auto_tags.length > 3 && (
+                  <span className="text-[10px] text-muted-foreground">+{sheet.auto_tags.length - 3}</span>
+                )}
+              </span>
+            )}
+          </Button>
         </div>
       </div>
 
@@ -1169,12 +1457,16 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
                     <div className="flex items-start justify-between gap-2 group/acc">
                       <div className="flex items-center gap-1 min-w-0">
                         <span className="font-mono text-[13px] font-semibold tracking-tight text-foreground">
-                          {row.accession_number}
+                          {isDemo() ? `REQ-${row.id}` : row.accession_number}
                         </span>
                         <button
                           className="opacity-0 group-hover/acc:opacity-60 hover:!opacity-100 transition-opacity shrink-0"
-                          onClick={(e) => { e.stopPropagation(); navigator.clipboard.writeText(row.accession_number) }}
-                          title="Copy accession number"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            navigator.clipboard.writeText(isDemo() ? `REQ-${row.id}` : row.accession_number)
+                            setSelectedRowId(row.id)
+                          }}
+                          title={isDemo() ? 'Copy request ID' : 'Copy accession number'}
                         >
                           <Copy className="h-3 w-3" />
                         </button>
@@ -1195,6 +1487,7 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
                           {row.slide_location}
                         </span>
                       )}
+                      {coverage[row.id] && <CoverageBadge cov={coverage[row.id]} />}
                     </div>
                     <CaseProgressBar row={row} />
                     {row.notes && (
@@ -1213,7 +1506,7 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
                 {/* Detail header */}
                 <div className="flex items-center justify-between mb-4">
                   <div>
-                    <h3 className="font-mono text-lg font-bold tracking-tight">{selectedRow.accession_number}</h3>
+                    <h3 className="font-mono text-lg font-bold tracking-tight">{isDemo() ? `REQ-${selectedRow.id}` : selectedRow.accession_number}</h3>
                     <p className="text-[12px] text-muted-foreground mt-0.5">
                       Added {selectedRow.created_at ? new Date(selectedRow.created_at).toLocaleDateString() : '—'}
                       {selectedRow.updated_at && ` · Updated ${new Date(selectedRow.updated_at).toLocaleDateString()}`}
@@ -1303,6 +1596,29 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
                         </button>
                         {isExpanded && (
                           <div className={`px-3 pb-3 pt-2 border-l-3 ${section.accentColor}`}>
+                            {/* Auto-populate button for Scanning section */}
+                            {section.id === 'scanning' && scannedSlides && scannedSlides.total > 0 && (
+                              <button
+                                className="w-full mb-3 flex items-center gap-2 px-3 py-2 rounded-md bg-violet-50 border border-violet-200 text-violet-700 text-[12px] font-medium hover:bg-violet-100 transition-colors"
+                                onClick={() => {
+                                  const heVal = scannedSlides.heBlocks.join(';')
+                                  const nonHeVal = scannedSlides.nonHeBlocks.join(';')
+                                  if (heVal) updateField(selectedRow.id, 'hes_scanned', heVal)
+                                  if (nonHeVal) updateField(selectedRow.id, 'non_hes_scanned', nonHeVal)
+                                  if (heVal && scannedSlides.nonHeBlocks.length === 0) {
+                                    updateField(selectedRow.id, 'he_scanning_status', 'Complete')
+                                  }
+                                }}
+                              >
+                                <Microscope className="h-3.5 w-3.5" />
+                                Auto-fill from {scannedSlides.total} scanned slide{scannedSlides.total !== 1 ? 's' : ''}
+                                <span className="text-[11px] font-normal opacity-70 ml-auto">
+                                  {scannedSlides.heBlocks.length > 0 && `${scannedSlides.heBlocks.length} HE`}
+                                  {scannedSlides.heBlocks.length > 0 && scannedSlides.nonHeBlocks.length > 0 && ' · '}
+                                  {scannedSlides.nonHeBlocks.length > 0 && `${scannedSlides.nonHeBlocks.length} non-HE`}
+                                </span>
+                              </button>
+                            )}
                             <div className="grid grid-cols-2 gap-x-4 gap-y-3">
                               {section.fields.map(field => (
                                 <div key={field.key} className={field.span === 2 ? 'col-span-2' : ''}>
@@ -1326,6 +1642,72 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
           </div>
         </div>
       )}
+
+      {/* Settings dialog — auto-tags */}
+      <Dialog open={isSettingsOpen} onOpenChange={setIsSettingsOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Sheet Settings</DialogTitle>
+            <DialogDescription>
+              Pick one or more tags to auto-apply to every case in this sheet. Tags are also applied to cases added later. Click a chip to toggle it.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3 py-2">
+            <div className="flex items-center justify-between">
+              <label className="text-sm font-medium">Auto-tags</label>
+              <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                <span className="tabular-nums">{settingsTagIds.size} selected</span>
+                {settingsTagIds.size > 0 && (
+                  <button
+                    type="button"
+                    className="underline hover:text-foreground"
+                    onClick={() => setSettingsTagIds(new Set())}
+                  >
+                    Clear
+                  </button>
+                )}
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-1.5 max-h-60 overflow-y-auto">
+              {allTags.length === 0 ? (
+                <p className="text-[12px] text-muted-foreground">No tags exist yet. Create one in the Slide Library.</p>
+              ) : (
+                allTags.map((t) => {
+                  const selected = settingsTagIds.has(t.id)
+                  return (
+                    <button
+                      key={t.id}
+                      type="button"
+                      onClick={() => toggleSettingsTag(t.id)}
+                      className={`inline-flex items-center gap-1 rounded-sm px-2 py-1 text-[12px] transition-colors ${
+                        selected
+                          ? 'border-2 border-black bg-muted'
+                          : 'border border-input hover:bg-muted'
+                      }`}
+                      style={!selected && t.color ? { borderColor: t.color, color: t.color } : undefined}
+                    >
+                      {t.color && <span className="h-2 w-2 rounded-full" style={{ backgroundColor: t.color }} />}
+                      <span className={selected ? 'text-foreground font-medium' : ''}>{t.name}</span>
+                      {selected && <Check className="h-3 w-3" />}
+                    </button>
+                  )
+                })
+              )}
+            </div>
+            {settingsMessage && (
+              <p className="text-[12px] text-muted-foreground">{settingsMessage}</p>
+            )}
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" size="sm" onClick={() => setIsSettingsOpen(false)}>Close</Button>
+            <Button size="sm" onClick={saveSettings} disabled={savingSettings}>
+              {savingSettings ? 'Saving…' : 'Save'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* Delete confirmation dialog */}
       <Dialog open={deleteConfirmId !== null} onOpenChange={() => setDeleteConfirmId(null)}>
@@ -1534,7 +1916,7 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
                       const row = rows.find(r => r.id === id)
                       return row ? (
                         <span key={id} className="inline-flex rounded bg-gray-100 border border-gray-300 px-1.5 py-0.5 text-[12px] font-mono text-gray-700">
-                          {row.accession_number}
+                          {isDemo() ? `REQ-${row.id}` : row.accession_number}
                         </span>
                       ) : null
                     })}

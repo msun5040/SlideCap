@@ -4,7 +4,8 @@ import {
   MoreHorizontal, Grid3X3, List, GripVertical,
   ChevronRight, Microscope, Check, Loader2,
   FolderPlus, Users, Edit2, ExternalLink, Filter,
-  LayoutGrid, Rows3, Tag,
+  LayoutGrid, Rows3, Tag, ScanSearch, Database,
+  HardDrive, Import, Play, FolderOutput, Tag as TagIcon,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -17,7 +18,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import type { Study, StudyDetail, StudySlide, StudyGroup, Slide } from '@/types/slide'
+import type { Study, StudyDetail, StudySlide, StudyGroup, Slide, UnlinkedFile } from '@/types/slide'
 import { getApiBase } from '@/api'
 
 // ─── Color palette for groups ───────────────────────────────
@@ -232,7 +233,7 @@ function SlideChip({
         style={groupColor ? { borderLeftColor: groupColor, borderLeftWidth: 3 } : undefined}
       >
         <span className="font-mono text-foreground">
-          {slide.accession_number ? `${slide.accession_number}` : slide.slide_hash.slice(0, 8)}
+          {slide.accession_number || slide.filename || slide.slide_hash.slice(0, 8)}
         </span>
         {slide.block_id && <span className="text-muted-foreground">{slide.block_id}</span>}
         <span className={`px-1 rounded-sm text-[10px] border ${stainColor}`}>{slide.stain_type || '?'}</span>
@@ -252,7 +253,7 @@ function SlideChip({
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-1.5">
           <span className="text-[12px] font-mono font-medium text-foreground truncate">
-            {slide.accession_number || slide.slide_hash.slice(0, 12)}
+            {slide.accession_number || slide.filename || slide.slide_hash.slice(0, 12)}
           </span>
           {slide.block_id && (
             <span className="text-[11px] text-muted-foreground">{slide.block_id}</span>
@@ -281,8 +282,12 @@ function GroupCard({
   onDeleteGroup,
   onEditGroup,
   onRemoveSlides,
+  onRunAnalysis,
+  onExportGroup,
+  onTagGroup,
   allStudySlides,
   viewMode,
+  children,
 }: {
   group: StudyGroup
   slides: StudySlide[]
@@ -291,8 +296,12 @@ function GroupCard({
   onDeleteGroup: () => void
   onEditGroup: () => void
   onRemoveSlides: (hashes: string[]) => void
+  onRunAnalysis: () => void
+  onExportGroup: () => void
+  onTagGroup: () => void
   allStudySlides: StudySlide[]
   viewMode: 'chips' | 'rows'
+  children?: React.ReactNode
 }) {
   const [collapsed, setCollapsed] = useState(false)
   const groupSlides = slides.filter(s => group.slide_hashes.includes(s.slide_hash))
@@ -337,7 +346,33 @@ function GroupCard({
             <span className="text-[11px] text-muted-foreground tabular-nums">{groupSlides.length}</span>
           </div>
         </div>
-        <div className="flex items-center gap-1 shrink-0">
+        <div className="flex items-center gap-0.5 shrink-0">
+          {groupSlides.length > 0 && (
+            <>
+              <button
+                className="p-1 text-muted-foreground hover:text-green-600 rounded transition-colors"
+                onClick={e => { e.stopPropagation(); onRunAnalysis() }}
+                title="Run analysis on this group"
+              >
+                <Play className="h-3 w-3" />
+              </button>
+              <button
+                className="p-1 text-muted-foreground hover:text-blue-600 rounded transition-colors"
+                onClick={e => { e.stopPropagation(); onExportGroup() }}
+                title="Export slides to folder"
+              >
+                <FolderOutput className="h-3 w-3" />
+              </button>
+              <button
+                className="p-1 text-muted-foreground hover:text-purple-600 rounded transition-colors"
+                onClick={e => { e.stopPropagation(); onTagGroup() }}
+                title="Tag all slides in group"
+              >
+                <TagIcon className="h-3 w-3" />
+              </button>
+            </>
+          )}
+          <div className="w-px h-3 bg-border mx-0.5" />
           <button
             className="p-1 text-muted-foreground hover:text-foreground rounded transition-colors"
             onClick={e => { e.stopPropagation(); handleSelectAll() }}
@@ -393,6 +428,9 @@ function GroupCard({
         </div>
       )}
 
+      {/* Nested child groups */}
+      {!collapsed && children}
+
       {/* Group note */}
       {!collapsed && group.note && (
         <div className="px-3 py-1.5 border-t border-border/40 bg-muted/10">
@@ -420,6 +458,24 @@ function StudyDetailView({ studyId, onBack }: { studyId: number; onBack: () => v
   const [stainFilter, setStainFilter] = useState<string>('')
   const [groupFilter, setGroupFilter] = useState<string>('all') // 'all' | 'ungrouped' | group_id
   const [addingSlides, setAddingSlides] = useState(false)
+
+  // ── Unlinked files (directory scan) ──
+  const [unlinkedFiles, setUnlinkedFiles] = useState<UnlinkedFile[]>([])
+  const [scanningDir, setScanningDir] = useState(false)
+  const [showUnlinked, setShowUnlinked] = useState(false)
+  const [selectedUnlinked, setSelectedUnlinked] = useState<Set<string>>(new Set())
+  const [importingFiles, setImportingFiles] = useState(false)
+  const [importTargetGroup, setImportTargetGroup] = useState<number | ''>('')
+
+  // ── Group actions ──
+  const [showExportDialog, setShowExportDialog] = useState<StudyGroup | null>(null)
+  const [exportPath, setExportPath] = useState('')
+  const [exportSymlinks, setExportSymlinks] = useState(true)
+  const [exporting, setExporting] = useState(false)
+  const [showTagDialog, setShowTagDialog] = useState<StudyGroup | null>(null)
+  const [groupTagName, setGroupTagName] = useState('')
+  const [groupTagColor, setGroupTagColor] = useState(GROUP_COLORS[0])
+  const [taggingGroup, setTaggingGroup] = useState(false)
 
   // Group form
   const [gName, setGName] = useState('')
@@ -612,6 +668,109 @@ function StudyDetailView({ studyId, onBack }: { studyId: number; onBack: () => v
     } catch {}
   }
 
+  // ── Scan study directory for unlinked files ──
+  const handleScanDirectory = useCallback(async () => {
+    setScanningDir(true)
+    try {
+      const res = await fetch(`${getApiBase()}/studies/${studyId}/unlinked-files`)
+      if (res.ok) {
+        const data = await res.json()
+        setUnlinkedFiles(data.files || [])
+        setShowUnlinked(true)
+        setSelectedUnlinked(new Set((data.files || []).map((f: UnlinkedFile) => f.filename)))
+      }
+    } catch (e) { console.error(e) }
+    finally { setScanningDir(false) }
+  }, [studyId])
+
+  // Import selected unlinked files into study
+  const handleImportFiles = async () => {
+    const filenames = Array.from(selectedUnlinked)
+    if (!filenames.length) return
+    setImportingFiles(true)
+    try {
+      const body: Record<string, unknown> = { filenames }
+      if (importTargetGroup) body.group_id = importTargetGroup
+      const res = await fetch(`${getApiBase()}/studies/${studyId}/import-files`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      if (res.ok) {
+        const data = await res.json()
+        // Remove imported files from unlinked list
+        setUnlinkedFiles(prev => prev.filter(f => !selectedUnlinked.has(f.filename)))
+        setSelectedUnlinked(new Set())
+        fetchStudy()
+      }
+    } catch (e) { console.error(e) }
+    finally { setImportingFiles(false) }
+  }
+
+  const toggleUnlinkedFile = (filename: string) => {
+    setSelectedUnlinked(prev => {
+      const next = new Set(prev)
+      if (next.has(filename)) next.delete(filename)
+      else next.add(filename)
+      return next
+    })
+  }
+
+  const toggleAllUnlinked = () => {
+    if (selectedUnlinked.size === unlinkedFiles.length) setSelectedUnlinked(new Set())
+    else setSelectedUnlinked(new Set(unlinkedFiles.map(f => f.filename)))
+  }
+
+  // ── Group action handlers ──
+  const handleExportGroup = async () => {
+    if (!showExportDialog || !exportPath.trim()) return
+    setExporting(true)
+    try {
+      const res = await fetch(`${getApiBase()}/studies/${studyId}/groups/${showExportDialog.id}/export`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target_dir: exportPath, symlinks: exportSymlinks }),
+      })
+      if (res.ok) {
+        const data = await res.json()
+        alert(`Exported ${data.exported} slide(s) to ${data.target_dir}${data.errors?.length ? `\n${data.errors.length} error(s)` : ''}`)
+        setShowExportDialog(null)
+        setExportPath('')
+      } else {
+        const err = await res.json().catch(() => ({}))
+        alert(`Export failed: ${err.detail || res.statusText}`)
+      }
+    } catch (e) { alert(`Export failed: ${e}`) }
+    finally { setExporting(false) }
+  }
+
+  const handleTagGroup = async () => {
+    if (!showTagDialog || !groupTagName.trim()) return
+    setTaggingGroup(true)
+    try {
+      const res = await fetch(`${getApiBase()}/studies/${studyId}/groups/${showTagDialog.id}/tag`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tag_name: groupTagName, tag_color: groupTagColor }),
+      })
+      if (res.ok) {
+        const data = await res.json()
+        alert(`Tagged ${data.tagged} slide(s) with "${data.tag_name}"`)
+        setShowTagDialog(null)
+        setGroupTagName('')
+      } else {
+        const err = await res.json().catch(() => ({}))
+        alert(`Tag failed: ${err.detail || res.statusText}`)
+      }
+    } catch (e) { alert(`Tag failed: ${e}`) }
+    finally { setTaggingGroup(false) }
+  }
+
+  const handleRunAnalysisOnGroup = (group: StudyGroup) => {
+    // Select only this group's slides, then user can go to Analysis tab
+    setSelectedHashes(new Set(group.slide_hashes))
+  }
+
   const resetGroupForm = () => {
     setGName(''); setGLabel(''); setGColor(GROUP_COLORS[0]); setGNote(''); setGParent(null)
   }
@@ -683,6 +842,10 @@ function StudyDetailView({ studyId, onBack }: { studyId: number; onBack: () => v
         <Button size="sm" variant="outline" onClick={openCreateGroup} className="h-7 text-[11px] px-2.5">
           <FolderPlus className="h-3 w-3 mr-1" />New Group
         </Button>
+        <Button size="sm" variant="outline" onClick={handleScanDirectory} disabled={scanningDir} className="h-7 text-[11px] px-2.5">
+          {scanningDir ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <ScanSearch className="h-3 w-3 mr-1" />}
+          Scan Directory
+        </Button>
 
         <div className="h-4 w-px bg-border mx-1" />
 
@@ -753,23 +916,141 @@ function StudyDetailView({ studyId, onBack }: { studyId: number; onBack: () => v
         </div>
       )}
 
+      {/* ── Unlinked Files Panel ── */}
+      {showUnlinked && (
+        <div className="mb-4 border border-amber-300 rounded-lg bg-amber-50/50 dark:bg-amber-950/20 overflow-hidden">
+          <div className="flex items-center gap-2 px-3 py-2.5 border-b border-amber-200 dark:border-amber-800">
+            <HardDrive className="h-3.5 w-3.5 text-amber-600" />
+            <span className="text-[13px] font-medium text-foreground">
+              Directory Files
+            </span>
+            <span className="text-[11px] text-muted-foreground tabular-nums">
+              {unlinkedFiles.length} unlinked
+            </span>
+            <div className="ml-auto flex items-center gap-2">
+              {unlinkedFiles.length > 0 && (
+                <>
+                  <button
+                    className="text-[11px] text-muted-foreground hover:text-foreground transition-colors"
+                    onClick={toggleAllUnlinked}
+                  >
+                    {selectedUnlinked.size === unlinkedFiles.length ? 'Deselect all' : 'Select all'}
+                  </button>
+                  {study.groups.length > 0 && (
+                    <select
+                      value={importTargetGroup}
+                      onChange={e => setImportTargetGroup(e.target.value ? Number(e.target.value) : '')}
+                      className="text-[11px] h-6 px-1.5 rounded border border-border bg-background text-foreground"
+                    >
+                      <option value="">No group</option>
+                      {study.groups.map(g => (
+                        <option key={g.id} value={g.id}>{g.label ? `${g.label} — ` : ''}{g.name}</option>
+                      ))}
+                    </select>
+                  )}
+                  <Button
+                    size="sm"
+                    onClick={handleImportFiles}
+                    disabled={importingFiles || selectedUnlinked.size === 0}
+                    className="h-6 text-[11px] px-2.5"
+                  >
+                    {importingFiles ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Import className="h-3 w-3 mr-1" />}
+                    Import {selectedUnlinked.size > 0 ? `(${selectedUnlinked.size})` : ''}
+                  </Button>
+                </>
+              )}
+              <button
+                className="p-1 text-muted-foreground hover:text-foreground rounded transition-colors"
+                onClick={() => setShowUnlinked(false)}
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          </div>
+          {unlinkedFiles.length === 0 ? (
+            <div className="px-3 py-6 text-center">
+              <Check className="h-5 w-5 text-emerald-500 mx-auto mb-2" />
+              <p className="text-[12px] text-muted-foreground">All files in the study folder are already imported</p>
+            </div>
+          ) : (
+            <div className="max-h-[300px] overflow-y-auto">
+              {unlinkedFiles.map(f => (
+                <div
+                  key={f.filename}
+                  className={`flex items-center gap-2 px-3 py-2 border-b border-amber-100 dark:border-amber-900/30 last:border-b-0 cursor-pointer transition-colors ${
+                    selectedUnlinked.has(f.filename) ? 'bg-amber-100/50 dark:bg-amber-900/30' : 'hover:bg-amber-50 dark:hover:bg-amber-950/30'
+                  }`}
+                  onClick={() => toggleUnlinkedFile(f.filename)}
+                >
+                  <Checkbox
+                    checked={selectedUnlinked.has(f.filename)}
+                    className="h-3.5 w-3.5 pointer-events-none"
+                  />
+                  <Microscope className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                  <div className="flex-1 min-w-0">
+                    <span className="text-[12px] font-mono font-medium text-foreground truncate block">{f.filename}</span>
+                    {f.subfolder && (
+                      <span className="text-[10px] text-muted-foreground">{f.subfolder}/</span>
+                    )}
+                  </div>
+                  {f.in_database && (
+                    <Badge variant="outline" className="text-[9px] h-4 shrink-0 text-blue-600 border-blue-300">
+                      <Database className="h-2.5 w-2.5 mr-0.5" />Clinical
+                    </Badge>
+                  )}
+                  <span className="text-[10px] text-muted-foreground tabular-nums shrink-0">{formatBytes(f.file_size_bytes)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Main content: Groups + Ungrouped */}
       <div className="space-y-3">
-        {/* Groups */}
-        {topLevelGroups.map(group => (
-          <GroupCard
-            key={group.id}
-            group={group}
-            slides={filteredSlides}
-            selectedHashes={selectedHashes}
-            onSelectSlide={handleSelectSlide}
-            onDeleteGroup={() => handleDeleteGroup(group.id)}
-            onEditGroup={() => openEditGroup(group)}
-            onRemoveSlides={(hashes) => handleRemoveSlidesFromGroup(group.id, hashes)}
-            allStudySlides={study.slides}
-            viewMode={viewMode}
-          />
-        ))}
+        {/* Groups (recursive for nesting) */}
+        {topLevelGroups.map(group => {
+          const childGroups = study.groups.filter(g => g.parent_id === group.id)
+          return (
+            <GroupCard
+              key={group.id}
+              group={group}
+              slides={filteredSlides}
+              selectedHashes={selectedHashes}
+              onSelectSlide={handleSelectSlide}
+              onDeleteGroup={() => handleDeleteGroup(group.id)}
+              onEditGroup={() => openEditGroup(group)}
+              onRemoveSlides={(hashes) => handleRemoveSlidesFromGroup(group.id, hashes)}
+              onRunAnalysis={() => handleRunAnalysisOnGroup(group)}
+              onExportGroup={() => { setShowExportDialog(group); setExportPath('') }}
+              onTagGroup={() => { setShowTagDialog(group); setGroupTagName('') }}
+              allStudySlides={study.slides}
+              viewMode={viewMode}
+            >
+              {childGroups.length > 0 && (
+                <div className="p-2 pl-4 space-y-2 border-t border-border/40 bg-muted/5">
+                  {childGroups.map(child => (
+                    <GroupCard
+                      key={child.id}
+                      group={child}
+                      slides={filteredSlides}
+                      selectedHashes={selectedHashes}
+                      onSelectSlide={handleSelectSlide}
+                      onDeleteGroup={() => handleDeleteGroup(child.id)}
+                      onEditGroup={() => openEditGroup(child)}
+                      onRemoveSlides={(hashes) => handleRemoveSlidesFromGroup(child.id, hashes)}
+                      onRunAnalysis={() => handleRunAnalysisOnGroup(child)}
+                      onExportGroup={() => { setShowExportDialog(child); setExportPath('') }}
+                      onTagGroup={() => { setShowTagDialog(child); setGroupTagName('') }}
+                      allStudySlides={study.slides}
+                      viewMode={viewMode}
+                    />
+                  ))}
+                </div>
+              )}
+            </GroupCard>
+          )
+        })}
 
         {/* Ungrouped slides */}
         {ungroupedSlides.length > 0 && (
@@ -949,6 +1230,101 @@ function StudyDetailView({ studyId, onBack }: { studyId: number; onBack: () => v
           </div>
         </DialogContent>
       </Dialog>
+
+      {/* ── Export Group Dialog ── */}
+      <Dialog open={!!showExportDialog} onOpenChange={open => { if (!open) setShowExportDialog(null) }}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="text-[15px]">Export Group: {showExportDialog?.name}</DialogTitle>
+            <DialogDescription className="text-[12px]">
+              {exportSymlinks ? 'Create symlinks' : 'Copy files'} to a target directory ({showExportDialog?.slide_count} slides)
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3 mt-2">
+            <div>
+              <label className="text-[12px] font-medium text-foreground mb-1 block">Target Directory</label>
+              <Input
+                value={exportPath}
+                onChange={e => setExportPath(e.target.value)}
+                placeholder="/path/to/export/folder"
+                className="h-8 text-[13px] font-mono"
+              />
+            </div>
+            <div className="flex items-center gap-2">
+              <Checkbox
+                id="symlinks"
+                checked={exportSymlinks}
+                onCheckedChange={v => setExportSymlinks(!!v)}
+              />
+              <label htmlFor="symlinks" className="text-[12px] text-foreground cursor-pointer">
+                Use symlinks (saves disk space, requires same filesystem)
+              </label>
+            </div>
+            <div className="flex justify-end gap-2 pt-1">
+              <Button variant="outline" size="sm" onClick={() => setShowExportDialog(null)} className="h-8 text-[12px]">Cancel</Button>
+              <Button size="sm" onClick={handleExportGroup} disabled={!exportPath.trim() || exporting} className="h-8 text-[12px]">
+                {exporting ? <Loader2 className="h-3 w-3 animate-spin mr-1.5" /> : <FolderOutput className="h-3 w-3 mr-1.5" />}
+                Export
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* ── Tag Group Dialog ── */}
+      <Dialog open={!!showTagDialog} onOpenChange={open => { if (!open) setShowTagDialog(null) }}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle className="text-[15px]">Tag Group: {showTagDialog?.name}</DialogTitle>
+            <DialogDescription className="text-[12px]">
+              Apply a tag to all {showTagDialog?.slide_count} slides in this group
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3 mt-2">
+            <div>
+              <label className="text-[12px] font-medium text-foreground mb-1 block">Tag Name</label>
+              <Input
+                value={groupTagName}
+                onChange={e => setGroupTagName(e.target.value)}
+                placeholder="e.g. MSK1, pre-treatment"
+                className="h-8 text-[13px]"
+                autoFocus
+              />
+            </div>
+            <div>
+              <label className="text-[12px] font-medium text-foreground mb-1 block">Color</label>
+              <div className="flex items-center gap-1 flex-wrap">
+                {GROUP_COLORS.map(c => (
+                  <button
+                    key={c}
+                    className={`h-6 w-6 rounded-sm border-2 transition-all ${groupTagColor === c ? 'border-foreground scale-110' : 'border-transparent hover:border-muted-foreground/30'}`}
+                    style={{ backgroundColor: c }}
+                    onClick={() => setGroupTagColor(c)}
+                  />
+                ))}
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 pt-1">
+              <Button variant="outline" size="sm" onClick={() => setShowTagDialog(null)} className="h-8 text-[12px]">Cancel</Button>
+              <Button size="sm" onClick={handleTagGroup} disabled={!groupTagName.trim() || taggingGroup} className="h-8 text-[12px]">
+                {taggingGroup ? <Loader2 className="h-3 w-3 animate-spin mr-1.5" /> : <TagIcon className="h-3 w-3 mr-1.5" />}
+                Tag All
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Selection hint for Run Analysis */}
+      {selectedHashes.size > 0 && (
+        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 bg-primary text-primary-foreground px-4 py-2 rounded-full shadow-lg text-[12px] font-medium flex items-center gap-2 z-50">
+          <Play className="h-3.5 w-3.5" />
+          {selectedHashes.size} slides selected — go to Analysis tab to submit
+          <button onClick={() => setSelectedHashes(new Set())} className="ml-2 hover:opacity-70">
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      )}
     </div>
   )
 }

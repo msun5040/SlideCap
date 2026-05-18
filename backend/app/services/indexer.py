@@ -419,7 +419,19 @@ class SlideIndexer:
                 self.accession_hash_to_paths[accession_hash].append(filepath)
                 
                 count += 1
-        
+
+        # Also scan studies/ directory for research/external slides
+        studies_dir = self.root / 'studies'
+        if studies_dir.is_dir():
+            valid_exts = {'.svs', '.tif', '.tiff', '.ndpi', '.mrxs'}
+            for filepath in studies_dir.rglob('*'):
+                if not filepath.is_file() or filepath.suffix.lower() not in valid_exts:
+                    continue
+                slide_hash = self.hasher.hash_slide_stem(filepath.stem)
+                if slide_hash not in self.slide_hash_to_path:
+                    self.slide_hash_to_path[slide_hash] = filepath
+                    count += 1
+
         return count
     
     def get_filepath(self, slide_hash: str) -> Optional[Path]:
@@ -744,6 +756,7 @@ class SlideIndexer:
             'years': sorted(set(
                 int(p.parent.name)
                 for p in self.slide_hash_to_path.values()
+                if p.parent.name.isdigit()
             )),
             'stain_types': sorted(set(
                 self.parser.parse(p.name).stain_type

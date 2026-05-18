@@ -190,28 +190,48 @@ class ClusterService:
                 })
         return gpus
 
+    def _make_transfer_transport(self) -> paramiko.Transport:
+        """
+        Create a dedicated paramiko Transport for file transfer.
+        Separate from the main SSH client so large transfers don't
+        starve the control channel's key-renegotiation.
+        """
+        if not self._host or not self._username or not self._password:
+            raise RuntimeError("Not connected to cluster. Please connect first.")
+        transport = paramiko.Transport((self._host, self._port))
+        # Disable key renegotiation during transfer (avoids timeout on large files)
+        transport.packetizer.REKEY_BYTES = pow(2, 40)      # 1 TB
+        transport.packetizer.REKEY_PACKETS = pow(2, 40)    # effectively never
+        transport.connect(username=self._username, password=self._password)
+        return transport
+
     def rsync_slide(self, local_path: Path, remote_dir: str) -> str:
         """
         Transfer a slide file to the cluster.
-        Uses rsync with sshpass if available, falls back to paramiko SFTP.
-        Returns the remote file path.
+
+        Strategy (in order):
+        1. rsync + sshpass (best: resumable, delta, progress)
+        2. scp + sshpass  (good: simple, uses its own SSH connection)
+        3. paramiko SFTP on a dedicated transport (fallback: avoids key-exchange timeout
+           by using a separate connection with rekeying disabled)
         """
         filename = local_path.name
         remote_path = f"{remote_dir}/{filename}"
+        file_mb = local_path.stat().st_size / 1e6
 
         # Ensure remote directory exists
         self.run_command(f"mkdir -p {remote_dir}")
 
-        # Try rsync + sshpass first (faster for large files)
-        # No -z: SVS/NDPI are already compressed; compression wastes CPU with no size benefit
+        ssh_opts = (
+            f"ssh -p {self._port}"
+            " -o StrictHostKeyChecking=no"
+            " -o ServerAliveInterval=15"
+            " -o ServerAliveCountMax=10"
+        )
+
+        # Strategy 1: rsync + sshpass (resumable, delta-transfer)
         if shutil.which("sshpass") and shutil.which("rsync"):
             try:
-                ssh_opts = (
-                    f"ssh -p {self._port}"
-                    " -o StrictHostKeyChecking=no"
-                    " -o ServerAliveInterval=30"
-                    " -o ServerAliveCountMax=6"
-                )
                 cmd = [
                     "sshpass", "-p", self._password,
                     "rsync", "-avP", "--no-perms", "--timeout=120",
@@ -220,24 +240,54 @@ class ClusterService:
                     f"{self._username}@{self._host}:{remote_dir}/",
                 ]
                 result = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=3600,  # 1 hour timeout for large files
+                    cmd, capture_output=True, text=True, timeout=7200,
                 )
                 if result.returncode == 0:
                     return remote_path
-                print(f"[Cluster] rsync failed: {result.stderr}, falling back to SFTP")
+                print(f"[Cluster] rsync failed (rc={result.returncode}): {result.stderr[:200]}")
+            except subprocess.TimeoutExpired:
+                print(f"[Cluster] rsync timed out for {filename}")
             except Exception as e:
-                print(f"[Cluster] rsync error: {e}, falling back to SFTP")
+                print(f"[Cluster] rsync error: {e}")
 
-        # Fallback: paramiko SFTP
-        client = self._get_client()
-        sftp = client.open_sftp()
+        # Strategy 2: scp + sshpass (simpler, own SSH connection)
+        if shutil.which("sshpass") and shutil.which("scp"):
+            try:
+                cmd = [
+                    "sshpass", "-p", self._password,
+                    "scp", "-o", "StrictHostKeyChecking=no",
+                    "-o", "ServerAliveInterval=15",
+                    "-o", "ServerAliveCountMax=10",
+                    "-P", str(self._port),
+                    str(local_path),
+                    f"{self._username}@{self._host}:{remote_path}",
+                ]
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=7200,
+                )
+                if result.returncode == 0:
+                    return remote_path
+                print(f"[Cluster] scp failed (rc={result.returncode}): {result.stderr[:200]}")
+            except subprocess.TimeoutExpired:
+                print(f"[Cluster] scp timed out for {filename}")
+            except Exception as e:
+                print(f"[Cluster] scp error: {e}")
+
+        # Strategy 3: paramiko SFTP on a DEDICATED transport
+        # Uses its own SSH connection so the main client isn't affected,
+        # and disables rekeying so large transfers don't trigger key-exchange timeouts.
+        print(f"[Cluster] Using dedicated SFTP transport for {filename} ({file_mb:.0f} MB)")
+        transport = self._make_transfer_transport()
         try:
-            sftp.put(str(local_path), remote_path)
+            sftp = paramiko.SFTPClient.from_transport(transport)
+            try:
+                # Use a 32MB buffer for better throughput on large files
+                sftp.get_channel().settimeout(300)  # 5 min timeout per read/write op
+                sftp.put(str(local_path), remote_path)
+            finally:
+                sftp.close()
         finally:
-            sftp.close()
+            transport.close()
 
         return remote_path
 
@@ -279,6 +329,16 @@ class ClusterService:
         if analysis.env_setup:
             parts.append(analysis.env_setup)
 
+        # Pin the job to the requested GPU
+        parts.append(f"export CUDA_VISIBLE_DEVICES={gpu_index}")
+        parts.append(f"export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1")
+
+        # Force TMPDIR to local disk — Ray/CellViT write heavy temp I/O that is
+        # extremely slow over NFS/SMB.  /tmp is always local.
+        local_tmp = f"/tmp/slidecap_tmp/{job_id}"
+        parts.append(f"export TMPDIR={_shlex.quote(local_tmp)}")
+        parts.append(f"mkdir -p {_shlex.quote(local_tmp)}")
+
         # Clean any stale output from a previous run, then create fresh dir
         parts.append(f"rm -rf {_shlex.quote(remote_output_dir)}")
         parts.append(f"mkdir -p {_shlex.quote(remote_output_dir)}")
@@ -286,9 +346,10 @@ class ClusterService:
 
         full_command = " && ".join(parts)
 
-        # After analysis (success or failure): delete the entire batch WSI dir
+        # After analysis (success or failure): clean up WSI dir and local tmp
         full_command += (
             f"; rm -rf {_shlex.quote(remote_wsi_dir)}"
+            f"; rm -rf {_shlex.quote(local_tmp)}"
             f"; true"
         )
 

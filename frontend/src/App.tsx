@@ -41,8 +41,9 @@ import { RequestTracker } from '@/components/RequestTracker'
 import { SlidePull } from '@/components/SlidePull'
 import { StudyManager } from '@/components/StudyManager'
 import { LauncherScreen } from '@/components/LauncherScreen'
+import { LoginScreen } from '@/components/LoginScreen'
 import { LoadingSpinner } from '@/components/LoadingSpinner'
-import { setApiBase, getApiBase } from '@/api'
+import { setApiBase, getApiBase, getAuthToken, clearAuthToken, installAuthInterceptor, setAppMode, isDemo } from '@/api'
 
 interface SortStatus {
   running: boolean
@@ -62,6 +63,8 @@ export { getApiBase as getAPI } from '@/api'
 
 export default function App() {
   const [launched, setLaunched] = useState(false)
+  const [authenticated, setAuthenticated] = useState(false)
+  const [checkingAuth, setCheckingAuth] = useState(true)
   const [currentView, setCurrentView] = useState<View>('slides')
   const [isSidebarOpen, setIsSidebarOpen] = useState(true)
   const [sortStatus, setSortStatus] = useState<SortStatus | null>(null)
@@ -72,18 +75,55 @@ export default function App() {
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const healthPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
+  // Install auth interceptor once
+  useEffect(() => {
+    installAuthInterceptor()
+  }, [])
+
   useEffect(() => {
     const isElectron = !!(window as any).electronAPI?.isElectron
     if (!isElectron) {
-      fetch(`http://${window.location.hostname}:8000/health`, { signal: AbortSignal.timeout(3000) })
+      const apiBase = getApiBase()
+      fetch(`${apiBase}/health`, { signal: AbortSignal.timeout(3000) })
         .then((res) => {
           if (res.ok) {
-            setApiBase(`http://${window.location.hostname}:8000`)
+            setApiBase(apiBase)
             setLaunched(true)
           }
         })
         .catch(() => {})
     }
+  }, [])
+
+  // Check auth status after launch
+  useEffect(() => {
+    if (!launched) return
+    const token = getAuthToken()
+    if (!token) {
+      setAuthenticated(false)
+      setCheckingAuth(false)
+      return
+    }
+    fetch(`${getApiBase()}/auth/status`, {
+      headers: { 'Authorization': `Bearer ${token}` },
+    })
+      .then(res => res.json())
+      .then(data => {
+        setAuthenticated(data.authenticated)
+        if (!data.authenticated) clearAuthToken()
+      })
+      .catch(() => {
+        setAuthenticated(false)
+        clearAuthToken()
+      })
+      .finally(() => setCheckingAuth(false))
+  }, [launched])
+
+  // Listen for auth expiry from fetch interceptor
+  useEffect(() => {
+    const handler = () => { setAuthenticated(false) }
+    window.addEventListener('slidecap:auth-expired', handler)
+    return () => window.removeEventListener('slidecap:auth-expired', handler)
   }, [])
 
   const handleLaunchReady = useCallback((apiBase: string) => {
@@ -127,7 +167,15 @@ export default function App() {
     const checkHealth = async () => {
       try {
         const res = await fetch(`${getApiBase()}/health`, { signal: AbortSignal.timeout(5000) })
-        setBackendStatus(res.ok ? 'connected' : 'disconnected')
+        if (res.ok) {
+          const data = await res.json().catch(() => null)
+          if (data?.app_mode === 'demo' || data?.app_mode === 'prod') {
+            setAppMode(data.app_mode)
+          }
+          setBackendStatus('connected')
+        } else {
+          setBackendStatus('disconnected')
+        }
       } catch {
         setBackendStatus('disconnected')
       }
@@ -179,12 +227,40 @@ export default function App() {
     }
   }, [])
 
-  const exportSlidesCsv = useCallback(() => {
-    window.open(`${getApiBase()}/export/slides.csv`, '_blank')
+  const exportSlidesCsv = useCallback(async () => {
+    setMenuAction({ type: 'Export slides', status: 'running', message: 'Exporting...' })
+    try {
+      const res = await fetch(`${getApiBase()}/export/slides.csv`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const blob = await res.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = 'slides.csv'
+      a.click()
+      URL.revokeObjectURL(url)
+      setMenuAction({ type: 'Export slides', status: 'done', message: 'Exported slides.csv' })
+      setTimeout(() => setMenuAction(null), 3000)
+    } catch (e: any) {
+      setMenuAction({ type: 'Export slides', status: 'error', message: e.message || 'Export failed' })
+      setTimeout(() => setMenuAction(null), 5000)
+    }
   }, [])
 
   if (!launched) {
     return <LauncherScreen onReady={handleLaunchReady} />
+  }
+
+  if (checkingAuth) {
+    return (
+      <div className="flex h-screen items-center justify-center" style={{ backgroundColor: '#111' }}>
+        <Loader2 className="h-6 w-6 animate-spin text-neutral-500" />
+      </div>
+    )
+  }
+
+  if (!authenticated) {
+    return <LoginScreen onAuthenticated={() => setAuthenticated(true)} />
   }
 
   const navigationItems = [
@@ -218,8 +294,13 @@ export default function App() {
             <div className="flex h-7 w-7 items-center justify-center rounded-sm" style={{ backgroundColor: 'var(--sidebar-accent)' }}>
               <Microscope className="h-4 w-4 text-white" />
             </div>
-            <div>
+            <div className="flex items-center gap-2">
               <span className="text-sm font-semibold text-white tracking-tight">SlideCap</span>
+              {isDemo() && (
+                <span className="text-[9px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded bg-amber-500 text-black">
+                  Demo
+                </span>
+              )}
             </div>
           </div>
 

@@ -26,6 +26,7 @@ export interface Slide {
   file_path?: string
   status?: 'available' | 'in-analysis' | 'archived'
   completed_analyses?: string[]
+  request_sheets?: { sheet_id: number; sheet_name: string | null; case_status: string }[]
 }
 
 export interface SearchFilters {
@@ -200,6 +201,7 @@ export interface RequestRow {
 
 export interface RequestSheetDetail extends RequestSheet {
   rows: RequestRow[]
+  auto_tags?: { id: number; name: string; color?: string }[]
 }
 
 export interface GpuInfo {
@@ -242,6 +244,7 @@ export interface StudySlide {
   file_size_bytes?: number
   file_exists: boolean
   accession_number?: string
+  filename?: string
   slide_number?: string
   year?: number
   file_path?: string
@@ -264,4 +267,14 @@ export interface StudyGroup {
 export interface StudyDetail extends Study {
   groups: StudyGroup[]
   slides: StudySlide[]
+}
+
+export interface UnlinkedFile {
+  filename: string
+  relative_path: string
+  subfolder: string | null
+  file_size_bytes: number
+  extension: string
+  slide_hash: string
+  in_database: boolean
 }

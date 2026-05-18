@@ -1,6 +1,6 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, Query, Depends, UploadFile, File
+from fastapi import FastAPI, HTTPException, Query, Depends, UploadFile, File, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -24,6 +24,19 @@ from sqlalchemy import text as sa_text
 from .config import settings
 from .db import init_db, get_db, get_session, Case, Slide, Tag, Project, Cohort, CohortFlag, CohortPatient, CohortPatientCase, Analysis, AnalysisJob, JobSlide, RequestSheet, RequestRow, Study, StudyGroup, init_lock, get_lock, Patient, ExternalMapping, generate_slidecap_id
 from .services import SlideHasher, SlideIndexer, ClusterService, JobStatusPoller
+from .auth import AuthMiddleware, create_challenge, verify_challenge, create_token, verify_token, cleanup_expired_challenges
+from . import demo as demo_mod
+
+
+def _is_demo() -> bool:
+    return settings.APP_MODE == "demo"
+
+
+# Demo cluster connection state — only used when APP_MODE=demo
+_demo_cluster_connected: bool = False
+
+# Demo staging scan cache (so /staging/sort knows what /staging/scan returned)
+_demo_staging_files: list[dict] = []
 
 
 # Request models for bulk operations
@@ -83,6 +96,9 @@ async def lifespan(app: FastAPI):
     print("Building path cache...")
     cache_count = indexer.build_path_cache()
     print(f"Cached {cache_count} slide paths")
+
+    # Clean up any expired auth challenges
+    cleanup_expired_challenges()
 
     # Auto-run incremental indexing to catch new files
     # Use a dedicated session for startup operations
@@ -149,6 +165,14 @@ async def lifespan(app: FastAPI):
     job_poller.start()
     print("Cluster service initialized (connect via UI to enable job submission)")
 
+    # Demo mode: auto-register CellViT so the demo flow works without manual setup
+    if _is_demo():
+        print(f"[Demo] APP_MODE=demo — seeding demo analyses, mock cluster active")
+        try:
+            demo_mod.seed_demo_analyses()
+        except Exception as e:
+            print(f"[Demo] Failed to seed analyses: {e}")
+
     print("=" * 60)
     print(f"API ready at http://{settings.HOST}:{settings.PORT}")
     print("=" * 60)
@@ -180,6 +204,51 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Auth middleware (must be added AFTER CORS so CORS handles preflight first)
+app.add_middleware(AuthMiddleware)
+
+
+# ============================================================
+# Authentication Endpoints
+# ============================================================
+
+class VerifyRequest(BaseModel):
+    code: str
+
+
+@app.post("/auth/challenge")
+def auth_challenge():
+    """Create a network drive challenge for authentication."""
+    try:
+        code, file_path = create_challenge()
+    except OSError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Cannot write to network drive. Is it mounted? ({e})"
+        )
+    return {
+        "message": "A 6-digit verification code has been written to the network drive.",
+        "file_path": file_path,
+        "expires_in_minutes": settings.AUTH_CHALLENGE_EXPIRY_MINUTES,
+    }
+
+
+@app.post("/auth/verify")
+def auth_verify(body: VerifyRequest):
+    """Verify the challenge code and issue a session token."""
+    if verify_challenge(body.code):
+        token = create_token()
+        return {"token": token, "expires_in_days": settings.AUTH_TOKEN_EXPIRY_DAYS}
+    raise HTTPException(status_code=401, detail="Invalid or expired code")
+
+
+@app.get("/auth/status")
+def auth_status(request: Request):
+    """Check if current token is valid."""
+    auth_header = request.headers.get("Authorization", "")
+    token = auth_header.replace("Bearer ", "") if auth_header.startswith("Bearer ") else ""
+    return {"authenticated": verify_token(token) if token else False}
+
 
 # ============================================================
 # Health & Status Endpoints
@@ -202,6 +271,7 @@ def health():
         "status": "ok",
         "network_root": settings.NETWORK_ROOT,
         "network_accessible": os.path.exists(settings.NETWORK_ROOT),
+        "app_mode": settings.APP_MODE,
     }
 
 
@@ -471,6 +541,28 @@ def search_slides(
             # Tag doesn't exist, return empty results
             results = []
 
+    # Enrich results with request sheet info
+    if results:
+        accessions = {_normalize_accession(r['accession_number']) for r in results if r.get('accession_number')}
+        if accessions:
+            req_rows = db.query(RequestRow).options(joinedload(RequestRow.sheet)).filter(
+                RequestRow.accession_number.in_(accessions)
+            ).all()
+            # Also check normalized forms
+            acc_to_sheets: dict[str, list] = {}
+            for rr in req_rows:
+                norm = _normalize_accession(rr.accession_number)
+                if norm not in acc_to_sheets:
+                    acc_to_sheets[norm] = []
+                acc_to_sheets[norm].append({
+                    'sheet_id': rr.sheet_id,
+                    'sheet_name': rr.sheet.name if rr.sheet else None,
+                    'case_status': rr.case_status,
+                })
+            for r in results:
+                norm = _normalize_accession(r.get('accession_number', ''))
+                r['request_sheets'] = acc_to_sheets.get(norm, [])
+
     return {
         "query": q,
         "filters": {"year": year, "stain": stain, "tag": tag},
@@ -502,6 +594,9 @@ def bulk_add_tags(request: BulkTagRequest, db: Session = Depends(get_db)):
                 if not tag:
                     tag = Tag(name=tag_name, color=request.color)
                     db.add(tag)
+                elif request.color and not tag.color:
+                    # Backfill color if existing tag has none
+                    tag.color = request.color
 
                 if tag not in slide.tags:
                     slide.tags.append(tag)
@@ -1024,6 +1119,9 @@ def add_tag_to_slide(slide_hash: str, tag_data: AddTagRequest, db: Session = Dep
             tag = Tag(name=tag_data.name, color=tag_data.color)
             db.add(tag)
             db.flush()  # Get the ID
+        elif tag_data.color and not tag.color:
+            # Backfill color if existing tag has none
+            tag.color = tag_data.color
 
         if tag not in slide.tags:
             slide.tags.append(tag)
@@ -1511,8 +1609,15 @@ class PatientCaseUpdate(BaseModel):
     note: Optional[str] = None
 
 
-def _enrich_surgery(surgery: "CohortPatientCase") -> dict:
-    """Build the serialised surgery dict, resolving accession number from indexer cache."""
+def _enrich_surgery(
+    surgery: "CohortPatientCase",
+    cohort_slide_ids: Optional[set] = None,
+) -> dict:
+    """Build the serialised surgery dict, resolving accession number from indexer cache.
+
+    If cohort_slide_ids is provided, slide_count is restricted to slides that
+    are members of that cohort (rather than every slide on the case).
+    """
     case = surgery.case
     accession_number = None
     if indexer:
@@ -1523,13 +1628,18 @@ def _enrich_surgery(surgery: "CohortPatientCase") -> dict:
                 if parsed:
                     accession_number = parsed.accession
                     break
+    if cohort_slide_ids is not None:
+        slide_count = sum(1 for s in case.slides if s.id in cohort_slide_ids)
+    else:
+        slide_count = len(case.slides)
     return {
         "id": surgery.id,
         "surgery_label": surgery.surgery_label,
         "case_hash": case.accession_hash,
+        "case_id": case.slidecap_id,
         "accession_number": accession_number,
         "year": case.year,
-        "slide_count": len(case.slides),
+        "slide_count": slide_count,
         "note": surgery.note,
     }
 
@@ -1537,9 +1647,16 @@ def _enrich_surgery(surgery: "CohortPatientCase") -> dict:
 @app.get("/cohorts/{cohort_id}/patients")
 def list_cohort_patients(cohort_id: int, db: Session = Depends(get_db)):
     """List all patients (and their surgery assignments) for a cohort."""
-    cohort = db.query(Cohort).filter_by(id=cohort_id).first()
+    cohort = (
+        db.query(Cohort)
+        .options(joinedload(Cohort.slides))
+        .filter_by(id=cohort_id)
+        .first()
+    )
     if not cohort:
         raise HTTPException(status_code=404, detail="Cohort not found")
+
+    cohort_slide_ids = {s.id for s in cohort.slides}
 
     patients = (
         db.query(CohortPatient)
@@ -1553,7 +1670,7 @@ def list_cohort_patients(cohort_id: int, db: Session = Depends(get_db)):
             "id": p.id,
             "label": p.label,
             "note": p.note,
-            "surgeries": [_enrich_surgery(s) for s in p.surgeries],
+            "surgeries": [_enrich_surgery(s, cohort_slide_ids) for s in p.surgeries],
         }
         for p in patients
     ]
@@ -2472,6 +2589,75 @@ class JobCancelRequest(BaseModel):
     job_ids: List[int]
 
 
+def _submit_jobs_demo(data: "JobSubmitRequest", db: Session) -> dict:
+    """
+    Demo-mode job submission. Creates real DB records but skips all
+    cluster work; demo_mod.simulate_job_run walks the job through
+    transferring -> running -> completed on a 5s + 5s timer.
+    """
+    if not _demo_cluster_connected:
+        raise HTTPException(status_code=503, detail="Not connected to cluster. Connect first via /cluster/connect")
+
+    analysis = db.query(Analysis).filter_by(id=data.analysis_id, active=True).first()
+    if not analysis:
+        raise HTTPException(status_code=404, detail="Analysis not found or inactive")
+
+    job = AnalysisJob(
+        slidecap_id=generate_slidecap_id(db, "JB"),
+        analysis_id=analysis.id,
+        model_name=analysis.name,
+        model_version=analysis.version,
+        parameters=data.parameters,
+        gpu_index=data.gpu_index,
+        remote_wsi_dir=data.remote_wsi_dir,
+        remote_output_dir=data.remote_output_dir,
+        output_path=str(settings.local_data_path / "demo-outputs"),
+        status="pending",
+        submitted_by=data.submitted_by,
+    )
+    db.add(job)
+    db.flush()
+
+    errors: list[str] = []
+    slide_specs: list[tuple[int, str]] = []
+
+    for slide_hash in data.slide_hashes:
+        slide = db.query(Slide).filter_by(slide_hash=slide_hash).first()
+        if not slide:
+            errors.append(f"Slide not found: {slide_hash[:12]}")
+            continue
+
+        # Build a non-PHI label for the demo output dir name
+        label = slide.slidecap_id or slide_hash[:10]
+        # Try filename if we have one, but fall back to the slidecap id
+        slide_path = indexer.get_filepath(slide_hash) if indexer else None
+        filename = slide_path.name if slide_path else f"{label}.svs"
+
+        job_slide = JobSlide(
+            job_id=job.id,
+            slide_id=slide.id,
+            remote_wsi_path=f"{data.remote_wsi_dir}/{job.id}/{filename}",
+            remote_output_path=f"{data.remote_output_dir}/{job.id}",
+            filename=filename,
+            status="pending",
+        )
+        db.add(job_slide)
+        db.flush()
+        slide_specs.append((job_slide.id, label))
+
+    db.commit()
+
+    demo_mod.simulate_job_run(job.id, slide_specs)
+
+    return {
+        "job_id": job.id,
+        "slides_created": len(slide_specs),
+        "old_records_cleaned": 0,
+        "errors": errors,
+        "cluster_connected": True,
+    }
+
+
 @app.post("/jobs/submit")
 def submit_jobs(data: JobSubmitRequest, db: Session = Depends(get_db)):
     """
@@ -2480,6 +2666,9 @@ def submit_jobs(data: JobSubmitRequest, db: Session = Depends(get_db)):
     Creates DB records immediately (pending), then spawns a background thread
     to do rsync + tmux start. This avoids holding the DB lock during long transfers.
     """
+    if _is_demo():
+        return _submit_jobs_demo(data, db)
+
     if not cluster_service or not cluster_service.is_connected:
         raise HTTPException(status_code=503, detail="Not connected to cluster. Connect first via /cluster/connect")
 
@@ -2527,8 +2716,19 @@ def submit_jobs(data: JobSubmitRequest, db: Session = Depends(get_db)):
     slides_created = 0
     old_records_cleaned = 0
 
-    # List of (job_slide_id, slide_hash, local_path, remote_wsi_path, remote_out) for bg thread
-    slides_to_process: list[tuple[int, str, str, str, str]] = []
+    # Check if cluster has the network drive mounted (skip transfers if so)
+    cluster_mount = settings.CLUSTER_NETWORK_MOUNT  # e.g. "/ligonlab"
+    direct_mount = False
+    local_to_cluster_prefix = None
+    if cluster_mount:
+        # Build path mapping: local NETWORK_ROOT -> cluster mount path
+        # e.g. "/Volumes/DFCI-LIGONLAB/Ligon Lab/test_directory_pt_slides" -> "/ligonlab"
+        local_to_cluster_prefix = (str(settings.NETWORK_ROOT), cluster_mount.rstrip("/"))
+        direct_mount = True
+        print(f"[Job] Direct mount mode: {local_to_cluster_prefix[0]} -> {local_to_cluster_prefix[1]}")
+
+    # List of (job_slide_id, slide_hash, local_path, remote_wsi_path) for bg thread
+    slides_to_process: list[tuple[int, str, str, str]] = []
 
     for slide_hash in data.slide_hashes:
         slide = db.query(Slide).filter_by(slide_hash=slide_hash).first()
@@ -2585,7 +2785,7 @@ def submit_jobs(data: JobSubmitRequest, db: Session = Depends(get_db)):
 
     db.commit()  # Commit and release DB immediately
 
-    # --- Phase 2: Background thread for rsync + single tmux session ---
+    # --- Phase 2: Background thread for transfer + job launch ---
     job_id = job.id
     gpu_index = data.gpu_index
     remote_wsi_batch_dir = f"{data.remote_wsi_dir}/{job_id}"
@@ -2593,53 +2793,38 @@ def submit_jobs(data: JobSubmitRequest, db: Session = Depends(get_db)):
 
     def _run_submissions():
         n = len(slides_to_process)
+        transfer_ok: list[int] = []
+        transfer_errors: dict[int, str] = {}
 
-        # --- Phase A: Mark all as transferring, then rsync each slide ---
-        # Set all to 'transferring' upfront in one commit so the UI reflects progress.
-        bg_db = get_session()
-        try:
-            for (js_id, _hash, _path, _remote) in slides_to_process:
-                js = bg_db.query(JobSlide).filter_by(id=js_id).first()
-                if js:
-                    js.status = "transferring"
-            bg_db.commit()
-        except Exception:
-            bg_db.rollback()
-        finally:
-            bg_db.close()
-
-        # Rsync slides in parallel — no DB session held during transfer
-        transfer_ok: list[int] = []   # js_ids that rsynced successfully
-        transfer_errors: dict[int, str] = {}  # js_id -> error message
-
-        def _transfer_one(args):
-            idx, js_id, local_path_str = args
-            local_path = Path(local_path_str)
-            if not local_path.exists():
-                return js_id, f"Local file not found: {local_path}"
-            try:
-                mb = local_path.stat().st_size / 1e6
-                print(f"[Job {job_id}/Transfer {idx+1}/{n}] Rsyncing {local_path.name} ({mb:.0f} MB)")
-                cluster_service.rsync_slide(local_path, remote_wsi_batch_dir)
-                print(f"[Job {job_id}/Transfer {idx+1}/{n}] Done: {local_path.name}")
-                return js_id, None
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                return js_id, f"Transfer failed: {e}"
-
-        work = [(i, js_id, lp) for i, (js_id, _sh, lp, _rp) in enumerate(slides_to_process)]
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            for js_id, error in pool.map(_transfer_one, work):
-                if error:
-                    transfer_errors[js_id] = error
-                else:
-                    transfer_ok.append(js_id)
-
-        # Commit rsync failures immediately so they show up
-        if transfer_errors:
+        if direct_mount:
+            # ── Direct mount: create symlinks on cluster instead of rsyncing ──
+            print(f"[Job {job_id}] Direct mount — creating symlinks for {n} slides (no transfer needed)")
             bg_db = get_session()
             try:
+                # Create the batch WSI dir on the cluster
+                cluster_service.run_command(f"mkdir -p {remote_wsi_batch_dir}")
+
+                for js_id, _hash, local_path_str, _remote in slides_to_process:
+                    # Translate local server path to cluster mount path
+                    cluster_path = local_path_str.replace(
+                        local_to_cluster_prefix[0], local_to_cluster_prefix[1]
+                    )
+                    symlink_dest = f"{remote_wsi_batch_dir}/{Path(local_path_str).name}"
+
+                    # Create symlink on the cluster: batch_dir/slide.svs -> /ligonlab/.../slide.svs
+                    _, stderr, rc = cluster_service.run_command(
+                        f"ln -sf {cluster_path!r} {symlink_dest!r}"
+                    )
+                    if rc != 0:
+                        transfer_errors[js_id] = f"Symlink failed: {stderr}"
+                    else:
+                        transfer_ok.append(js_id)
+
+                # Update DB statuses
+                for js_id in transfer_ok:
+                    js = bg_db.query(JobSlide).filter_by(id=js_id).first()
+                    if js:
+                        js.status = "transferring"  # brief transitional status
                 for js_id, msg in transfer_errors.items():
                     js = bg_db.query(JobSlide).filter_by(id=js_id).first()
                     if js:
@@ -2650,13 +2835,67 @@ def submit_jobs(data: JobSubmitRequest, db: Session = Depends(get_db)):
                 bg_db.rollback()
             finally:
                 bg_db.close()
+        else:
+            # ── Rsync mode: transfer slides over SSH ──
+            # Set all to 'transferring' upfront in one commit so the UI reflects progress.
+            bg_db = get_session()
+            try:
+                for (js_id, _hash, _path, _remote) in slides_to_process:
+                    js = bg_db.query(JobSlide).filter_by(id=js_id).first()
+                    if js:
+                        js.status = "transferring"
+                bg_db.commit()
+            except Exception:
+                bg_db.rollback()
+            finally:
+                bg_db.close()
+
+            # Rsync slides in parallel — no DB session held during transfer
+            def _transfer_one(args):
+                idx, js_id, local_path_str = args
+                local_path = Path(local_path_str)
+                if not local_path.exists():
+                    return js_id, f"Local file not found: {local_path}"
+                try:
+                    mb = local_path.stat().st_size / 1e6
+                    print(f"[Job {job_id}/Transfer {idx+1}/{n}] Rsyncing {local_path.name} ({mb:.0f} MB)")
+                    cluster_service.rsync_slide(local_path, remote_wsi_batch_dir)
+                    print(f"[Job {job_id}/Transfer {idx+1}/{n}] Done: {local_path.name}")
+                    return js_id, None
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    return js_id, f"Transfer failed: {e}"
+
+            work = [(i, js_id, lp) for i, (js_id, _sh, lp, _rp) in enumerate(slides_to_process)]
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                for js_id, error in pool.map(_transfer_one, work):
+                    if error:
+                        transfer_errors[js_id] = error
+                    else:
+                        transfer_ok.append(js_id)
+
+            # Commit rsync failures immediately so they show up
+            if transfer_errors:
+                bg_db = get_session()
+                try:
+                    for js_id, msg in transfer_errors.items():
+                        js = bg_db.query(JobSlide).filter_by(id=js_id).first()
+                        if js:
+                            js.status = "failed"
+                            js.error_message = msg
+                    bg_db.commit()
+                except Exception:
+                    bg_db.rollback()
+                finally:
+                    bg_db.close()
 
         if not transfer_ok:
-            print(f"[Job {job_id}] All transfers failed.")
+            print(f"[Job {job_id}] All {'symlinks' if direct_mount else 'transfers'} failed.")
             _recompute_job_status_standalone(job_id)
             return
 
-        print(f"[Job {job_id}] Transfers complete ({len(transfer_ok)}/{n}). Starting batch analysis...")
+        print(f"[Job {job_id}] {'Symlinks' if direct_mount else 'Transfers'} complete ({len(transfer_ok)}/{n}). Starting batch analysis...")
 
         # --- Phase B: Start tmux session then mark all successful slides as running ---
         # Both the tmux launch and the DB update happen in one block so they stay in sync.
@@ -2991,6 +3230,8 @@ def get_job(job_id: int, db: Session = Depends(get_db)):
             {
                 "id": js.id,
                 "slide_hash": js.slide.slide_hash if js.slide else None,
+                "slide_id": js.slide.slidecap_id if js.slide else None,
+                "case_id": js.slide.case.slidecap_id if js.slide and js.slide.case else None,
                 "filename": (indexer.get_filepath(js.slide.slide_hash).name if indexer and js.slide and indexer.get_filepath(js.slide.slide_hash) else None),
                 "accession_number": (
                     indexer.parser.parse(indexer.get_filepath(js.slide.slide_hash).name).accession
@@ -3434,6 +3675,13 @@ class ClusterConnectRequest(BaseModel):
 @app.post("/cluster/connect")
 def cluster_connect(data: ClusterConnectRequest):
     """Connect to the GPU cluster via SSH."""
+    if _is_demo():
+        global _demo_cluster_connected
+        # Brief artificial delay so the spinner is visible during the demo
+        import time as _t; _t.sleep(0.6)
+        _demo_cluster_connected = True
+        return demo_mod.mock_cluster_connect(data.host, data.username)
+
     if not cluster_service:
         raise HTTPException(status_code=503, detail="Cluster service not initialized")
 
@@ -3454,6 +3702,10 @@ def cluster_connect(data: ClusterConnectRequest):
 @app.post("/cluster/disconnect")
 def cluster_disconnect():
     """Disconnect from the GPU cluster."""
+    if _is_demo():
+        global _demo_cluster_connected
+        _demo_cluster_connected = False
+        return {"status": "ok", "connected": False}
     if cluster_service:
         cluster_service.disconnect()
     return {"status": "ok", "connected": False}
@@ -3462,6 +3714,9 @@ def cluster_disconnect():
 @app.get("/cluster/status")
 def cluster_status():
     """Get cluster connection status. Actively probes the SSH connection."""
+    if _is_demo():
+        return demo_mod.mock_cluster_status(_demo_cluster_connected)
+
     if not cluster_service:
         return {"connected": False}
 
@@ -3482,6 +3737,11 @@ def cluster_status():
 @app.get("/cluster/gpus")
 def cluster_gpus():
     """Get current GPU status from the cluster."""
+    if _is_demo():
+        if not _demo_cluster_connected:
+            raise HTTPException(status_code=503, detail="Not connected to cluster")
+        return demo_mod.fake_gpus()
+
     if not cluster_service or not cluster_service.is_connected:
         raise HTTPException(status_code=503, detail="Not connected to cluster")
 
@@ -3641,6 +3901,8 @@ def search_results(
 
         matching.append({
             "slide_hash": slide.slide_hash,
+            "slide_id": slide.slidecap_id,
+            "case_id": slide.case.slidecap_id if slide.case else None,
             "accession_number": parsed.accession,
             "block_id": slide.block_id,
             "stain_type": slide.stain_type,
@@ -4423,6 +4685,11 @@ def staging_delete_file(filename: str):
 @app.get("/staging/scan")
 def staging_scan():
     """Scan staging folder for .svs files and parse their filenames."""
+    if _is_demo():
+        global _demo_staging_files
+        _demo_staging_files = demo_mod.mock_staging_scan()
+        return _demo_staging_files
+
     if not indexer:
         raise HTTPException(status_code=503, detail="Indexer not initialized")
 
@@ -4517,6 +4784,16 @@ def staging_scan():
 @app.post("/staging/sort")
 def staging_sort(req: SortRequest):
     """Start sort in background. Returns immediately — poll /staging/sort/status for progress."""
+    if _is_demo():
+        if _sort_state.get("running"):
+            raise HTTPException(status_code=409, detail="Sort already in progress")
+        # Use either the requested filenames or the cached scan
+        filenames = req.filenames or [f["filename"] for f in _demo_staging_files]
+        if not filenames:
+            return {"started": False, "total": 0, "message": "No files to sort"}
+        demo_mod.start_demo_sort(_sort_state, filenames)
+        return {"started": True, "total": len(filenames)}
+
     if not indexer:
         raise HTTPException(status_code=503, detail="Indexer not initialized")
 
@@ -4667,6 +4944,29 @@ async def import_slides_csv(
 @app.get("/dashboard/summary")
 def dashboard_summary(db: Session = Depends(get_db)):
     """Aggregated dashboard data: library stats, staging, recent jobs, storage."""
+    if _is_demo():
+        # Return a fast canned payload + recent jobs from the demo DB
+        payload = demo_mod.mock_dashboard_summary()
+        recent_jobs = (
+            db.query(AnalysisJob)
+            .options(joinedload(AnalysisJob.slides))
+            .order_by(AnalysisJob.submitted_at.desc())
+            .limit(5)
+            .all()
+        )
+        payload["recent_jobs"] = [
+            {
+                "id": j.id,
+                "model_name": j.model_name,
+                "status": j.status,
+                "slide_count": len(j.slides),
+                "submitted_at": j.submitted_at.isoformat() if j.submitted_at else None,
+                "completed_at": j.completed_at.isoformat() if j.completed_at else None,
+            }
+            for j in recent_jobs
+        ]
+        return payload
+
     if not indexer:
         raise HTTPException(status_code=503, detail="Indexer not initialized")
 
@@ -4759,6 +5059,9 @@ class RequestSheetCreate(BaseModel):
 class RequestSheetUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
+    # When provided, replace the sheet's auto-tags with exactly this list.
+    # Pass [] to clear all. None means "no change".
+    auto_tag_ids: Optional[List[int]] = None
 
 class RequestRowCreate(BaseModel):
     accession_number: str
@@ -4926,6 +5229,112 @@ def case_warnings(
     return {"warnings": warnings}
 
 
+_BLOCK_SPLIT_RE = re.compile(r"[,;\s/]+")
+
+
+def _parse_block_list(raw: Optional[str]) -> list[str]:
+    """
+    Split a free-text block field into a list of canonical block IDs.
+
+    Handles comma, semicolon, slash, and whitespace separators and
+    uppercases each token. Empty/None input returns [].
+    """
+    if not raw:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for tok in _BLOCK_SPLIT_RE.split(raw):
+        norm = tok.strip().upper()
+        if norm and norm not in seen:
+            seen.add(norm)
+            out.append(norm)
+    return out
+
+
+def _apply_auto_tags_to_accession(db: Session, accession: str, tags: list) -> int:
+    """Add each tag to the Case matching this accession. Returns count of tags newly added."""
+    if not hasher or not tags:
+        return 0
+    acc_hash = hasher.hash_accession(_normalize_accession(accession))
+    case = db.query(Case).filter_by(accession_hash=acc_hash).first()
+    if not case:
+        return 0
+    added = 0
+    existing = set(case.tags)
+    for tag in tags:
+        if tag not in existing:
+            case.tags.append(tag)
+            existing.add(tag)
+            added += 1
+    return added
+
+
+def _apply_auto_tags_to_sheet(db: Session, sheet: "RequestSheet") -> int:
+    """Apply every sheet.auto_tags entry to every row's accession.
+    Returns the count of (case, tag) pairs newly created."""
+    tags = list(sheet.auto_tags)
+    if not tags:
+        return 0
+    added = 0
+    for row in sheet.rows:
+        added += _apply_auto_tags_to_accession(db, row.accession_number, tags)
+    return added
+
+
+@app.get("/request-sheets/{sheet_id}/coverage")
+def request_sheet_coverage(sheet_id: int, db: Session = Depends(get_db)):
+    """
+    For every row in a request sheet, report which scanned slides exist on
+    the row's accession, grouped by block. Read-only — does not write back
+    to `blocks_available`. The frontend renders this as a side-by-side hint
+    next to the user-entered fields.
+    """
+    sheet = db.query(RequestSheet).filter_by(id=sheet_id).first()
+    if not sheet:
+        raise HTTPException(status_code=404, detail="Sheet not found")
+    if not indexer:
+        raise HTTPException(status_code=503, detail="Indexer not initialized")
+
+    rows = db.query(RequestRow).filter_by(sheet_id=sheet_id).all()
+    coverage: dict[int, dict] = {}
+
+    for row in rows:
+        acc_norm = _normalize_accession(row.accession_number)
+        results = indexer.search(db, query=acc_norm, limit=500)
+        # Restrict to exact accession matches (search is fuzzy)
+        scanned = [r for r in results if _normalize_accession(r.get("accession_number", "")) == acc_norm]
+
+        # Group scanned slides by block
+        blocks_scanned_map: dict[str, list[dict]] = {}
+        for s in scanned:
+            b = (s.get("block_id") or "").upper() or "(no block)"
+            blocks_scanned_map.setdefault(b, []).append({
+                "stain_type": s.get("stain_type"),
+                "slide_number": s.get("slide_number"),
+            })
+
+        requested = _parse_block_list(row.all_blocks)
+        scanned_block_ids = set(blocks_scanned_map.keys())
+
+        # Coverage: requested blocks that have at least one scanned slide
+        requested_covered = [b for b in requested if b in scanned_block_ids]
+        requested_missing = [b for b in requested if b not in scanned_block_ids]
+        # Scanned blocks not asked for (informational)
+        extra_blocks = sorted(scanned_block_ids - set(requested))
+
+        coverage[row.id] = {
+            "requested_blocks": requested,
+            "scanned_blocks": sorted(scanned_block_ids),
+            "requested_covered": requested_covered,
+            "requested_missing": requested_missing,
+            "extra_blocks": extra_blocks,
+            "slides_total": len(scanned),
+            "slides_by_block": blocks_scanned_map,
+        }
+
+    return {"sheet_id": sheet_id, "coverage": coverage}
+
+
 @app.post("/request-sheets")
 def create_request_sheet(req: RequestSheetCreate, db: Session = Depends(get_db)):
     sheet = RequestSheet(name=req.name, description=req.description, created_by=req.created_by)
@@ -4944,7 +5353,10 @@ def create_request_sheet(req: RequestSheetCreate, db: Session = Depends(get_db))
 
 @app.get("/request-sheets/{sheet_id}")
 def get_request_sheet(sheet_id: int, db: Session = Depends(get_db)):
-    sheet = db.query(RequestSheet).options(joinedload(RequestSheet.rows)).filter_by(id=sheet_id).first()
+    sheet = db.query(RequestSheet).options(
+        joinedload(RequestSheet.rows),
+        joinedload(RequestSheet.auto_tags),
+    ).filter_by(id=sheet_id).first()
     if not sheet:
         raise HTTPException(404, "Sheet not found")
     return {
@@ -4955,22 +5367,57 @@ def get_request_sheet(sheet_id: int, db: Session = Depends(get_db)):
         "created_by": sheet.created_by,
         "created_at": sheet.created_at.isoformat() if sheet.created_at else None,
         "updated_at": sheet.updated_at.isoformat() if sheet.updated_at else None,
+        "auto_tags": [
+            {"id": t.id, "name": t.name, "color": t.color}
+            for t in sheet.auto_tags
+        ],
         "rows": [_serialize_request_row(r) for r in sheet.rows],
     }
 
 
 @app.patch("/request-sheets/{sheet_id}")
 def update_request_sheet(sheet_id: int, req: RequestSheetUpdate, db: Session = Depends(get_db)):
-    sheet = db.query(RequestSheet).filter_by(id=sheet_id).first()
+    sheet = db.query(RequestSheet).options(
+        joinedload(RequestSheet.rows),
+        joinedload(RequestSheet.auto_tags),
+    ).filter_by(id=sheet_id).first()
     if not sheet:
         raise HTTPException(404, "Sheet not found")
     if req.name is not None:
         sheet.name = req.name
     if req.description is not None:
         sheet.description = req.description
+
+    auto_tag_applied = 0
+    if req.auto_tag_ids is not None:
+        # Replace the whole set of auto-tags
+        new_ids = list(set(req.auto_tag_ids))
+        new_tags = db.query(Tag).filter(Tag.id.in_(new_ids)).all() if new_ids else []
+        if len(new_tags) != len(new_ids):
+            raise HTTPException(404, "One or more tags not found")
+        sheet.auto_tags = new_tags
+        db.flush()
+        # Apply immediately to every current row's case
+        auto_tag_applied = _apply_auto_tags_to_sheet(db, sheet)
+
     sheet.updated_at = datetime.utcnow()
     db.flush()
-    return {"ok": True}
+    return {"ok": True, "auto_tag_applied": auto_tag_applied}
+
+
+@app.post("/request-sheets/{sheet_id}/apply-auto-tag")
+def apply_auto_tag_now(sheet_id: int, db: Session = Depends(get_db)):
+    """Re-apply every auto-tag to every row's case (idempotent)."""
+    sheet = db.query(RequestSheet).options(
+        joinedload(RequestSheet.rows),
+        joinedload(RequestSheet.auto_tags),
+    ).filter_by(id=sheet_id).first()
+    if not sheet:
+        raise HTTPException(404, "Sheet not found")
+    if not sheet.auto_tags:
+        return {"ok": True, "auto_tag_applied": 0, "message": "No auto-tags set"}
+    applied = _apply_auto_tags_to_sheet(db, sheet)
+    return {"ok": True, "auto_tag_applied": applied}
 
 
 @app.delete("/request-sheets/{sheet_id}")
@@ -4984,7 +5431,7 @@ def delete_request_sheet(sheet_id: int, db: Session = Depends(get_db)):
 
 @app.post("/request-sheets/{sheet_id}/rows")
 def create_request_row(sheet_id: int, req: RequestRowCreate, db: Session = Depends(get_db)):
-    sheet = db.query(RequestSheet).filter_by(id=sheet_id).first()
+    sheet = db.query(RequestSheet).options(joinedload(RequestSheet.auto_tags)).filter_by(id=sheet_id).first()
     if not sheet:
         raise HTTPException(404, "Sheet not found")
     normalized = _normalize_accession(req.accession_number)
@@ -4996,6 +5443,9 @@ def create_request_row(sheet_id: int, req: RequestRowCreate, db: Session = Depen
     row = RequestRow(sheet_id=sheet_id, **data)
     db.add(row)
     sheet.updated_at = datetime.utcnow()
+    # If the sheet has auto-tags, apply them to this new row's case
+    if sheet.auto_tags:
+        _apply_auto_tags_to_accession(db, normalized, list(sheet.auto_tags))
     db.flush()
     return _serialize_request_row(row)
 
@@ -5340,6 +5790,9 @@ def _serialize_study_slide(slide):
                 d['accession_number'] = parsed.accession
                 d['slide_number'] = parsed.slide_number
                 d['year'] = parsed.year
+            else:
+                # External/research slide — use filename stem as display name
+                d['filename'] = fp.stem
             d['file_path'] = str(fp)
     return d
 
@@ -5537,28 +5990,221 @@ def remove_slides_from_group(study_id: int, group_id: int, data: dict, db: Sessi
     return {"ok": True, "total": len(group.slides)}
 
 
+@app.post("/studies/{study_id}/groups/{group_id}/export")
+def export_group_slides(study_id: int, group_id: int, data: dict, db: Session = Depends(get_db)):
+    """Copy or symlink a group's slides to a target directory."""
+    group = db.query(StudyGroup).filter_by(id=group_id, study_id=study_id).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+
+    target_dir = data.get('target_dir', '').strip()
+    use_symlinks = data.get('symlinks', True)
+    if not target_dir:
+        raise HTTPException(status_code=400, detail="target_dir is required")
+
+    target_path = Path(target_dir)
+    try:
+        target_path.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not create directory: {e}")
+
+    exported = 0
+    errors = []
+    for slide in group.slides:
+        src = indexer.get_filepath(slide.slide_hash) if indexer else None
+        if not src or not src.exists():
+            errors.append(f"No file for {slide.slide_hash[:12]}")
+            continue
+        dest = target_path / src.name
+        if dest.exists():
+            exported += 1
+            continue
+        try:
+            if use_symlinks:
+                dest.symlink_to(src)
+            else:
+                import shutil
+                shutil.copy2(str(src), str(dest))
+            exported += 1
+        except Exception as e:
+            errors.append(f"Failed to export {src.name}: {e}")
+
+    return {"exported": exported, "errors": errors, "target_dir": str(target_path)}
+
+
+@app.post("/studies/{study_id}/groups/{group_id}/tag")
+def tag_group_slides(study_id: int, group_id: int, data: dict, db: Session = Depends(get_db)):
+    """Bulk-add a tag to all slides in a group."""
+    group = db.query(StudyGroup).filter_by(id=group_id, study_id=study_id).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+
+    tag_name = data.get('tag_name', '').strip()
+    tag_color = data.get('tag_color')
+    if not tag_name:
+        raise HTTPException(status_code=400, detail="tag_name is required")
+
+    # Get or create tag
+    from sqlalchemy import func
+    tag = db.query(Tag).filter(func.lower(Tag.name) == tag_name.lower()).first()
+    if not tag:
+        tag = Tag(name=tag_name, color=tag_color)
+        db.add(tag)
+        db.flush()
+    elif tag_color and not tag.color:
+        tag.color = tag_color
+
+    tagged = 0
+    for slide in group.slides:
+        if tag not in slide.tags:
+            slide.tags.append(tag)
+            tagged += 1
+    db.flush()
+    return {"tagged": tagged, "tag_id": tag.id, "tag_name": tag.name}
+
+
 @app.get("/studies/{study_id}/unlinked-files")
 def get_unlinked_files(study_id: int, db: Session = Depends(get_db)):
-    """List files in the study folder that aren't in the database."""
+    """List slide files in the study folder that aren't linked to this study."""
     study = db.query(Study).filter_by(id=study_id).first()
     if not study:
         raise HTTPException(status_code=404, detail="Study not found")
 
     study_dir = settings.slides_path / 'studies' / study.folder_name
     if not study_dir.exists():
-        return {"files": []}
+        return {"files": [], "folder_path": str(study_dir)}
 
     linked_hashes = {s.slide_hash for s in study.slides}
+    hasher = SlideHasher(settings.salt_path)
     unlinked = []
-    for f in study_dir.iterdir():
-        if f.is_file() and f.suffix.lower() in ('.svs', '.tif', '.tiff', '.ndpi', '.mrxs'):
-            unlinked.append({
-                'filename': f.name,
-                'file_size_bytes': f.stat().st_size,
-                'extension': f.suffix.lower(),
-            })
+    valid_exts = ('.svs', '.tif', '.tiff', '.ndpi', '.mrxs')
+
+    # Walk study dir recursively (including subdirectories/folders)
+    for f in study_dir.rglob('*'):
+        if not f.is_file() or f.suffix.lower() not in valid_exts:
+            continue
+        stem = f.stem
+        slide_hash = hasher.hash_slide_stem(stem)
+        # Skip if already linked to study
+        if slide_hash in linked_hashes:
+            continue
+        # Check if it already exists in DB (from clinical index)
+        existing = db.query(Slide).filter_by(slide_hash=slide_hash).first()
+        rel_path = str(f.relative_to(study_dir))
+        subfolder = str(f.parent.relative_to(study_dir)) if f.parent != study_dir else None
+        unlinked.append({
+            'filename': f.name,
+            'relative_path': rel_path,
+            'subfolder': subfolder,
+            'file_size_bytes': f.stat().st_size,
+            'extension': f.suffix.lower(),
+            'slide_hash': slide_hash,
+            'in_database': existing is not None,
+        })
 
     return {"files": unlinked, "folder_path": str(study_dir)}
+
+
+@app.post("/studies/{study_id}/import-files")
+def import_study_files(study_id: int, data: dict, db: Session = Depends(get_db)):
+    """
+    Import unlinked files from the study folder into the database and link to study.
+
+    For files already in the DB (clinical slides), just links them to the study.
+    For new files (outside hospital, hand-labeled), creates a Case + Slide record.
+
+    Body: { "filenames": ["slide1.svs", "slide2.svs"] }
+    Optional: { "filenames": [...], "group_id": 123 } to also add to a group.
+    """
+    study = db.query(Study).filter_by(id=study_id).first()
+    if not study:
+        raise HTTPException(status_code=404, detail="Study not found")
+
+    filenames = data.get('filenames', [])
+    group_id = data.get('group_id')
+    if not filenames:
+        raise HTTPException(status_code=400, detail="No filenames provided")
+
+    study_dir = settings.slides_path / 'studies' / study.folder_name
+    hasher = SlideHasher(settings.salt_path)
+    valid_exts = ('.svs', '.tif', '.tiff', '.ndpi', '.mrxs')
+
+    linked_hashes = {s.slide_hash for s in study.slides}
+    group = None
+    if group_id:
+        group = db.query(StudyGroup).filter_by(id=group_id, study_id=study_id).first()
+
+    imported = 0
+    linked = 0
+    errors = []
+
+    for filename in filenames:
+        # Find the file in the study directory (could be in a subfolder)
+        matches = list(study_dir.rglob(filename))
+        if not matches:
+            errors.append(f"File not found: {filename}")
+            continue
+        filepath = matches[0]
+        if filepath.suffix.lower() not in valid_exts:
+            errors.append(f"Invalid file type: {filename}")
+            continue
+
+        stem = filepath.stem
+        slide_hash = hasher.hash_slide_stem(stem)
+
+        # Check if already linked to study
+        if slide_hash in linked_hashes:
+            continue
+
+        # Check if slide exists in DB
+        slide = db.query(Slide).filter_by(slide_hash=slide_hash).first()
+
+        if not slide:
+            # New external slide — create a Case + Slide record
+            # Use filename stem as accession hash (these don't follow standard naming)
+            case_hash = hasher.hash_accession(stem)
+            case = db.query(Case).filter_by(accession_hash=case_hash).first()
+            if not case:
+                case = Case(accession_hash=case_hash, year=0)
+                db.add(case)
+                db.flush()
+
+            try:
+                file_size = filepath.stat().st_size
+            except OSError:
+                file_size = None
+
+            slide = Slide(
+                slide_hash=slide_hash,
+                case_id=case.id,
+                file_size_bytes=file_size,
+                file_exists=True,
+            )
+            db.add(slide)
+            db.flush()
+            imported += 1
+
+            # Register in indexer path cache so analysis submission can find the file
+            if indexer:
+                indexer.slide_hash_to_path[slide_hash] = filepath
+        else:
+            linked += 1
+
+        # Link to study
+        study.slides.append(slide)
+        linked_hashes.add(slide_hash)
+
+        # Also add to group if specified
+        if group and slide not in group.slides:
+            group.slides.append(slide)
+
+    db.flush()
+    return {
+        "imported": imported,
+        "linked": linked,
+        "errors": errors,
+        "total": len(study.slides),
+    }
 
 
 # ============================================================

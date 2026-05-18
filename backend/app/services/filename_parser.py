@@ -33,8 +33,13 @@ class ParsedFilename:
             block_part = self.block_id
         else:
             block_part = self.slide_number  # digits only — no leading dash
-        parts = [self.accession, block_part, self.stain_type]
-        if self.random_id:
+        parts = [self.accession, block_part]
+        if self.stain_type:
+            parts.append(self.stain_type)
+            if self.random_id:
+                parts.append(self.random_id)
+        elif self.random_id:
+            # No stain — random_id occupies the same regex slot in the filename
             parts.append(self.random_id)
         return '_'.join(parts)
 
@@ -92,6 +97,14 @@ class FilenameParser:
 
         slide_number = slide_from_block or slide_only or ''
         block_id = block_id or ''
+
+        # Some legacy filenames have no stain — only a random ID after block-slide.
+        # The pattern still captures it as `stain_type`. If the captured stain
+        # looks like a random ID (purely digits, 4+ chars) and no random_id was
+        # captured, swap them so stain_type is empty and random_id is set.
+        if not random_id and stain_type and stain_type.isdigit() and len(stain_type) >= 4:
+            random_id = stain_type
+            stain_type = ''
 
         return ParsedFilename(
             accession=accession_norm,

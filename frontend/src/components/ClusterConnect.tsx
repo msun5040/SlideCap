@@ -4,7 +4,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import type { ClusterStatus, GpuInfo } from '@/types/slide'
 
-import { getApiBase } from '@/api'
+import { getApiBase, isDemo } from '@/api'
 
 /** Call this from any component that receives a 503 from the backend. */
 export function signalClusterDisconnected() {
@@ -18,10 +18,10 @@ interface ClusterConnectProps {
 export function ClusterConnect({ onStatusChange }: ClusterConnectProps) {
   const [status, setStatus] = useState<ClusterStatus>({ connected: false })
   const [lostConnection, setLostConnection] = useState(false)
-  const [host, setHost] = useState('cetus.dfci.harvard.edu')
+  const [host, setHost] = useState(isDemo() ? 'demo.cluster.local' : 'cetus.dfci.harvard.edu')
   const [port, setPort] = useState('22')
-  const [username, setUsername] = useState('')
-  const [password, setPassword] = useState('')
+  const [username, setUsername] = useState(isDemo() ? 'demo' : '')
+  const [password, setPassword] = useState(isDemo() ? 'demo' : '')
   const [isConnecting, setIsConnecting] = useState(false)
   const [error, setError] = useState('')
   const [showForm, setShowForm] = useState(false)
@@ -128,6 +128,11 @@ export function ClusterConnect({ onStatusChange }: ClusterConnectProps) {
             <div className="h-2.5 w-2.5 rounded-full bg-green-500" />
             <span className="text-sm font-medium">
               Connected to {status.host} as {status.username}
+              {isDemo() && (
+                <span className="ml-2 text-[10px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded bg-amber-500 text-black">
+                  Mock
+                </span>
+              )}
             </span>
           </div>
           <div className="flex gap-2">

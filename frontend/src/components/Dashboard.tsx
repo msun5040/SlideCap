@@ -133,6 +133,7 @@ export function Dashboard({ onSortStarted, sortStatus }: DashboardProps) {
   const [stagingFiles, setStagingFiles] = useState<StagingFile[] | null>(null)
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [scanning, setScanning] = useState(false)
+  const [removingConflicts, setRemovingConflicts] = useState(false)
   const [sorting, setSorting] = useState(false)
 
   // Staging tag state
@@ -229,8 +230,13 @@ export function Dashboard({ onSortStarted, sortStatus }: DashboardProps) {
 
   const handleDeleteAllConflicts = async () => {
     const conflicts = stagingFiles?.filter(f => f.conflict) ?? []
-    for (const f of conflicts) {
-      await handleDeleteStaging(f.filename)
+    setRemovingConflicts(true)
+    try {
+      for (const f of conflicts) {
+        await handleDeleteStaging(f.filename)
+      }
+    } finally {
+      setRemovingConflicts(false)
     }
   }
 
@@ -329,8 +335,8 @@ export function Dashboard({ onSortStarted, sortStatus }: DashboardProps) {
               Scan Staging Folder
             </Button>
             {stagingFiles && stagingFiles.some(f => f.conflict) && (
-              <Button variant="outline" size="sm" onClick={handleDeleteAllConflicts} className="text-red-600 hover:text-red-700">
-                <Trash2 className="h-4 w-4 mr-1" />
+              <Button variant="outline" size="sm" onClick={handleDeleteAllConflicts} disabled={removingConflicts} className="text-red-600 hover:text-red-700">
+                {removingConflicts ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <Trash2 className="h-4 w-4 mr-1" />}
                 Remove Conflicts ({stagingFiles.filter(f => f.conflict).length})
               </Button>
             )}

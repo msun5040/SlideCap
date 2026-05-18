@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef, useMemo } from 'react'
 import {
   Search, Send, Users, AlertTriangle, Loader2, CheckCircle, XCircle,
-  ChevronDown, ChevronRight, Tag, Hash, Stethoscope,
+  ChevronDown, ChevronRight, Tag, Hash, Stethoscope, FolderOpen, Microscope,
+  FileText,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -22,10 +23,11 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import type { Analysis, AnalysisJob, Cohort, CohortDetail, CohortPatient, Slide, GpuInfo } from '@/types/slide'
+import type { Analysis, AnalysisJob, Cohort, CohortDetail, CohortPatient, Slide, GpuInfo, Study, StudyDetail, StudySlide } from '@/types/slide'
 import { signalClusterDisconnected } from '@/components/ClusterConnect'
 
-import { getApiBase, normalizeAccession } from '@/api'
+import { getApiBase, normalizeAccession, isDemo } from '@/api'
+import { displaySlide, displayCase } from '@/lib/display'
 import { SortableHeader } from '@/components/SortableHeader'
 import { useSortable } from '@/hooks/useSortable'
 
@@ -42,7 +44,7 @@ interface TagInfo {
 
 export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps) {
   const [step, setStep] = useState<1 | 2>(1)
-  const [mode, setMode] = useState<'search' | 'cohort' | 'tag'>('search')
+  const [mode, setMode] = useState<'search' | 'cohort' | 'tag' | 'study'>('search')
 
   // ── Search mode ──────────────────────────────────────────────────────
   const [searchQuery, setSearchQuery] = useState('')
@@ -68,6 +70,13 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
   const [tagSelectedHashes, setTagSelectedHashes] = useState<Set<string>>(new Set())
   const [loadingTagSlides, setLoadingTagSlides] = useState(false)
 
+  // ── Study mode ───────────────────────────────────────────────────────
+  const [studies, setStudies] = useState<Study[]>([])
+  const [selectedStudyId, setSelectedStudyId] = useState<number | null>(null)
+  const [studyDetail, setStudyDetail] = useState<StudyDetail | null>(null)
+  const [loadingStudy, setLoadingStudy] = useState(false)
+  const [studySelectedHashes, setStudySelectedHashes] = useState<Set<string>>(new Set())
+
   const { sorted: sortedSearchResults, sortConfig: searchSortConfig, handleSort: handleSearchSort } = useSortable(searchResults)
   const { sorted: sortedTagSlides, sortConfig: tagSortConfig, handleSort: handleTagSort } = useSortable(tagSlides)
 
@@ -88,11 +97,17 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
   const [trackedJob, setTrackedJob] = useState<AnalysisJob | null>(null)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
+  // Output files (shown after job completes)
+  type OutputGroup = { slide_hash: string; label: string; files: string[]; annotation_count: number; is_local: boolean }
+  const [outputGroups, setOutputGroups] = useState<OutputGroup[] | null>(null)
+  const [loadingOutputs, setLoadingOutputs] = useState(false)
+
   // ── Initial fetches ──────────────────────────────────────────────────
   useEffect(() => {
     fetchCohorts()
     fetchAnalyses()
     fetchTags()
+    fetchStudies()
   }, [])
 
   // Poll job progress
@@ -112,7 +127,7 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
       } catch (e) { console.error('Poll failed:', e) }
     }
     poll()
-    pollRef.current = setInterval(poll, 10000)
+    pollRef.current = setInterval(poll, isDemo() ? 1500 : 10000)
     return () => {
       if (pollRef.current) clearInterval(pollRef.current)
       pollRef.current = null
@@ -172,6 +187,27 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
     load()
   }, [selectedTagName, mode])
 
+  // Fetch study detail when study selected
+  useEffect(() => {
+    if (!selectedStudyId || mode !== 'study') {
+      setStudyDetail(null)
+      return
+    }
+    const load = async () => {
+      setLoadingStudy(true)
+      try {
+        const res = await fetch(`${getApiBase()}/studies/${selectedStudyId}`)
+        if (res.ok) {
+          const data: StudyDetail = await res.json()
+          setStudyDetail(data)
+          setStudySelectedHashes(new Set(data.slides.map(s => s.slide_hash)))
+        }
+      } catch (e) { console.error(e) }
+      finally { setLoadingStudy(false) }
+    }
+    load()
+  }, [selectedStudyId, mode])
+
   // ── Fetch functions ──────────────────────────────────────────────────
   const fetchCohorts = async () => {
     try {
@@ -191,6 +227,13 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
     try {
       const res = await fetch(`${getApiBase()}/tags`)
       if (res.ok) setTags(await res.json())
+    } catch (e) { console.error(e) }
+  }
+
+  const fetchStudies = async () => {
+    try {
+      const res = await fetch(`${getApiBase()}/studies`)
+      if (res.ok) setStudies(await res.json())
     } catch (e) { console.error(e) }
   }
 
@@ -230,6 +273,7 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
   const slideCount = useMemo(() => {
     if (mode === 'search') return selectedHashes.size
     if (mode === 'tag') return tagSelectedHashes.size
+    if (mode === 'study') return studySelectedHashes.size
     if (mode === 'cohort') {
       if (!selectedCohortId) return 0
       if (patientSelectMode === 'all') {
@@ -248,7 +292,7 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
       return count
     }
     return 0
-  }, [mode, selectedHashes, tagSelectedHashes, selectedCohortId, cohorts, patientSelectMode, cohortPatients, selectedPatientIds, includeUnassigned, unassignedCases])
+  }, [mode, selectedHashes, tagSelectedHashes, studySelectedHashes, selectedCohortId, cohorts, patientSelectMode, cohortPatients, selectedPatientIds, includeUnassigned, unassignedCases])
 
   const getSelectedCaseHashes = (): string[] | undefined => {
     if (patientSelectMode === 'all') return undefined
@@ -329,6 +373,22 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
     else setTagSelectedHashes(new Set(tagSlides.map(s => s.slide_hash)))
   }
 
+  // ── Study slide toggle ──────────────────────────────────────────────
+  const toggleStudySlide = (hash: string) => {
+    setStudySelectedHashes(prev => {
+      const next = new Set(prev)
+      if (next.has(hash)) next.delete(hash)
+      else next.add(hash)
+      return next
+    })
+  }
+
+  const toggleAllStudySlides = () => {
+    if (!studyDetail) return
+    if (studySelectedHashes.size >= studyDetail.slides.length) setStudySelectedHashes(new Set())
+    else setStudySelectedHashes(new Set(studyDetail.slides.map(s => s.slide_hash)))
+  }
+
   // ── Cohort patient selection ─────────────────────────────────────────
   const togglePatient = (patientId: number) => {
     setSelectedPatientIds(prev => {
@@ -354,10 +414,21 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
   }
 
   // ── Slide name helper ────────────────────────────────────────────────
-  const slideName = (s: Slide) =>
-    s.accession_number
-      ? `${s.accession_number}${s.block_id ? ` ${s.block_id}` : ''}${s.stain_type ? ` ${s.stain_type}` : ''}`
-      : s.slide_hash.slice(0, 12) + '…'
+  const slideName = (s: Slide) => displaySlide(s)
+
+  // ── Output file fetch ────────────────────────────────────────────────
+  const fetchOutputFiles = async () => {
+    if (!trackedJobId) return
+    setLoadingOutputs(true)
+    try {
+      const res = await fetch(`${getApiBase()}/jobs/${trackedJobId}/output-filenames`)
+      if (res.ok) {
+        const data = await res.json()
+        setOutputGroups(data)
+      }
+    } catch (e) { console.error('Failed to load output files:', e) }
+    finally { setLoadingOutputs(false) }
+  }
 
   // ── Submit ───────────────────────────────────────────────────────────
   const handleSubmit = async () => {
@@ -384,7 +455,9 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
       } else {
         const hashes = mode === 'tag'
           ? Array.from(tagSelectedHashes)
-          : Array.from(selectedHashes)
+          : mode === 'study'
+            ? Array.from(studySelectedHashes)
+            : Array.from(selectedHashes)
         url = `${getApiBase()}/jobs/submit`
         body = {
           analysis_id: selectedAnalysisId,
@@ -418,6 +491,7 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
         if (data.job_id) {
           setTrackedJobId(data.job_id)
           setTrackedJob(null)
+          setOutputGroups(null)
         }
       } else {
         const err = await res.json()
@@ -503,9 +577,7 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
               {trackedJob.slides.map((s) => (
                 <div key={s.id} className="flex items-center gap-2 text-xs">
                   <span className="font-mono truncate flex-1 text-muted-foreground">
-                    {(s as any).accession_number
-                      ? `${(s as any).accession_number}${(s as any).block_id ? ` ${(s as any).block_id}` : ''}${(s as any).stain_type ? ` ${(s as any).stain_type}` : ''}`
-                      : s.slide_hash ? s.slide_hash.slice(0, 16) + '…' : '-'}
+                    {displaySlide(s as any)}
                   </span>
                   <Badge
                     variant="outline"
@@ -524,6 +596,58 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
                   )}
                 </div>
               ))}
+            </div>
+          )}
+
+          {trackedJob.status === 'completed' && (
+            <div className="pt-2 border-t space-y-2">
+              {!outputGroups ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={fetchOutputFiles}
+                  disabled={loadingOutputs}
+                >
+                  {loadingOutputs ? (
+                    <><Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" /> Loading…</>
+                  ) : (
+                    <><FileText className="mr-2 h-3.5 w-3.5" /> View Output Files</>
+                  )}
+                </Button>
+              ) : (
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-medium text-muted-foreground">Output files</span>
+                    <Button variant="ghost" size="sm" onClick={() => setOutputGroups(null)} className="h-6 text-xs">
+                      Hide
+                    </Button>
+                  </div>
+                  {outputGroups.length === 0 ? (
+                    <p className="text-xs text-muted-foreground">No output files found.</p>
+                  ) : (
+                    <div className="space-y-2">
+                      {outputGroups.map((g) => (
+                        <div key={g.slide_hash} className="rounded-md border bg-muted/30 p-2 space-y-1">
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs font-mono font-medium">{g.label}</span>
+                            <span className="text-[10px] text-muted-foreground">{g.files.length} file{g.files.length !== 1 ? 's' : ''}</span>
+                          </div>
+                          {g.files.length > 0 && (
+                            <ul className="space-y-0.5 pl-1">
+                              {g.files.map((f) => (
+                                <li key={f} className="flex items-center gap-2 text-[11px] font-mono text-muted-foreground">
+                                  <FileText className="h-3 w-3 shrink-0" />
+                                  {f}
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -556,6 +680,10 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
             <Button variant={mode === 'tag' ? 'default' : 'outline'} size="sm" onClick={() => setMode('tag')}>
               <Tag className="mr-2 h-4 w-4" />
               By Flag/Tag
+            </Button>
+            <Button variant={mode === 'study' ? 'default' : 'outline'} size="sm" onClick={() => setMode('study')}>
+              <FolderOpen className="mr-2 h-4 w-4" />
+              From Study
             </Button>
           </div>
 
@@ -616,7 +744,7 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
                             />
                           </TableCell>
                           <TableCell className="font-mono text-sm">
-                            {showHashes ? s.slide_hash.slice(0, 16) + '…' : (s.accession_number || s.slide_hash.slice(0, 12) + '…')}
+                            {showHashes ? s.slide_hash.slice(0, 16) + '…' : displaySlide(s)}
                           </TableCell>
                           <TableCell>{s.block_id}</TableCell>
                           <TableCell>{s.stain_type}</TableCell>
@@ -749,7 +877,7 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
                                       <div key={surgery.id} className="flex items-center gap-3 pl-10 pr-4 py-1.5 text-sm text-muted-foreground">
                                         <Stethoscope className="h-3.5 w-3.5 shrink-0" />
                                         <span className="font-medium text-foreground">{surgery.surgery_label}</span>
-                                        <span>{surgery.accession_number || surgery.case_hash.slice(0, 10) + '…'}</span>
+                                        <span>{displayCase(surgery)}</span>
                                         <span className="ml-auto">{surgery.slide_count} slides</span>
                                       </div>
                                     ))}
@@ -857,6 +985,120 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
                                 <TableCell>{s.block_id}</TableCell>
                                 <TableCell>{s.stain_type}</TableCell>
                                 <TableCell>{s.year}</TableCell>
+                              </TableRow>
+                            ))}
+                          </TableBody>
+                        </Table>
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+
+          {/* ── Study mode ── */}
+          {mode === 'study' && (
+            <div className="space-y-4">
+              <div className="space-y-2">
+                <label className="text-sm font-medium">Select study</label>
+                <Select value={selectedStudyId?.toString() ?? ''} onValueChange={v => setSelectedStudyId(Number(v))}>
+                  <SelectTrigger className="max-w-xs">
+                    <SelectValue placeholder="Choose a study..." />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {studies.map(s => (
+                      <SelectItem key={s.id} value={s.id.toString()}>
+                        <div className="flex items-center gap-2">
+                          <FolderOpen className="h-3.5 w-3.5 text-muted-foreground" />
+                          {s.name}
+                          <span className="text-xs text-muted-foreground">({s.slide_count} slides)</span>
+                        </div>
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  Select slides from a study folder, including external/research slides.
+                </p>
+              </div>
+
+              {selectedStudyId && (
+                <>
+                  {loadingStudy ? (
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                      <Loader2 className="h-4 w-4 animate-spin" /> Loading study...
+                    </div>
+                  ) : !studyDetail || studyDetail.slides.length === 0 ? (
+                    <p className="text-sm text-muted-foreground">No slides in this study. Import files via the Studies tab first.</p>
+                  ) : (
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm text-muted-foreground">{studyDetail.slides.length} slide{studyDetail.slides.length !== 1 ? 's' : ''} in study</span>
+                        <button className="text-xs text-primary hover:underline" onClick={toggleAllStudySlides}>
+                          {studySelectedHashes.size >= studyDetail.slides.length ? 'Deselect all' : 'Select all'}
+                        </button>
+                      </div>
+
+                      {/* Group filter chips */}
+                      {studyDetail.groups.length > 0 && (
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <span className="text-xs text-muted-foreground">Groups:</span>
+                          {studyDetail.groups.map(g => {
+                            const groupSlideHashes = g.slide_hashes
+                            const allInGroup = groupSlideHashes.every(h => studySelectedHashes.has(h))
+                            return (
+                              <button
+                                key={g.id}
+                                className={`text-[10px] font-medium px-2 py-1 rounded border transition-colors ${
+                                  allInGroup ? 'border-primary bg-primary/10 text-primary' : 'border-border hover:border-primary/40'
+                                }`}
+                                style={g.color ? { borderColor: allInGroup ? undefined : g.color + '60' } : undefined}
+                                onClick={() => {
+                                  setStudySelectedHashes(prev => {
+                                    const next = new Set(prev)
+                                    if (allInGroup) {
+                                      groupSlideHashes.forEach(h => next.delete(h))
+                                    } else {
+                                      groupSlideHashes.forEach(h => next.add(h))
+                                    }
+                                    return next
+                                  })
+                                }}
+                              >
+                                {g.color && <span className="inline-block w-2 h-2 rounded-full mr-1" style={{ backgroundColor: g.color }} />}
+                                {g.label || g.name} ({groupSlideHashes.length})
+                              </button>
+                            )
+                          })}
+                        </div>
+                      )}
+
+                      <div className="rounded-lg border max-h-[350px] overflow-auto">
+                        <Table>
+                          <TableHeader>
+                            <TableRow>
+                              <TableHead className="w-10">
+                                <input type="checkbox" checked={studySelectedHashes.size === studyDetail.slides.length && studyDetail.slides.length > 0} onChange={toggleAllStudySlides} className="h-4 w-4" />
+                              </TableHead>
+                              <TableHead>Slide</TableHead>
+                              <TableHead>Block</TableHead>
+                              <TableHead>Stain</TableHead>
+                              <TableHead>Size</TableHead>
+                            </TableRow>
+                          </TableHeader>
+                          <TableBody>
+                            {studyDetail.slides.map(s => (
+                              <TableRow key={s.slide_hash} className="cursor-pointer" onClick={() => toggleStudySlide(s.slide_hash)}>
+                                <TableCell>
+                                  <input type="checkbox" checked={studySelectedHashes.has(s.slide_hash)} onChange={() => toggleStudySlide(s.slide_hash)} className="h-4 w-4" />
+                                </TableCell>
+                                <TableCell className="font-mono text-sm">{displaySlide(s)}</TableCell>
+                                <TableCell>{s.block_id || '—'}</TableCell>
+                                <TableCell>{s.stain_type || '—'}</TableCell>
+                                <TableCell className="text-xs text-muted-foreground tabular-nums">
+                                  {s.file_size_bytes ? `${(s.file_size_bytes / (1024*1024)).toFixed(0)} MB` : '—'}
+                                </TableCell>
                               </TableRow>
                             ))}
                           </TableBody>

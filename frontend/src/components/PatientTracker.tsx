@@ -20,6 +20,7 @@ import {
 import type { CaseGroup, CohortPatient, PatientSurgery } from '@/types/slide'
 
 import { getApiBase } from '@/api'
+import { displayCase } from '@/lib/display'
 
 interface PatientTrackerProps {
   cohortId: number
@@ -410,7 +411,7 @@ export function PatientTracker({ cohortId, caseGroups }: PatientTrackerProps) {
                         )}
 
                         <span className="text-xs font-mono text-foreground truncate">
-                          {surgery.accession_number ?? surgery.case_hash.slice(0, 8) + '…'}
+                          {displayCase(surgery)}
                         </span>
 
                         {surgery.year && (
@@ -444,7 +445,7 @@ export function PatientTracker({ cohortId, caseGroups }: PatientTrackerProps) {
                             ? <SelectItem value="_none" disabled>No unassigned cases</SelectItem>
                             : unassignedCases.map((c) => (
                               <SelectItem key={c.case_hash} value={c.case_hash}>
-                                {c.accession_number ?? c.case_hash.slice(0, 8) + '…'}
+                                {displayCase(c)}
                                 {c.year ? ` (${c.year})` : ''}
                               </SelectItem>
                             ))}
@@ -515,7 +516,7 @@ export function PatientTracker({ cohortId, caseGroups }: PatientTrackerProps) {
                   <div className="flex items-center gap-2 px-4 py-2 hover:bg-muted/20">
                     <div className="flex-1 flex items-center gap-2 text-sm min-w-0">
                       <span className="font-mono text-xs truncate text-muted-foreground">
-                        {caseGroup.accession_number ?? caseGroup.case_hash.slice(0, 8) + '…'}
+                        {displayCase(caseGroup)}
                       </span>
                       {caseGroup.year && (
                         <span className="text-xs text-muted-foreground shrink-0">{caseGroup.year}</span>

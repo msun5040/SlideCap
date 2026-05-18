@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { Search, Filter, Tag as TagIcon, Eye, Tags, X, Plus, Settings, Trash2, ChevronDown, FileDown, Upload, Pencil, Check } from 'lucide-react'
+import { Search, Filter, Tag as TagIcon, Eye, Tags, X, Plus, Settings, Trash2, ChevronDown, FileDown, Upload, Pencil, Check, FileText, Download, Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { SlideViewer } from '@/components/SlideViewer'
 import { TagInput } from '@/components/TagInput'
@@ -35,7 +35,8 @@ import { CopyableText } from '@/components/CopyableText'
 import { SortableHeader } from '@/components/SortableHeader'
 import { useSortable } from '@/hooks/useSortable'
 
-import { getApiBase, normalizeAccession } from '@/api'
+import { getApiBase, normalizeAccession, isDemo } from '@/api'
+import { displaySlide } from '@/lib/display'
 
 // Preset colors for tags
 const PRESET_COLORS = [
@@ -92,6 +93,7 @@ export function SlideLibrary() {
   const [isCreatingTag, setIsCreatingTag] = useState(false)
   const [isDeletingTag, setIsDeletingTag] = useState<number | null>(null)
   const [expandedSlideTags, setExpandedSlideTags] = useState<Set<string>>(new Set())
+  const [colorPickerForTag, setColorPickerForTag] = useState<number | null>(null)
 
   // Download with analysis state
   const [isJobPickerOpen, setIsJobPickerOpen] = useState(false)
@@ -106,6 +108,11 @@ export function SlideLibrary() {
   // Slide results (cell stats) state for detail dialog
   const [slideResults, setSlideResults] = useState<{ job_id: number; analysis_name: string; version: string; status: string; cell_stats?: Record<string, number> | null }[]>([])
   const [loadingResults, setLoadingResults] = useState(false)
+  // Per-job output files & download state inside the Completed Analyses block
+  type OutputGroup = { slide_hash: string; label: string; files: string[]; annotation_count: number; is_local: boolean }
+  const [analysisOutputs, setAnalysisOutputs] = useState<Record<number, OutputGroup[] | undefined>>({})
+  const [loadingOutputJob, setLoadingOutputJob] = useState<number | null>(null)
+  const [downloadingJob, setDownloadingJob] = useState<number | null>(null)
 
   // Annotation state for detail dialog
   const [annotations, setAnnotations] = useState<{ name: string; size: number }[]>([])
@@ -264,6 +271,8 @@ export function SlideLibrary() {
       console.error('Search error:', error)
     } finally {
       setLoading(false)
+      // Refresh available tags so badge colors stay current with the latest tag data
+      fetchAvailableTags()
     }
   }
 
@@ -408,6 +417,34 @@ export function SlideLibrary() {
     }
   }, [])
 
+  const fetchAnalysisOutputs = useCallback(async (jobId: number, slideHash: string) => {
+    setLoadingOutputJob(jobId)
+    try {
+      const res = await fetch(`${getApiBase()}/jobs/${jobId}/output-filenames?slide_hashes=${encodeURIComponent(slideHash)}`)
+      if (res.ok) {
+        const data: OutputGroup[] = await res.json()
+        setAnalysisOutputs((prev) => ({ ...prev, [jobId]: data }))
+      }
+    } catch (e) { console.error('Failed to load output files:', e) }
+    finally { setLoadingOutputJob(null) }
+  }, [])
+
+  const downloadAnalysisZip = useCallback(async (jobId: number) => {
+    setDownloadingJob(jobId)
+    try {
+      const res = await fetch(`${getApiBase()}/jobs/${jobId}/download-zip`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const blob = await res.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `job_${jobId}_results.zip`
+      a.click()
+      URL.revokeObjectURL(url)
+    } catch (e) { console.error('Download failed:', e) }
+    finally { setDownloadingJob(null) }
+  }, [])
+
   const uploadAnnotation = async (slideHash: string, file: File) => {
     setUploadingAnnotation(true)
     try {
@@ -465,6 +502,7 @@ export function SlideLibrary() {
         .then((data) => setSlideResults(data))
         .catch(() => setSlideResults([]))
         .finally(() => setLoadingResults(false))
+      setAnalysisOutputs({})
     }
   }, [isDetailsDialogOpen, selectedSlide, fetchAnnotations])
 
@@ -721,6 +759,27 @@ export function SlideLibrary() {
     }
   }
 
+  const updateTagColor = async (tagId: number, color: string) => {
+    // Optimistic update
+    setAvailableTags(prev => prev.map(t => t.id === tagId ? { ...t, color } : t))
+    setColorPickerForTag(null)
+    try {
+      const res = await fetch(`${getApiBase()}/tags/${tagId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ color }),
+      })
+      if (!res.ok) {
+        // Revert on failure
+        fetchAvailableTags()
+        alert('Failed to update tag color')
+      }
+    } catch {
+      fetchAvailableTags()
+      alert('Failed to update tag color')
+    }
+  }
+
   const toggleExpandedTags = (slideHash: string, e: React.MouseEvent) => {
     e.stopPropagation()
     const newExpanded = new Set(expandedSlideTags)
@@ -798,20 +857,24 @@ export function SlideLibrary() {
             </SelectContent>
           </Select>
 
-          <Select value={tagFilter} onValueChange={(value) => {
-            if (value === '__manage__') {
-              setIsTagManagementOpen(true)
-            } else {
-              setTagFilter(value)
-            }
-          }}>
+          <Select
+            value={tagFilter}
+            onValueChange={(value) => {
+              if (value === '__manage__') {
+                setIsTagManagementOpen(true)
+              } else {
+                setTagFilter(value)
+              }
+            }}
+            onOpenChange={(open) => { if (open) fetchAvailableTags() }}
+          >
             <SelectTrigger className="w-36">
               <TagIcon className="mr-2 h-4 w-4" />
               <SelectValue placeholder="Tag" />
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="all">All Tags</SelectItem>
-              {availableTags.filter(t => (t.slide_count ?? 0) > 0).map((tag) => (
+              {availableTags.map((tag) => (
                 <SelectItem key={tag.id} value={tag.name}>
                   <div className="flex items-center gap-2">
                     {tag.color && (
@@ -821,7 +884,7 @@ export function SlideLibrary() {
                       />
                     )}
                     {tag.name}
-                    <span className="text-muted-foreground text-xs">({tag.slide_count})</span>
+                    <span className="text-muted-foreground text-xs">({tag.slide_count ?? 0})</span>
                   </div>
                 </SelectItem>
               ))}
@@ -935,8 +998,19 @@ export function SlideLibrary() {
                     />
                   </TableCell>
                   <TableCell>
-                    <CopyableText className="font-medium text-sm" mono={false} text={slide.accession_number} />
-                    {slide.slide_id && (
+                    <div className="flex items-center gap-1.5">
+                      <CopyableText
+                        className="font-medium text-sm"
+                        mono={false}
+                        text={isDemo() ? (slide.slide_id || slide.slide_hash.slice(0, 12)) : slide.accession_number}
+                      />
+                      {slide.request_sheets && slide.request_sheets.length > 0 && (
+                        <span className="inline-flex items-center rounded px-1 py-0.5 text-[9px] font-medium bg-violet-100 text-violet-700 dark:bg-violet-900 dark:text-violet-300 whitespace-nowrap" title={slide.request_sheets.map(rs => rs.sheet_name).join(', ')}>
+                          REQ
+                        </span>
+                      )}
+                    </div>
+                    {!isDemo() && slide.slide_id && (
                       <span className="block text-[10px] font-mono text-muted-foreground/60 mt-0.5">{slide.slide_id}</span>
                     )}
                   </TableCell>
@@ -1048,7 +1122,7 @@ export function SlideLibrary() {
           <DialogHeader>
             <DialogTitle>Manage Tags</DialogTitle>
             <DialogDescription>
-              {selectedSlide?.accession_number} - Block {selectedSlide?.block_id}, Slide {selectedSlide?.slide_number}
+              {selectedSlide && displaySlide(selectedSlide)} - Block {selectedSlide?.block_id}, Slide {selectedSlide?.slide_number}
             </DialogDescription>
           </DialogHeader>
           {loadingTags ? (
@@ -1069,17 +1143,20 @@ export function SlideLibrary() {
           <DialogHeader>
             <DialogTitle>Slide Details</DialogTitle>
             <DialogDescription>
-              {selectedSlide?.accession_number}
+              {selectedSlide && displaySlide(selectedSlide)}
             </DialogDescription>
           </DialogHeader>
           {selectedSlide && (
             <div className="grid grid-cols-2 gap-4 py-4">
               <div>
-                <label className="text-sm text-muted-foreground">Accession #</label>
-                <CopyableText className="font-medium text-sm" text={selectedSlide.accession_number} />
+                <label className="block text-sm text-muted-foreground">{isDemo() ? 'Slide ID:' : 'Accession #:'}</label>
+                <CopyableText
+                  className="font-medium text-sm"
+                  text={isDemo() ? (selectedSlide.slide_id || selectedSlide.slide_hash.slice(0, 12)) : selectedSlide.accession_number}
+                />
               </div>
               <div>
-                <label className="text-sm text-muted-foreground">Slide Hash</label>
+                <label className="block text-sm text-muted-foreground">Slide Hash:</label>
                 <CopyableText className="text-sm" text={`${selectedSlide.slide_hash.substring(0, 16)}...`} copyValue={selectedSlide.slide_hash} />
               </div>
               <div>
@@ -1129,6 +1206,19 @@ export function SlideLibrary() {
                   </div>
                 </div>
               )}
+              {selectedSlide.request_sheets && selectedSlide.request_sheets.length > 0 && (
+                <div className="col-span-2 border-t pt-3">
+                  <label className="text-sm text-muted-foreground">Request Sheets</label>
+                  <div className="flex flex-wrap gap-2 mt-1">
+                    {selectedSlide.request_sheets.map((rs) => (
+                      <span key={rs.sheet_id} className="inline-flex items-center gap-1.5 rounded-sm px-2 py-1 text-xs font-medium border border-violet-200 bg-violet-50 text-violet-700 dark:border-violet-800 dark:bg-violet-950 dark:text-violet-300">
+                        {rs.sheet_name || `Sheet #${rs.sheet_id}`}
+                        <span className="text-[10px] opacity-70">({rs.case_status || 'Not Started'})</span>
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
               {selectedSlide.slide_tags && selectedSlide.slide_tags.length > 0 && (
                 <div className="col-span-2">
                   <label className="text-sm text-muted-foreground">Tags</label>
@@ -1146,33 +1236,86 @@ export function SlideLibrary() {
                     {loadingResults ? (
                       <p className="text-xs text-muted-foreground">Loading results...</p>
                     ) : slideResults.length > 0 ? (
-                      slideResults.map((r) => (
-                        <div key={`${r.job_id}-${r.analysis_name}`} className="rounded border p-2">
-                          <div className="flex items-center gap-2">
-                            <Badge
-                              variant="secondary"
-                              style={{
-                                backgroundColor: '#3B82F620',
-                                color: '#3B82F6',
-                                borderColor: '#3B82F6',
-                              }}
-                            >
-                              {r.analysis_name} v{r.version}
-                            </Badge>
-                            <span className="text-xs text-muted-foreground">Job #{r.job_id}</span>
-                          </div>
-                          {r.cell_stats && (
-                            <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-muted-foreground mt-1.5">
-                              {Object.entries(r.cell_stats).map(([name, count]) => (
-                                <span key={name}>
-                                  <span className="font-medium text-foreground/70">{name}:</span>{' '}
-                                  {count.toLocaleString()}
-                                </span>
-                              ))}
+                      slideResults.map((r) => {
+                        const files = analysisOutputs[r.job_id]
+                        return (
+                          <div key={`${r.job_id}-${r.analysis_name}`} className="rounded border p-2 space-y-2">
+                            <div className="flex items-center gap-2">
+                              <Badge
+                                variant="secondary"
+                                style={{
+                                  backgroundColor: '#3B82F620',
+                                  color: '#3B82F6',
+                                  borderColor: '#3B82F6',
+                                }}
+                              >
+                                {r.analysis_name} v{r.version}
+                              </Badge>
+                              <span className="text-xs text-muted-foreground">Job #{r.job_id}</span>
+                              <div className="ml-auto flex items-center gap-1">
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  className="h-7 text-xs"
+                                  disabled={loadingOutputJob === r.job_id}
+                                  onClick={() => {
+                                    if (files) {
+                                      setAnalysisOutputs((prev) => ({ ...prev, [r.job_id]: undefined }))
+                                    } else if (selectedSlide) {
+                                      fetchAnalysisOutputs(r.job_id, selectedSlide.slide_hash)
+                                    }
+                                  }}
+                                >
+                                  {loadingOutputJob === r.job_id ? (
+                                    <Loader2 className="h-3 w-3 animate-spin mr-1" />
+                                  ) : (
+                                    <FileText className="h-3 w-3 mr-1" />
+                                  )}
+                                  {files ? 'Hide' : 'Files'}
+                                </Button>
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  className="h-7 text-xs"
+                                  disabled={downloadingJob === r.job_id}
+                                  onClick={() => downloadAnalysisZip(r.job_id)}
+                                >
+                                  {downloadingJob === r.job_id ? (
+                                    <Loader2 className="h-3 w-3 animate-spin mr-1" />
+                                  ) : (
+                                    <Download className="h-3 w-3 mr-1" />
+                                  )}
+                                  Download
+                                </Button>
+                              </div>
                             </div>
-                          )}
-                        </div>
-                      ))
+                            {r.cell_stats && (
+                              <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-muted-foreground">
+                                {Object.entries(r.cell_stats).map(([name, count]) => (
+                                  <span key={name}>
+                                    <span className="font-medium text-foreground/70">{name}:</span>{' '}
+                                    {count.toLocaleString()}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                            {files && (
+                              files.length === 0 ? (
+                                <p className="text-xs text-muted-foreground">No output files found.</p>
+                              ) : (
+                                <ul className="space-y-0.5 pl-1 pt-1 border-t">
+                                  {files.flatMap((g) => g.files).map((f) => (
+                                    <li key={f} className="flex items-center gap-2 text-[11px] font-mono text-muted-foreground">
+                                      <FileText className="h-3 w-3 shrink-0" />
+                                      {f}
+                                    </li>
+                                  ))}
+                                </ul>
+                              )
+                            )}
+                          </div>
+                        )
+                      })
                     ) : (
                       <div className="flex flex-wrap gap-2">
                         {selectedSlide.completed_analyses.map((name: string) => (
@@ -1290,8 +1433,8 @@ export function SlideLibrary() {
                 {PRESET_COLORS.map((color) => (
                   <button
                     key={color}
-                    className={`w-5 h-5 rounded-full border-2 transition-all ${
-                      bulkTagColor === color ? 'border-black scale-110 ring-1 ring-black' : 'border-transparent hover:scale-105'
+                    className={`w-5 h-5 rounded-full transition-all ring-offset-2 ring-offset-background ${
+                      bulkTagColor === color ? 'ring-2 ring-foreground' : 'hover:scale-110'
                     }`}
                     style={{ backgroundColor: color }}
                     onClick={() => setBulkTagColor(color)}
@@ -1472,8 +1615,8 @@ export function SlideLibrary() {
                   {PRESET_COLORS.map((color) => (
                     <button
                       key={color}
-                      className={`w-5 h-5 rounded-full border-2 transition-all ${
-                        newTagColor === color ? 'border-black scale-110 ring-1 ring-black' : 'border-transparent hover:scale-105'
+                      className={`w-5 h-5 rounded-full transition-all ring-offset-2 ring-offset-background ${
+                        newTagColor === color ? 'ring-2 ring-foreground' : 'hover:scale-110'
                       }`}
                       style={{ backgroundColor: color }}
                       onClick={() => setNewTagColor(color)}
@@ -1511,10 +1654,28 @@ export function SlideLibrary() {
                       className="flex items-center justify-between p-2 rounded-lg hover:bg-muted/50 group"
                     >
                       <div className="flex items-center gap-2 flex-1 min-w-0">
-                        <span
-                          className="w-3 h-3 rounded-full shrink-0"
-                          style={{ backgroundColor: tag.color || '#6B7280' }}
-                        />
+                        <div className="relative shrink-0">
+                          <button
+                            className="w-4 h-4 rounded-full ring-1 ring-border hover:ring-2 hover:ring-foreground transition-all"
+                            style={{ backgroundColor: tag.color || '#6B7280' }}
+                            onClick={() => setColorPickerForTag(colorPickerForTag === tag.id ? null : tag.id)}
+                            title="Change color"
+                          />
+                          {colorPickerForTag === tag.id && (
+                            <div className="absolute left-0 top-6 z-50 flex gap-1 p-2 bg-popover border rounded-lg shadow-lg">
+                              {PRESET_COLORS.map((color) => (
+                                <button
+                                  key={color}
+                                  className={`w-5 h-5 rounded-full transition-all ring-offset-2 ring-offset-background ${
+                                    tag.color === color ? 'ring-2 ring-foreground' : 'hover:scale-110'
+                                  }`}
+                                  style={{ backgroundColor: color }}
+                                  onClick={() => updateTagColor(tag.id, color)}
+                                />
+                              ))}
+                            </div>
+                          )}
+                        </div>
                         {editingTagId === tag.id ? (
                           <div className="flex items-center gap-1 flex-1">
                             <Input
@@ -1594,7 +1755,7 @@ export function SlideLibrary() {
       {isViewerOpen && selectedSlide && (
         <SlideViewer
           slideHash={selectedSlide.slide_hash}
-          slideName={`${selectedSlide.accession_number} - ${selectedSlide.block_id}-${selectedSlide.slide_number} (${selectedSlide.stain_type})`}
+          slideName={`${displaySlide(selectedSlide)} - ${selectedSlide.block_id}-${selectedSlide.slide_number} (${selectedSlide.stain_type})`}
           onClose={() => setIsViewerOpen(false)}
         />
       )}
