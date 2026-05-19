@@ -761,7 +761,10 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
   }, [sheetId])
 
   useEffect(() => { fetchSheet() }, [fetchSheet])
-  useEffect(() => { fetchCoverage() }, [fetchCoverage])
+  // Refetch coverage when the sheet changes OR rows are added/removed. Using
+  // rows.length keeps this from firing on every field edit (those don't
+  // affect block coverage).
+  useEffect(() => { fetchCoverage() }, [fetchCoverage, rows.length])
 
   const openSettings = useCallback(async () => {
     setSettingsTagIds(new Set(sheet?.auto_tags?.map(t => t.id) ?? []))
@@ -885,6 +888,9 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
       })
       if (!res.ok) {
         setRows(prev => prev.map(r => r.id === rowId ? { ...r, [field]: row[field as keyof RequestRow] } : r))
+      } else if (field === 'all_blocks' || field === 'accession_number') {
+        // These fields drive the coverage calculation — refresh badges
+        fetchCoverage()
       }
     } catch {
       setRows(prev => prev.map(r => r.id === rowId ? { ...r, [field]: row[field as keyof RequestRow] } : r))

@@ -31,6 +31,18 @@ class Settings(BaseSettings):
     # cluster submissions to a mock pipeline. Set via APP_MODE env var.
     APP_MODE: str = "prod"
 
+    # ── Filename parser ────────────────────────────────────────────────
+    # Deploying institutions can override the parser pattern list to match
+    # their accession scheme without code changes. JSON env var
+    # PARSER_PATTERNS must decode to a list of {name, description, regex}
+    # objects. The regex must use these named groups:
+    #
+    #   accession (required), year (required), block, slide / slide_only,
+    #   stain, random
+    #
+    # Default = "" which means "use the built-in DFCI Ligon Lab pattern."
+    PARSER_PATTERNS: str = ""
+
     @property
     def app_data_path(self) -> Path:
         return Path(self.NETWORK_ROOT) / self.APP_DATA_DIR

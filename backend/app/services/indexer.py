@@ -30,11 +30,12 @@ class SlideIndexer:
     def __init__(
         self,
         hasher: SlideHasher,
-        network_root: str
+        network_root: str,
+        parser: FilenameParser | None = None,
     ):
         self.hasher = hasher
         self.root = Path(network_root)
-        self.parser = FilenameParser()
+        self.parser = parser or FilenameParser()
 
         # In-memory caches for fast lookup (built on startup)
         self.slide_hash_to_path: dict[str, Path] = {}

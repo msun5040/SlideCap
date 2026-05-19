@@ -21,6 +21,7 @@ import {
   HardDriveDownload,
   Ghost,
   Loader2,
+  Code,
 } from 'lucide-react'
 import {
   DropdownMenu,
@@ -42,6 +43,7 @@ import { SlidePull } from '@/components/SlidePull'
 import { StudyManager } from '@/components/StudyManager'
 import { LauncherScreen } from '@/components/LauncherScreen'
 import { LoginScreen } from '@/components/LoginScreen'
+import { ParserSettingsDialog } from '@/components/ParserSettingsDialog'
 import { LoadingSpinner } from '@/components/LoadingSpinner'
 import { setApiBase, getApiBase, getAuthToken, clearAuthToken, installAuthInterceptor, setAppMode, isDemo } from '@/api'
 
@@ -72,6 +74,7 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(true)
   const [menuAction, setMenuAction] = useState<{ type: string; status: 'running' | 'done' | 'error'; message: string } | null>(null)
   const [ghostPreview, setGhostPreview] = useState<any>(null)
+  const [isParserSettingsOpen, setIsParserSettingsOpen] = useState(false)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const healthPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
@@ -457,6 +460,19 @@ export default function App() {
             </DropdownMenuContent>
           </DropdownMenu>
 
+          <DropdownMenu>
+            <DropdownMenuTrigger className="px-2.5 py-1 text-[13px] text-muted-foreground hover:text-foreground hover:bg-muted rounded-sm transition-colors outline-none">
+              Settings
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start" className="w-56">
+              <DropdownMenuLabel className="text-xs">Deployment</DropdownMenuLabel>
+              <DropdownMenuItem onClick={() => setIsParserSettingsOpen(true)}>
+                <Code className="h-4 w-4 mr-2" />
+                Parser configuration
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+
           {/* Spacer + current view label */}
           <div className="h-4 w-px bg-border mx-1" />
           <span className="text-[13px] font-medium text-foreground">
@@ -576,6 +592,9 @@ export default function App() {
           </div>
         </main>
       </div>
+
+      {/* Parser settings dialog */}
+      <ParserSettingsDialog open={isParserSettingsOpen} onOpenChange={setIsParserSettingsOpen} />
 
       {/* Ghost slides preview dialog */}
       <Dialog open={ghostPreview !== null} onOpenChange={(open) => { if (!open) setGhostPreview(null) }}>

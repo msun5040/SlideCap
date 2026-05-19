@@ -88,9 +88,13 @@ async def lifespan(app: FastAPI):
     print("Initializing hasher...")
     hasher = SlideHasher(settings.salt_path)
 
-    # Initialize indexer (scans slides/ subdirectory for year folders)
-    print("Initializing indexer...")
-    indexer = SlideIndexer(hasher, str(settings.slides_path))
+    # Initialize indexer with the configured parser patterns (or built-in default)
+    from .services.filename_parser import FilenameParser, patterns_from_config
+    parser_patterns = patterns_from_config(settings.PARSER_PATTERNS)
+    print(f"Initializing indexer with {len(parser_patterns)} parser pattern(s): "
+          f"{', '.join(p.name for p in parser_patterns)}")
+    indexer = SlideIndexer(hasher, str(settings.slides_path),
+                           parser=FilenameParser(parser_patterns))
 
     # Build path cache for fast lookups
     print("Building path cache...")
@@ -272,6 +276,82 @@ def health():
         "network_root": settings.NETWORK_ROOT,
         "network_accessible": os.path.exists(settings.NETWORK_ROOT),
         "app_mode": settings.APP_MODE,
+    }
+
+
+# ── Parser settings (read-only + test) ────────────────────────────────
+
+
+class ParserTestRequest(BaseModel):
+    filename: str
+    regex: Optional[str] = None  # optional ad-hoc regex (overrides configured patterns)
+
+
+@app.get("/parser/patterns")
+def get_parser_patterns():
+    """Return the parser patterns currently in use. Read-only — configured via PARSER_PATTERNS env var."""
+    if not indexer:
+        raise HTTPException(status_code=503, detail="Indexer not initialized")
+    return [
+        {"name": p.name, "description": p.description, "regex": p.regex.pattern}
+        for p in indexer.parser.patterns
+    ]
+
+
+@app.post("/parser/test")
+def test_parser(req: ParserTestRequest):
+    """
+    Try the given filename against every configured pattern (or an ad-hoc
+    regex if `regex` is provided). Returns which pattern matched and what
+    each pattern would extract.
+    """
+    if not indexer:
+        raise HTTPException(status_code=503, detail="Indexer not initialized")
+    from .services.filename_parser import FilenameParser, NamedPattern
+    import re as _re
+
+    filename = (req.filename or '').strip()
+    if not filename:
+        raise HTTPException(status_code=400, detail="filename is required")
+
+    if req.regex:
+        try:
+            ad_hoc = _re.compile(req.regex, _re.IGNORECASE)
+        except _re.error as e:
+            raise HTTPException(status_code=400, detail=f"Invalid regex: {e}")
+        patterns = [NamedPattern(name="(test pattern)", description="", regex=ad_hoc)]
+    else:
+        patterns = list(indexer.parser.patterns)
+
+    test_parser_inst = FilenameParser(patterns)
+    parsed = test_parser_inst.parse(filename)
+
+    # Per-pattern breakdown so the UI can show which ones did/did not match
+    attempts = []
+    for p in patterns:
+        m = p.regex.match(filename)
+        attempts.append({
+            "name": p.name,
+            "matched": m is not None,
+            "groups": m.groupdict() if m else None,
+        })
+
+    return {
+        "filename": filename,
+        "matched": parsed is not None,
+        "matched_pattern": parsed.pattern_name if parsed else None,
+        "parsed": (
+            {
+                "accession": parsed.accession,
+                "block_id": parsed.block_id,
+                "slide_number": parsed.slide_number,
+                "stain_type": parsed.stain_type,
+                "random_id": parsed.random_id,
+                "year": parsed.year,
+                "full_stem": parsed.full_stem,
+            } if parsed else None
+        ),
+        "attempts": attempts,
     }
 
 
