@@ -109,6 +109,7 @@ export interface Analysis {
   name: string
   version: string
   description?: string
+  kind: string                   // plugin id, e.g. "cellvit"
   script_path?: string
   working_directory?: string
   env_setup?: string
@@ -121,6 +122,25 @@ export interface Analysis {
   active: boolean
   created_at?: string
   job_count?: number
+  transforms?: string  // JSON-encoded list of {match, ops} rules; empty → kind's default_rules apply
+}
+
+/** Returned by GET /analyses/kinds — one entry per registered plugin module. */
+export interface AnalysisKind {
+  id: string
+  name: string
+  description: string
+  default_rules: { match: string; ops: string[] }[]
+  output_globs: string[]
+  renderers: AnalysisRenderer[]
+}
+
+/** A per-slide compute exposed by a kind plugin (e.g. UNI's UMAP scatter). */
+export interface AnalysisRenderer {
+  id: string
+  name: string
+  description: string
+  output: string  // currently "scatter2d"
 }
 
 export interface JobSlide {

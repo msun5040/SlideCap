@@ -46,6 +46,7 @@ import { LoginScreen } from '@/components/LoginScreen'
 import { ParserSettingsDialog } from '@/components/ParserSettingsDialog'
 import { LoadingSpinner } from '@/components/LoadingSpinner'
 import { setApiBase, getApiBase, getAuthToken, clearAuthToken, installAuthInterceptor, setAppMode, isDemo } from '@/api'
+import { SlideDetailsProvider } from '@/components/SlideDetailsContext'
 
 interface SortStatus {
   running: boolean
@@ -280,9 +281,13 @@ export default function App() {
     currentView === view ? '' : 'hidden'
 
   return (
+    <SlideDetailsProvider>
     <div className="flex h-screen bg-background">
       {/* macOS traffic light spacer */}
       <div className="fixed top-0 left-0 right-0 h-8 z-50" style={{ WebkitAppRegion: 'drag' } as React.CSSProperties} />
+      {/* Note: SlideDetailsProvider wraps this tree so any descendant can call
+          `useSlideDetails().openSlideDetails(hash)` to pop the global Slide
+          Details dialog. Single instance, single source of truth. */}
 
       {/* Sidebar — dark, minimal */}
       <aside
@@ -656,5 +661,6 @@ export default function App() {
         </DialogContent>
       </Dialog>
     </div>
+    </SlideDetailsProvider>
   )
 }

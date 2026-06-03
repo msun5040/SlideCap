@@ -19,11 +19,17 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# DEMO_PYTHON overrides the interpreter used to start the backend. Falls back
+# to `python`, which on a pyenv-managed machine may be a shim pointing at
+# `system` with no SlideCap deps installed. Set DEMO_PYTHON to a full path
+# (or use PYENV_VERSION=<env> ./scripts/run-demo.sh) when that happens.
+DEMO_PYTHON="${DEMO_PYTHON:-python}"
+
 cd "$REPO_ROOT/backend"
 APP_MODE=demo \
   PORT=8001 \
   LOCAL_DATA_DIR="$HOME/.slidecap-demo" \
-  python run_server.py &
+  "$DEMO_PYTHON" run_server.py &
 
 cd "$REPO_ROOT/frontend"
 npm run dev:demo &

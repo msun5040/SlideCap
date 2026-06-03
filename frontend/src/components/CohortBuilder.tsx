@@ -37,6 +37,7 @@ import { PatientTracker } from '@/components/PatientTracker'
 import { getApiBase, normalizeAccession, isDemo } from '@/api'
 import { displaySlide, displayCase } from '@/lib/display'
 import { SortableHeader } from '@/components/SortableHeader'
+import { useSlideDetails } from '@/components/SlideDetailsContext'
 import { useSortable } from '@/hooks/useSortable'
 const SLIDE_FLAG_TAG = 'flagged'
 
@@ -97,6 +98,10 @@ function StatusIcon({ status, title }: { status: string; title?: string }) {
 }
 
 export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
+  // Imperative trigger for the global slide-details dialog — used by per-slide
+  // rows below so users can quick-look any slide in the cohort.
+  const { openSlideDetails } = useSlideDetails()
+
   // ── Cohort data ──────────────────────────────────────────────────────
   const [cohort, setCohort] = useState<CohortDetail | null>(null)
   const [cohortLoading, setCohortLoading] = useState(true)
@@ -1092,7 +1097,22 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                                     return (
                                       <div
                                         key={slide.slide_hash}
-                                        className="flex items-center gap-2.5 px-3 py-1.5 group/slide hover:bg-gray-100/60 transition-colors first:pt-2 last:pb-2"
+                                        className="flex items-center gap-2.5 px-3 py-1.5 group/slide hover:bg-gray-100/60 transition-colors first:pt-2 last:pb-2 cursor-pointer"
+                                        onClick={() => openSlideDetails({
+                                          // CohortSlide shape → Slide-compatible seed. Full data
+                                          // streams in from /slides/{hash} once the dialog opens.
+                                          slide_hash: slide.slide_hash,
+                                          accession_number: slide.accession_number || '',
+                                          block_id: slide.block_id,
+                                          slide_number: slide.slide_number || '',
+                                          stain_type: slide.stain_type,
+                                          year: slide.year ?? undefined,
+                                          random_id: slide.random_id,
+                                          case_hash: slide.case_hash ?? undefined,
+                                          slide_tags: slide.tags,
+                                          file_size_bytes: slide.file_size_bytes,
+                                        })}
+                                        title="View slide details"
                                       >
                                         {/* Stain dot */}
                                         <span
@@ -1132,7 +1152,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                                           className={`shrink-0 inline-flex items-center justify-center h-5 w-5 rounded-full transition-colors ${
                                             flagged ? 'text-red-500' : 'text-muted-foreground/30 opacity-0 group-hover/slide:opacity-100 hover:text-red-400'
                                           }`}
-                                          onClick={() => toggleSlideFlag(slide)}
+                                          onClick={(e) => { e.stopPropagation(); toggleSlideFlag(slide) }}
                                           title={flagged ? 'Unflag slide' : 'Flag slide'}
                                         >
                                           <Flag className={`h-2.5 w-2.5 ${flagged ? 'fill-current' : ''}`} />
@@ -1140,7 +1160,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                                         {/* Remove slide */}
                                         <button
                                           className="shrink-0 opacity-0 group-hover/slide:opacity-100 text-muted-foreground hover:text-destructive transition-opacity"
-                                          onClick={() => removeSlide(slide.slide_hash)}
+                                          onClick={(e) => { e.stopPropagation(); removeSlide(slide.slide_hash) }}
                                           title="Remove slide"
                                         >
                                           <X className="h-3 w-3" />

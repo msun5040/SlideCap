@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Plus, Users, Trash2, Upload, Filter, Tag } from 'lucide-react'
+import { Plus, Users, Trash2, Upload, Filter, Tag, ClipboardPaste } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
@@ -19,6 +19,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { CohortBuilder } from '@/components/CohortBuilder'
+import { CohortFromPasteDialog } from '@/components/CohortFromPasteDialog'
 import type { Cohort } from '@/types/slide'
 
 import { getApiBase } from '@/api'
@@ -32,6 +33,9 @@ export function CohortDashboard() {
   const [loading, setLoading] = useState(true)
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false)
   const [createMode, setCreateMode] = useState<'empty' | 'upload' | 'tag' | null>(null)
+  // Paste-flow dialog is mounted separately so it doesn't have to share state
+  // with the mode-pick dialog above.
+  const [isPasteDialogOpen, setIsPasteDialogOpen] = useState(false)
   const [newCohortName, setNewCohortName] = useState('')
   const [newCohortDescription, setNewCohortDescription] = useState('')
   const [selectedFile, setSelectedFile] = useState<File | null>(null)
@@ -370,6 +374,23 @@ export function CohortDashboard() {
               <Button
                 variant="outline"
                 className="justify-start h-auto py-4"
+                onClick={() => {
+                  // Close the mode-pick dialog first, then open the paste flow.
+                  // Mounting both at once would double-stack the dialog backdrop.
+                  setIsCreateDialogOpen(false)
+                  setIsPasteDialogOpen(true)
+                }}
+              >
+                <ClipboardPaste className="mr-3 h-5 w-5" />
+                <div className="text-left">
+                  <p className="font-medium">From Pasted Accessions</p>
+                  <p className="text-sm text-muted-foreground whitespace-normal">Paste a list, preview matching slides, filter by year / stain / scanned-status, then commit. Best for ad-hoc cohorts.</p>
+                </div>
+              </Button>
+
+              <Button
+                variant="outline"
+                className="justify-start h-auto py-4"
                 onClick={() => setCreateMode('tag')}
               >
                 <Tag className="mr-3 h-5 w-5" />
@@ -443,6 +464,19 @@ export function CohortDashboard() {
           )}
         </DialogContent>
       </Dialog>
+
+      {/* Paste-flow dialog: build a cohort from a pasted accession list with
+          live filtering. On success, refresh the cohort table and jump into
+          the new cohort's builder view. */}
+      <CohortFromPasteDialog
+        open={isPasteDialogOpen}
+        onOpenChange={setIsPasteDialogOpen}
+        onCreated={(cohortId) => {
+          fetchCohorts()
+          setActiveCohortId(cohortId)
+          setSubView('builder')
+        }}
+      />
     </div>
   )
 }

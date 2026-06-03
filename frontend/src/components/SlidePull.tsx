@@ -15,6 +15,7 @@ import {
   Circle,
   Copy,
   ClipboardCheck,
+  FolderOutput,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -60,6 +61,33 @@ function formatBytes(bytes?: number): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`
 }
 
+// Classify a stain into a coarse bucket used by the stain-filter UI.
+type StainBucket = 'H&E' | 'IHC' | 'Other'
+function stainBucket(stain?: string): StainBucket {
+  const s = (stain || '').trim().toUpperCase()
+  // H&E may be recorded as HE, HNE, H&E, or H E depending on the site's naming.
+  if (s === 'HE' || s === 'HNE' || s === 'H&E' || s === 'H E') return 'H&E'
+  if (s.startsWith('IHC')) return 'IHC'
+  return 'Other'
+}
+function slideMatchesStainFilter(stain: string | undefined, buckets: Set<StainBucket>): boolean {
+  if (buckets.size === 0) return true // empty filter = all
+  return buckets.has(stainBucket(stain))
+}
+
+interface ExportReport {
+  output_dir: string
+  preferred_method: 'symlink' | 'hardlink' | 'copy'
+  bin_size: number
+  bin_count: number
+  total_requested: number
+  total_exported: number
+  missing_count: number
+  failure_count: number
+  bins: { bin: string; path: string; slides: number; failures: number }[]
+  summary_path: string
+}
+
 // ── Main Component ──────────────────────────────────────────────
 export function SlidePull() {
   const [cases, setCases] = useState<PullCase[]>([])
@@ -91,11 +119,21 @@ export function SlidePull() {
   // Paste
   const [pasteText, setPasteText] = useState('')
   const [pasteLoading, setPasteLoading] = useState(false)
+  const [pasteStainFilter, setPasteStainFilter] = useState<Set<StainBucket>>(new Set(['H&E']))
 
   // Export
   const [copied, setCopied] = useState(false)
   const [downloading, setDownloading] = useState(false)
   const [downloadError, setDownloadError] = useState('')
+
+  // Export to directory
+  const [isExportOpen, setIsExportOpen] = useState(false)
+  const [exportDir, setExportDir] = useState('')
+  const [exportBinSize, setExportBinSize] = useState(100)
+  const [exportMethod, setExportMethod] = useState<'hardlink' | 'copy' | 'symlink'>('hardlink')
+  const [exporting, setExporting] = useState(false)
+  const [exportError, setExportError] = useState('')
+  const [exportReport, setExportReport] = useState<ExportReport | null>(null)
 
   // ── Add slides from search results (grouped by accession) ─────
   const addSlidesFromResults = useCallback((slides: Slide[]) => {
@@ -257,6 +295,7 @@ export function SlidePull() {
           const data = await res.json()
           const exact = (data.results || []).filter((s: Slide) =>
             normalizeAccession(s.accession_number) === q
+            && slideMatchesStainFilter(s.stain_type, pasteStainFilter)
           )
           if (exact.length > 0) addSlidesFromResults(exact)
         }
@@ -265,6 +304,15 @@ export function SlidePull() {
     setPasteLoading(false)
     setIsPasteOpen(false)
     setPasteText('')
+  }
+
+  const togglePasteStain = (b: StainBucket) => {
+    setPasteStainFilter(prev => {
+      const next = new Set(prev)
+      if (next.has(b)) next.delete(b)
+      else next.add(b)
+      return next
+    })
   }
 
   // ── Case/slide operations ─────────────────────────────────────
@@ -337,6 +385,47 @@ export function SlidePull() {
     a.download = `slide-pull-${new Date().toISOString().slice(0, 10)}.csv`
     a.click()
     URL.revokeObjectURL(url)
+  }
+
+  const openExportDialog = () => {
+    setExportError('')
+    setExportReport(null)
+    setIsExportOpen(true)
+  }
+
+  const runExportToDirectory = async () => {
+    const hashes = cases.flatMap(c => c.slides.filter(s => s.selected).map(s => s.slide_hash))
+    if (hashes.length === 0) return
+    if (!exportDir.trim()) {
+      setExportError('Output directory is required')
+      return
+    }
+    setExporting(true)
+    setExportError('')
+    setExportReport(null)
+    try {
+      const res = await fetch(`${getApiBase()}/slides/pull-export`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          slide_hashes: hashes,
+          output_dir: exportDir.trim(),
+          bin_size: Math.max(1, exportBinSize | 0),
+          method: exportMethod,
+        }),
+      })
+      if (!res.ok) {
+        const detail = await res.json().catch(() => null)
+        throw new Error(detail?.detail || `Export failed (${res.status})`)
+      }
+      const report = (await res.json()) as ExportReport
+      setExportReport(report)
+    } catch (e: any) {
+      console.error('Export failed:', e)
+      setExportError(e.message || 'Export failed')
+    } finally {
+      setExporting(false)
+    }
   }
 
   const downloadFiles = async () => {
@@ -483,12 +572,153 @@ export function SlidePull() {
                   {pasteText.split(/[\n,;]+/).filter(l => l.trim()).length} cases
                 </p>
               )}
+              <div className="space-y-1.5">
+                <p className="text-[11px] font-medium text-muted-foreground uppercase tracking-wide">Stain filter</p>
+                <div className="flex gap-1.5">
+                  {(['H&E', 'IHC', 'Other'] as StainBucket[]).map(b => {
+                    const active = pasteStainFilter.has(b)
+                    return (
+                      <button
+                        key={b}
+                        type="button"
+                        onClick={() => togglePasteStain(b)}
+                        className={`text-[12px] px-2.5 py-1 rounded border transition-colors ${
+                          active
+                            ? b === 'H&E'
+                              ? 'bg-rose-50 text-rose-700 border-rose-300'
+                              : b === 'IHC'
+                                ? 'bg-blue-50 text-blue-700 border-blue-300'
+                                : 'bg-gray-100 text-gray-700 border-gray-300'
+                            : 'bg-background text-muted-foreground border-gray-300 hover:bg-muted/30'
+                        }`}
+                      >
+                        {b}
+                      </button>
+                    )
+                  })}
+                </div>
+                <p className="text-[11px] text-muted-foreground">
+                  {pasteStainFilter.size === 0 ? 'No filter — all stains will be loaded' : `Only ${Array.from(pasteStainFilter).join(', ')} slides will be loaded`}
+                </p>
+              </div>
             </div>
             <DialogFooter>
               <Button variant="outline" size="sm" onClick={() => setIsPasteOpen(false)}>Cancel</Button>
               <Button size="sm" onClick={handlePasteImport} disabled={!pasteText.trim() || pasteLoading}>
                 {pasteLoading ? 'Loading...' : 'Load Slides'}
               </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
+        {/* Export to directory dialog */}
+        <Dialog open={isExportOpen} onOpenChange={setIsExportOpen}>
+          <DialogContent className="sm:max-w-lg">
+            <DialogHeader>
+              <DialogTitle>Export to Directory</DialogTitle>
+              <DialogDescription>
+                Create a directory of slide files for Halo. Splits into {exportBinSize}-slide bins.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="space-y-3 py-2">
+              <div className="space-y-1.5">
+                <label className="text-[11px] font-medium text-muted-foreground uppercase tracking-wide">Output directory</label>
+                <Input
+                  value={exportDir}
+                  onChange={(e) => setExportDir(e.target.value)}
+                  placeholder="e.g. /Volumes/halo-share/pulls/2026-06-02-mycase"
+                  className="text-[13px] font-mono"
+                  autoFocus
+                  disabled={exporting}
+                />
+                <p className="text-[11px] text-muted-foreground">Absolute path on the SlideCap host. Will be created if it doesn't exist.</p>
+              </div>
+              <div className="space-y-1.5">
+                <label className="text-[11px] font-medium text-muted-foreground uppercase tracking-wide">Method</label>
+                <Select value={exportMethod} onValueChange={(v) => setExportMethod(v as 'hardlink' | 'copy' | 'symlink')} disabled={exporting}>
+                  <SelectTrigger className="text-[13px]">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="hardlink" className="text-[13px]">Hardlink (recommended)</SelectItem>
+                    <SelectItem value="copy" className="text-[13px]">Copy</SelectItem>
+                    <SelectItem value="symlink" className="text-[13px]">Symlink</SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="text-[11px] text-muted-foreground">
+                  {exportMethod === 'hardlink' && 'Instant. Looks like a real file to Halo. No extra disk space. Requires same volume as the WSI files.'}
+                  {exportMethod === 'copy' && 'Slowest but always works. Duplicates bytes on disk.'}
+                  {exportMethod === 'symlink' && 'Instant, but Halo may not follow symlinks. Use only if you have verified it works.'}
+                  {' '}Falls back to copy if the preferred method fails.
+                </p>
+              </div>
+              <div className="space-y-1.5">
+                <label className="text-[11px] font-medium text-muted-foreground uppercase tracking-wide">Slides per bin</label>
+                <Input
+                  type="number"
+                  min={1}
+                  max={1000}
+                  value={exportBinSize}
+                  onChange={(e) => setExportBinSize(parseInt(e.target.value || '100', 10))}
+                  className="text-[13px] w-24"
+                  disabled={exporting}
+                />
+                <p className="text-[11px] text-muted-foreground">
+                  {selectedSlides > 0
+                    ? `${selectedSlides} selected → ${Math.ceil(selectedSlides / Math.max(1, exportBinSize))} bin${Math.ceil(selectedSlides / Math.max(1, exportBinSize)) === 1 ? '' : 's'}`
+                    : 'Select slides first'}
+                </p>
+              </div>
+
+              {exportError && (
+                <div className="rounded-md border border-red-300 bg-red-50 p-2.5 text-[12px] text-red-700">
+                  {exportError}
+                </div>
+              )}
+
+              {exportReport && (
+                <div className="rounded-md border border-emerald-300 bg-emerald-50 p-3 text-[12px] space-y-2">
+                  <div className="flex items-center gap-2">
+                    <Check className="h-3.5 w-3.5 text-emerald-700" />
+                    <span className="font-medium text-emerald-900">Export complete</span>
+                    <span className="ml-auto rounded bg-emerald-100 text-emerald-800 px-1.5 py-0.5 text-[11px] font-medium">
+                      {exportReport.preferred_method}
+                    </span>
+                  </div>
+                  <div className="font-mono text-[11px] text-emerald-900 break-all">{exportReport.output_dir}</div>
+                  <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-[12px]">
+                    <span className="text-emerald-900/70">Bins created</span><span className="tabular-nums text-right">{exportReport.bin_count}</span>
+                    <span className="text-emerald-900/70">Exported</span><span className="tabular-nums text-right">{exportReport.total_exported}</span>
+                    <span className="text-emerald-900/70">Missing</span><span className="tabular-nums text-right">{exportReport.missing_count}</span>
+                    <span className="text-emerald-900/70">Failed</span><span className="tabular-nums text-right">{exportReport.failure_count}</span>
+                  </div>
+                  {exportReport.bins.length > 0 && (
+                    <div className="border-t border-emerald-200 pt-1.5 space-y-0.5 max-h-32 overflow-y-auto">
+                      {exportReport.bins.map(b => (
+                        <div key={b.bin} className="flex justify-between text-[11px] font-mono">
+                          <span>{b.bin}</span>
+                          <span className="tabular-nums">{b.slides} slides{b.failures ? ` · ${b.failures} failed` : ''}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {exportReport.preferred_method === 'copy' && exportMethod !== 'copy' && (
+                    <p className="text-[11px] text-amber-700 border-t border-emerald-200 pt-1.5">
+                      Preferred method ({exportMethod}) failed on this target — fell back to copy. SlideCap dedup is preserved on the source side only.
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+            <DialogFooter>
+              <Button variant="outline" size="sm" onClick={() => setIsExportOpen(false)}>
+                {exportReport ? 'Close' : 'Cancel'}
+              </Button>
+              {!exportReport && (
+                <Button size="sm" onClick={runExportToDirectory} disabled={selectedSlides === 0 || !exportDir.trim() || exporting}>
+                  {exporting ? 'Exporting...' : `Export ${selectedSlides} slide${selectedSlides === 1 ? '' : 's'}`}
+                </Button>
+              )}
             </DialogFooter>
           </DialogContent>
         </Dialog>
@@ -674,8 +904,8 @@ export function SlidePull() {
                       </div>
                       <div className="w-20 text-center">
                         <span className={`inline-flex rounded px-1.5 py-0.5 text-[11px] font-medium ${
-                          s.stain_type === 'HE' ? 'bg-rose-50 text-rose-700 border border-rose-200' :
-                          s.stain_type?.startsWith('IHC') ? 'bg-blue-50 text-blue-700 border border-blue-200' :
+                          stainBucket(s.stain_type) === 'H&E' ? 'bg-rose-50 text-rose-700 border border-rose-200' :
+                          stainBucket(s.stain_type) === 'IHC' ? 'bg-blue-50 text-blue-700 border border-blue-200' :
                           'bg-gray-50 text-gray-600 border border-gray-200'
                         }`}>{s.stain_type || '—'}</span>
                       </div>
@@ -743,11 +973,21 @@ export function SlidePull() {
             <Button
               size="sm"
               className="w-full h-8 text-[12px]"
+              onClick={openExportDialog}
+              disabled={selectedSlides === 0}
+            >
+              <FolderOutput className="h-3 w-3 mr-1.5" />
+              Export to Directory
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              className="w-full h-8 text-[12px]"
               onClick={downloadFiles}
               disabled={selectedSlides === 0 || downloading}
             >
               <Package className="h-3 w-3 mr-1.5" />
-              {downloading ? 'Preparing ZIP...' : 'Download Files'}
+              {downloading ? 'Preparing ZIP...' : 'Download ZIP'}
             </Button>
             {downloadError && (
               <p className="text-[11px] text-red-600">{downloadError}</p>

@@ -838,122 +838,39 @@ def get_slide(slide_hash: str, db: Session = Depends(get_db)):
 from openslide import open_slide
 from openslide.deepzoom import DeepZoomGenerator
 
-# ── Tile source via `large_image` ────────────────────────────────────────
-#
-# Replaced the openslide.DeepZoomGenerator + PIL re-encode pipeline (pre-
-# large_image snapshot saved at backend/app/main.py.pre-large-image).
-# Why: SVS files store JPEG-compressed tiles in their native pyramid. The
-# old path decoded those JPEGs to RGBA, converted to RGB, re-encoded to
-# JPEG (~20-30ms per tile), and shipped them. large_image's tiff source
-# reads the raw JPEG bytes from the SVS and sends them unchanged — same
-# bytes the scanner produced, no re-encode tax. Empirical (warm openslide
-# vs warm tiff source on a 116k×38k SVS, mid-zoom): ~3 ms/tile → ~0 ms/tile.
-import large_image
+# Cache for DeepZoom generators (handles all tile math correctly)
+_dz_cache: dict[str, DeepZoomGenerator] = {}
 
-# Cache for large_image TileSource handles (keeps the slide open, IFD
-# parsed, page cache warm — same idea as DeepZoomGenerator cache).
-_ts_cache: dict[str, "large_image.tilesource.TileSource"] = {}
-
-# Native SVS tile size. Most scanners write 256×256 tiles; using the same
-# size in the DZI manifest means OSD asks for tiles at exactly the
-# positions where they're already encoded — so tiff-source passthrough hits
-# the fast path on every request.
-TILE_SIZE = 256
-# Overlap=0 because native SVS tiles have no overlap. OSD handles
-# unoverlapped tiles fine; the only cost is no edge-blending at extreme
-# zoom-in, which is invisible on H&E.
-TILE_OVERLAP = 0
+# Tile size = 510 (+ 1px overlap on each side = 512px rendered tiles).
+# Bumped from 254 — at 512 each request covers 4× the area, so an initial
+# "fit to screen" view fans out ~50 requests instead of ~200. Per-tile encode
+# cost is slightly higher but the round-trip count drop is the dominant win
+# (HTTP/decode overhead per tile is ~constant, ~15-30ms each).
+TILE_SIZE = 510
+TILE_OVERLAP = 1
 TILE_FORMAT = "jpeg"
-TILE_JPEG_QUALITY = 80  # only used by the openslide-fallback path
-TILE_CACHE_VERSION = "v3"  # bump to invalidate the on-disk tile cache
-# v3: switched tile pipeline to large_image native passthrough; tile size
-#     changed from 510 (with overlap) to 256 (without). v2 cache is
-#     incompatible — left in place but ignored by the v3 path.
+TILE_JPEG_QUALITY = 80
+TILE_CACHE_VERSION = "v2"  # bump to invalidate the on-disk tile cache
+# v2: invalidated v1 because partial-SVS-copy ghost tiles from the early
+#     anchor-pre-warm runs were poisoning the cache. v2 cache only gets
+#     written once the auto-copy size-validation gate passes.
 
-def _get_ts(slide_hash: str):
-    """
-    Get or create a large_image TileSource for a slide.
-
-    Prefers the ``tiff`` source (true native-JPEG passthrough — bytes go
-    SVS → HTTP unchanged, no decode/encode). Falls back to ``openslide``
-    if tifffile can't open the file (rare formats, non-standard SVS, etc.).
-    Either way it's substantially faster than the openslide.DeepZoomGenerator
-    + PIL re-encode pipeline we used to run.
-    """
-    cached = _ts_cache.get(slide_hash)
-    if cached is not None:
-        return cached
+def _get_dz(slide_hash: str) -> DeepZoomGenerator:
+    """Get or create a DeepZoomGenerator for a slide."""
+    if slide_hash in _dz_cache:
+        return _dz_cache[slide_hash]
 
     filepath = indexer.get_filepath(slide_hash)
     if not filepath or not filepath.exists():
         raise HTTPException(status_code=404, detail="Slide file not found")
 
-    # Crucial: pass `encoding='JPEG'` BUT NOT `jpegQuality`. Setting a
-    # quality forces re-encoding (~30 ms/tile); omitting it lets large_image
-    # ship the SVS's native JPEG bytes unchanged (~0 ms/tile). The
-    # openslide fallback does want jpegQuality since it has to re-encode
-    # from RGBA anyway; we set it post-open so it only applies there.
-    last_err: Exception | None = None
-    for source in ("tiff", "openslide"):
-        try:
-            ts = large_image.open(str(filepath), sourceName=source, encoding="JPEG")
-            if source == "openslide":
-                # Re-encoding fallback path benefits from quality control.
-                ts._jpegQuality = TILE_JPEG_QUALITY
-            _ts_cache[slide_hash] = ts
-            return ts
-        except Exception as e:
-            last_err = e
-            continue
-    raise HTTPException(status_code=500, detail=f"Failed to open slide via large_image: {last_err}")
-
-
-def _dzi_max_level(width: int, height: int) -> int:
-    """DZI max level for an image of WxH px (the highest level = full res)."""
-    import math
-    return max(0, math.ceil(math.log2(max(width, height))))
-
-
-# Per-slide metadata cache. getMetadata() on large_image is cheap (~1 ms)
-# but called once per tile request it adds up. This caches the only fields
-# we need: width, height, level count, native tile size.
-_md_cache: dict[str, tuple[int, int, int, int, int]] = {}
-
-
-def _md_for(slide_hash: str) -> tuple[int, int, int, int, int]:
-    """Returns (width, height, levels, tile_size, max_dzi_level). Cached."""
-    cached = _md_cache.get(slide_hash)
-    if cached is not None:
-        return cached
-    ts = _get_ts(slide_hash)
-    md = ts.getMetadata()
-    w, h, levels = md["sizeX"], md["sizeY"], md["levels"]
-    ts_sz = md.get("tileWidth") or TILE_SIZE
-    out = (w, h, levels, ts_sz, _dzi_max_level(w, h))
-    _md_cache[slide_hash] = out
-    return out
-
-
-def _dzi_to_zxy(slide_hash: str, level: int, col: int, row: int):
-    """
-    Convert a DZI (level, col, row) request into large_image (x, y, z).
-
-    DZI levels run 0..max_level where max_level = ceil(log2(max(W, H))).
-    large_image's z runs 0..levels-1 where 0 is the smallest pyramid level
-    available. The alignment between the two depends on how many levels
-    large_image found in the SVS.
-
-    Returns (z, x, y) suitable for ``ts.getTile``. If the DZI level is
-    below large_image's smallest level (extreme zoom-out), clamps z to 0
-    and returns col=0,row=0 — OSD's home view rarely lands there.
-    """
-    _, _, levels, _, max_dzi = _md_for(slide_hash)
-    z = level - (max_dzi - (levels - 1))
-    if z < 0:
-        return 0, 0, 0
-    if z >= levels:
-        raise HTTPException(status_code=404, detail=f"Invalid DZI level {level} (max for this slide is {max_dzi})")
-    return z, col, row
+    try:
+        slide = open_slide(str(filepath))
+        dz = DeepZoomGenerator(slide, tile_size=TILE_SIZE, overlap=TILE_OVERLAP)
+        _dz_cache[slide_hash] = dz
+        return dz
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to open slide: {e}")
 
 
 def _get_and_cache_embedded_thumbnail(slide_hash: str, filepath: Path) -> bytes:
@@ -1140,7 +1057,9 @@ def get_slide_dzi(slide_hash: str):
     "second open is instant" trick: after first open kicks off the warm,
     every future pan/zoom + future reopen comes from disk cache.
     """
-    width, height, _, tile_size, _ = _md_for(slide_hash)
+    dz = _get_dz(slide_hash)
+
+    width, height = dz.level_dimensions[-1]  # Highest resolution level
 
     _schedule_warm_on_first_open(slide_hash)
 
@@ -1149,7 +1068,7 @@ def get_slide_dzi(slide_hash: str):
             "xmlns": "http://schemas.microsoft.com/deepzoom/2008",
             "Format": TILE_FORMAT,
             "Overlap": str(TILE_OVERLAP),
-            "TileSize": str(tile_size),
+            "TileSize": str(TILE_SIZE),
             "Size": {
                 "Width": str(width),
                 "Height": str(height)
@@ -1168,33 +1087,25 @@ def _tile_cache_path(slide_hash: str, level: int, col: int, row: int) -> Path:
     return settings.local_data_path / "tile-cache" / slide_hash / bucket / str(level) / f"{col}_{row}.{TILE_FORMAT}"
 
 
-def _generate_tile_bytes(slide_hash: str, level: int, col: int, row: int) -> bytes:
-    """
-    Fetch a single tile as JPEG bytes via large_image (no cache I/O).
-
-    On the tiff source this is a native passthrough — the JPEG bytes stored
-    in the SVS are returned unchanged. On the openslide fallback it's still
-    way cheaper than the old PIL re-encode because large_image avoids the
-    RGBA→RGB→JPEG round-trip.
-    """
-    ts = _get_ts(slide_hash)
-    z, x, y = _dzi_to_zxy(slide_hash, level, col, row)
-    return ts.getTile(x, y, z)
+def _generate_tile_bytes(dz: DeepZoomGenerator, level: int, col: int, row: int) -> bytes:
+    """Read + encode a single tile to JPEG bytes (no cache I/O)."""
+    tile = dz.get_tile(level, (col, row)).convert('RGB')
+    buf = BytesIO()
+    tile.save(buf, format='JPEG', quality=TILE_JPEG_QUALITY)
+    return buf.getvalue()
 
 
 @app.get("/slides/{slide_hash}/tiles/{level}/{col}_{row}.jpeg")
 def get_slide_tile(slide_hash: str, level: int, col: int, row: int):
     """
-    Serve a single DZI tile.
-
-    Two fast paths:
-      1. Disk cache hit — static file serve, ~1 ms.
-      2. large_image native passthrough — SVS stores JPEG tiles in its
-         pyramid; we read the bytes and ship them unchanged, ~3-15 ms vs
-         the 30-80 ms of the old openslide+PIL re-encode pipeline.
-
-    Cold cache miss writes the bytes to disk for the next request.
+    Get a single tile from the slide at the specified level and position.
+    Uses OpenSlide's DeepZoomGenerator for correct tile calculation, with an
+    on-disk JPEG cache so re-opens of the same slide skip the openslide read
+    + PIL encode entirely.
     """
+    # Fast path: serve from disk cache if we've encoded this tile before.
+    # Roughly a 20-50x speedup vs cold path (1-2ms disk read + send vs
+    # 30-100ms openslide read + RGB convert + JPEG encode).
     cache_path = _tile_cache_path(slide_hash, level, col, row)
     if cache_path.exists():
         return FileResponse(
@@ -1203,55 +1114,67 @@ def get_slide_tile(slide_hash: str, level: int, col: int, row: int):
             headers={"Cache-Control": "public, max-age=86400"},
         )
 
+    dz = _get_dz(slide_hash)
+
+    # Validate level
+    if level < 0 or level >= dz.level_count:
+        raise HTTPException(status_code=404, detail=f"Invalid level: {level}")
+
+    # Validate tile coordinates
+    tiles_x, tiles_y = dz.level_tiles[level]
+    if col < 0 or col >= tiles_x or row < 0 or row >= tiles_y:
+        raise HTTPException(status_code=404, detail="Tile out of bounds")
+
     try:
-        image_bytes = _generate_tile_bytes(slide_hash, level, col, row)
-    except HTTPException:
-        raise
+        # Generate the tile, then persist to the on-disk cache so the next
+        # request goes through the fast path above. write_bytes is atomic
+        # enough for our purposes (cross-process: last writer wins on
+        # identical bytes — no-op).
+        image_bytes = _generate_tile_bytes(dz, level, col, row)
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_bytes(image_bytes)
+        except Exception as cache_err:
+            # Cache write failure is non-fatal — log and serve uncached.
+            print(f"[tile-cache] write failed for {slide_hash[:12]} L{level} {col},{row}: {cache_err}")
+        return Response(
+            content=image_bytes,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to read tile: {e}")
-
-    try:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_bytes(image_bytes)
-    except Exception as cache_err:
-        print(f"[tile-cache] write failed for {slide_hash[:12]} L{level} {col},{row}: {cache_err}")
-
-    return Response(
-        content=image_bytes,
-        media_type="image/jpeg",
-        headers={"Cache-Control": "public, max-age=86400"},
-    )
 
 
 def prewarm_slide_tiles(slide_hash: str, max_tiles: int = 300) -> int:
     """
-    Pre-generate + disk-cache the lowest-resolution tiles so the initial
-    "fit to screen" view in OSD pops up instantly. Walks DZI levels
+    Pre-generate + disk-cache the lowest-resolution DeepZoom levels so the
+    initial "fit to screen" view in OSD pops up instantly. Walks levels
     bottom-up (smallest image first) until we hit `max_tiles`, then stops —
     this caps disk usage and prewarm time regardless of slide size.
+
+    Rationale: OSD's first paint at default zoom needs maybe 20-50 tiles
+    from the mid-low levels (e.g. levels 8-12). Pre-cached, those are sub-ms
+    file reads. Levels above that are needed only after zoom-in, which the
+    user does interactively — pre-warming them would waste minutes of CPU
+    for marginal benefit.
 
     Returns the number of tiles generated. Safe to no-op if the slide file
     is missing.
     """
     try:
-        _get_ts(slide_hash)
+        dz = _get_dz(slide_hash)
     except HTTPException:
         print(f"[tile-prewarm] slide {slide_hash[:12]}: file missing — skipping")
         return 0
 
-    width, height, _, tile_size, max_dzi = _md_for(slide_hash)
-
     generated = 0
-    # Iterate low-res → high-res by DZI level. Same level math the tile
-    # endpoint uses, so cached entries are the ones OSD will actually fetch.
-    import math
-    for level in range(max_dzi + 1):
-        # Image dims at this DZI level
-        scale = 2 ** (max_dzi - level)
-        w_l = max(1, math.ceil(width / scale))
-        h_l = max(1, math.ceil(height / scale))
-        cols = max(1, math.ceil(w_l / tile_size))
-        rows = max(1, math.ceil(h_l / tile_size))
+    # Iterate low-resolution → high-resolution. Levels are indexed 0..N-1
+    # where 0 is the smallest single-pixel-ish image. Stop once we've
+    # cached enough tiles to cover an initial viewport (default budget
+    # covers the bottom ~10 levels of a typical 100k WSI).
+    for level in range(dz.level_count):
+        cols, rows = dz.level_tiles[level]
         for row in range(rows):
             for col in range(cols):
                 if generated >= max_tiles:
@@ -1260,7 +1183,7 @@ def prewarm_slide_tiles(slide_hash: str, max_tiles: int = 300) -> int:
                 if cache_path.exists():
                     continue
                 try:
-                    data = _generate_tile_bytes(slide_hash, level, col, row)
+                    data = _generate_tile_bytes(dz, level, col, row)
                     cache_path.parent.mkdir(parents=True, exist_ok=True)
                     cache_path.write_bytes(data)
                     generated += 1
@@ -2239,231 +2162,6 @@ def export_cohort(cohort_id: int, db: Session = Depends(get_db)):
 
 class SlidePullRequest(BaseModel):
     slide_hashes: List[str]
-
-
-class SlidePullExportRequest(BaseModel):
-    slide_hashes: List[str]
-    output_dir: str
-    bin_size: int = 100
-    bin_prefix: str = "pull"
-    # 'hardlink' (default, looks like a real file, fastest, same-volume only)
-    # 'copy' (slowest but always works)
-    # 'symlink' (instant but downstream tools like Halo may not follow)
-    # 'auto' (legacy: symlink → hardlink → copy probe)
-    method: str = "hardlink"
-
-
-def _resolve_link_method(output_dir: Path, sample_src: Path, requested: str) -> str:
-    """Pick the link method to use as the *preferred* method for this export.
-
-    - 'hardlink' / 'symlink' / 'copy' — honor user request directly (the per-file
-      _link_or_copy fallback chain still degrades gracefully if it fails partway).
-    - 'auto' — legacy probe: try symlink, then hardlink, then copy.
-    """
-    if requested in ("hardlink", "symlink", "copy"):
-        return requested
-
-    probe_dir = output_dir / ".slidecap-probe"
-    try:
-        probe_dir.mkdir(exist_ok=True)
-    except OSError:
-        return "copy"
-    try:
-        sym_probe = probe_dir / f"sym-{os.getpid()}"
-        try:
-            if sym_probe.is_symlink() or sym_probe.exists():
-                sym_probe.unlink()
-            os.symlink(str(sample_src), str(sym_probe))
-            try:
-                sym_probe.unlink()
-            except OSError:
-                pass
-            return "symlink"
-        except (OSError, NotImplementedError):
-            pass
-
-        link_probe = probe_dir / f"hl-{os.getpid()}"
-        try:
-            if link_probe.exists():
-                link_probe.unlink()
-            os.link(str(sample_src), str(link_probe))
-            try:
-                link_probe.unlink()
-            except OSError:
-                pass
-            return "hardlink"
-        except (OSError, NotImplementedError):
-            pass
-
-        return "copy"
-    finally:
-        try:
-            shutil.rmtree(probe_dir, ignore_errors=True)
-        except Exception:
-            pass
-
-
-def _link_or_copy(src: Path, dst: Path, preferred: str) -> str:
-    """Materialize src at dst using preferred method, falling back to weaker methods. Returns method actually used."""
-    if dst.is_symlink() or dst.exists():
-        dst.unlink()
-
-    if preferred == "symlink":
-        chain = ["symlink", "hardlink", "copy"]
-    elif preferred == "hardlink":
-        chain = ["hardlink", "copy"]
-    else:
-        chain = ["copy"]
-
-    last_err: Optional[Exception] = None
-    for method in chain:
-        try:
-            if method == "symlink":
-                os.symlink(str(src), str(dst))
-            elif method == "hardlink":
-                os.link(str(src), str(dst))
-            else:
-                shutil.copy2(str(src), str(dst))
-            return method
-        except (OSError, NotImplementedError) as e:
-            last_err = e
-            continue
-    raise RuntimeError(f"All link methods failed for {src.name}: {last_err}")
-
-
-@app.post("/slides/pull-export")
-def pull_export(data: SlidePullExportRequest):
-    """Materialize selected slides under output_dir as pull-NNN/ subdirs, capped at bin_size slides each.
-    Uses symlinks where supported, falls back to hardlinks, then copies. Writes a manifest per bin
-    and a top-level pull-summary.csv recording method, missing slides, and any failures."""
-    if not indexer:
-        raise HTTPException(status_code=503, detail="Indexer not initialized")
-    if not data.slide_hashes:
-        raise HTTPException(status_code=400, detail="No slides requested")
-
-    bin_size = max(1, data.bin_size)
-    bin_prefix = re.sub(r"[^\w\-]", "", data.bin_prefix or "pull") or "pull"
-
-    try:
-        output_root = Path(data.output_dir).expanduser().resolve()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid output_dir: {e}")
-
-    try:
-        output_root.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        raise HTTPException(status_code=400, detail=f"Cannot create output_dir: {e}")
-    if not output_root.is_dir():
-        raise HTTPException(status_code=400, detail=f"output_dir is not a directory: {output_root}")
-
-    # Resolve slide hashes to filepaths
-    resolved: list[dict] = []
-    missing_hashes: list[str] = []
-    for slide_hash in data.slide_hashes:
-        filepath = indexer.get_filepath(slide_hash)
-        if not filepath or not filepath.exists():
-            missing_hashes.append(slide_hash)
-            continue
-        parsed = indexer.parser.parse(filepath.name)
-        accession = parsed.accession if parsed else slide_hash[:12]
-        resolved.append({
-            "slide_hash": slide_hash,
-            "src_path": filepath,
-            "accession": accession,
-            "filename": filepath.name,
-        })
-
-    if not resolved:
-        raise HTTPException(status_code=404, detail="No slide files available on disk for the given hashes")
-
-    method_request = (data.method or "hardlink").lower()
-    if method_request not in ("auto", "hardlink", "symlink", "copy"):
-        raise HTTPException(status_code=400, detail=f"Invalid method: {data.method}")
-    preferred_method = _resolve_link_method(output_root, resolved[0]["src_path"], method_request)
-
-    failures: list[dict] = []
-    bin_reports: list[dict] = []
-
-    for bin_idx in range(0, len(resolved), bin_size):
-        chunk = resolved[bin_idx:bin_idx + bin_size]
-        bin_num = (bin_idx // bin_size) + 1
-        bin_dir = output_root / f"{bin_prefix}-{bin_num:03d}"
-        bin_dir.mkdir(parents=True, exist_ok=True)
-
-        manifest_rows: list[dict] = []
-        bin_failures = 0
-        for s in chunk:
-            dst = bin_dir / s["filename"]
-            try:
-                used = _link_or_copy(s["src_path"], dst, preferred_method)
-                manifest_rows.append({
-                    "slide_hash": s["slide_hash"],
-                    "accession": s["accession"],
-                    "filename": s["filename"],
-                    "src_path": str(s["src_path"]),
-                    "method": used,
-                })
-            except Exception as e:
-                bin_failures += 1
-                failures.append({
-                    "slide_hash": s["slide_hash"],
-                    "filename": s["filename"],
-                    "bin": bin_dir.name,
-                    "error": str(e),
-                })
-
-        with open(bin_dir / "manifest.csv", "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["slide_hash", "accession", "filename", "src_path", "method"])
-            writer.writeheader()
-            writer.writerows(manifest_rows)
-
-        bin_reports.append({
-            "bin": bin_dir.name,
-            "path": str(bin_dir),
-            "slides": len(manifest_rows),
-            "failures": bin_failures,
-        })
-
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    total_exported = sum(b["slides"] for b in bin_reports)
-    with open(output_root / "pull-summary.csv", "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["exported_at", timestamp])
-        w.writerow(["preferred_method", preferred_method])
-        w.writerow(["bin_size", bin_size])
-        w.writerow(["total_requested", len(data.slide_hashes)])
-        w.writerow(["total_exported", total_exported])
-        w.writerow(["missing_count", len(missing_hashes)])
-        w.writerow(["failure_count", len(failures)])
-        w.writerow([])
-        w.writerow(["bin", "path", "slides", "failures"])
-        for b in bin_reports:
-            w.writerow([b["bin"], b["path"], b["slides"], b["failures"]])
-        if missing_hashes:
-            w.writerow([])
-            w.writerow(["missing_slide_hashes"])
-            for h in missing_hashes:
-                w.writerow([h])
-        if failures:
-            w.writerow([])
-            w.writerow(["failure_slide_hash", "filename", "bin", "error"])
-            for fl in failures:
-                w.writerow([fl["slide_hash"], fl["filename"], fl["bin"], fl["error"]])
-
-    return {
-        "output_dir": str(output_root),
-        "preferred_method": preferred_method,
-        "bin_size": bin_size,
-        "bin_count": len(bin_reports),
-        "total_requested": len(data.slide_hashes),
-        "total_exported": total_exported,
-        "missing_count": len(missing_hashes),
-        "failure_count": len(failures),
-        "bins": bin_reports,
-        "failures": failures[:25],
-        "missing_hashes": missing_hashes[:25],
-        "summary_path": str(output_root / "pull-summary.csv"),
-    }
 
 
 @app.post("/slides/pull-download")

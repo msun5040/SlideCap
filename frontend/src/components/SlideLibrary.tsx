@@ -1,7 +1,9 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { Search, Filter, Tag as TagIcon, Eye, Tags, X, Plus, Settings, Trash2, ChevronDown, FileDown, Upload, Pencil, Check, FileText, Download, Loader2 } from 'lucide-react'
+import { Search, Filter, Tag as TagIcon, Eye, Tags, X, Plus, Settings, Trash2, ChevronDown, FileDown, Upload, Pencil, Check, FileText, Download, Loader2, Layers, ScatterChart } from 'lucide-react'
+import { ScatterViewerOverlay } from '@/components/ScatterViewerOverlay'
+import type { AnalysisKind } from '@/types/slide'
 import { Button } from '@/components/ui/button'
-import { SlideViewer } from '@/components/SlideViewer'
+import { SlideViewerOSD } from '@/components/SlideViewerOSD'
 import { TagInput } from '@/components/TagInput'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
@@ -106,13 +108,27 @@ export function SlideLibrary() {
   })
 
   // Slide results (cell stats) state for detail dialog
-  const [slideResults, setSlideResults] = useState<{ job_id: number; analysis_name: string; version: string; status: string; cell_stats?: Record<string, number> | null }[]>([])
+  const [slideResults, setSlideResults] = useState<{ job_id: number; analysis_name: string; version: string; status: string; analysis_kind?: string | null; cell_stats?: Record<string, number> | null }[]>([])
+  // Kind registry — loaded once, used to surface renderer buttons (UMAP/PCA/…)
+  // next to a completed-analysis row when the analysis's kind plugin declares any.
+  const [kinds, setKinds] = useState<AnalysisKind[]>([])
+  // Active renderer scatter view (e.g. UNI's UMAP). Mounts ScatterViewerOverlay.
+  const [scatterViewer, setScatterViewer] = useState<{
+    jobId: number; slideHash: string; slideName: string; rendererId: string; rendererName: string
+  } | null>(null)
   const [loadingResults, setLoadingResults] = useState(false)
   // Per-job output files & download state inside the Completed Analyses block
   type OutputGroup = { slide_hash: string; label: string; files: string[]; annotation_count: number; is_local: boolean }
   const [analysisOutputs, setAnalysisOutputs] = useState<Record<number, OutputGroup[] | undefined>>({})
   const [loadingOutputJob, setLoadingOutputJob] = useState<number | null>(null)
   const [downloadingJob, setDownloadingJob] = useState<number | null>(null)
+
+  // Overlay viewer state — opens OSD viewer with a chosen analysis output as overlay
+  const [overlayViewer, setOverlayViewer] = useState<{
+    slideHash: string
+    slideName: string
+    overlays: { id: string; name: string; type: 'geojson'; url: string }[]
+  } | null>(null)
 
   // Annotation state for detail dialog
   const [annotations, setAnnotations] = useState<{ name: string; size: number }[]>([])
@@ -219,6 +235,15 @@ export function SlideLibrary() {
   // Fetch available tags on mount
   useEffect(() => {
     fetchAvailableTags()
+  }, [])
+
+  // Fetch analysis-kind plugins once — used to decide which renderer buttons
+  // (UMAP / PCA / …) to surface next to a slide's completed-analysis row.
+  useEffect(() => {
+    fetch(`${getApiBase()}/analyses/kinds`)
+      .then(r => r.ok ? r.json() : [])
+      .then((data: AnalysisKind[]) => setKinds(Array.isArray(data) ? data : []))
+      .catch(() => setKinds([]))
   }, [])
 
   const handleSearch = async () => {
@@ -427,6 +452,25 @@ export function SlideLibrary() {
       }
     } catch (e) { console.error('Failed to load output files:', e) }
     finally { setLoadingOutputJob(null) }
+  }, [])
+
+  const isOverlayFile = (name: string) => {
+    const lower = name.toLowerCase()
+    return lower.endsWith('.geojson')
+      || lower.endsWith('.geojson.snappy')
+      || lower.endsWith('.json.gz')
+      || lower.endsWith('.geojson.gz')
+  }
+
+  const openOverlayFile = useCallback((jobId: number, slideHash: string, slideName: string, filePath: string) => {
+    const encoded = filePath.split('/').map(encodeURIComponent).join('/')
+    const url = `${getApiBase()}/results/${jobId}/file/${encoded}?slide_hash=${encodeURIComponent(slideHash)}&apply_transforms=true`
+    const fileName = filePath.split('/').pop() || filePath
+    setOverlayViewer({
+      slideHash,
+      slideName,
+      overlays: [{ id: `${jobId}-${slideHash}-${filePath}`, name: fileName, type: 'geojson', url }],
+    })
   }, [])
 
   const downloadAnalysisZip = useCallback(async (jobId: number) => {
@@ -1253,6 +1297,31 @@ export function SlideLibrary() {
                               </Badge>
                               <span className="text-xs text-muted-foreground">Job #{r.job_id}</span>
                               <div className="ml-auto flex items-center gap-1">
+                                {/* Renderer buttons (UMAP / PCA / …) for kinds
+                                    that declare them. Opens ScatterViewerOverlay
+                                    pinned to this slide + job. */}
+                                {(() => {
+                                  const kind = kinds.find(k => k.id === r.analysis_kind)
+                                  return (kind?.renderers || []).map(rd => (
+                                    <Button
+                                      key={rd.id}
+                                      variant="outline"
+                                      size="sm"
+                                      className="h-7 text-xs"
+                                      title={rd.description}
+                                      onClick={() => selectedSlide && setScatterViewer({
+                                        jobId: r.job_id,
+                                        slideHash: selectedSlide.slide_hash,
+                                        slideName: `${displaySlide(selectedSlide)} - ${selectedSlide.block_id}-${selectedSlide.slide_number}`,
+                                        rendererId: rd.id,
+                                        rendererName: rd.name,
+                                      })}
+                                    >
+                                      <ScatterChart className="h-3 w-3 mr-1" />
+                                      {rd.name}
+                                    </Button>
+                                  ))
+                                })()}
                                 <Button
                                   variant="outline"
                                   size="sm"
@@ -1304,12 +1373,29 @@ export function SlideLibrary() {
                                 <p className="text-xs text-muted-foreground">No output files found.</p>
                               ) : (
                                 <ul className="space-y-0.5 pl-1 pt-1 border-t">
-                                  {files.flatMap((g) => g.files).map((f) => (
-                                    <li key={f} className="flex items-center gap-2 text-[11px] font-mono text-muted-foreground">
-                                      <FileText className="h-3 w-3 shrink-0" />
-                                      {f}
-                                    </li>
-                                  ))}
+                                  {files.flatMap((g) => g.files).map((f) => {
+                                    const overlayable = isOverlayFile(f)
+                                    return (
+                                      <li key={f} className="flex items-center gap-2 text-[11px] font-mono text-muted-foreground">
+                                        <FileText className="h-3 w-3 shrink-0" />
+                                        <span className="truncate flex-1" title={f}>{f}</span>
+                                        {overlayable && selectedSlide && (
+                                          <button
+                                            className="shrink-0 inline-flex items-center gap-1 text-[10px] text-primary hover:underline"
+                                            onClick={() => openOverlayFile(
+                                              r.job_id,
+                                              selectedSlide.slide_hash,
+                                              `${displaySlide(selectedSlide)} - ${selectedSlide.block_id}-${selectedSlide.slide_number}`,
+                                              f,
+                                            )}
+                                            title="Overlay on slide"
+                                          >
+                                            <Layers className="h-3 w-3" />Overlay
+                                          </button>
+                                        )}
+                                      </li>
+                                    )
+                                  })}
                                 </ul>
                               )
                             )}
@@ -1753,10 +1839,35 @@ export function SlideLibrary() {
 
       {/* Slide Viewer Overlay */}
       {isViewerOpen && selectedSlide && (
-        <SlideViewer
+        <SlideViewerOSD
           slideHash={selectedSlide.slide_hash}
           slideName={`${displaySlide(selectedSlide)} - ${selectedSlide.block_id}-${selectedSlide.slide_number} (${selectedSlide.stain_type})`}
           onClose={() => setIsViewerOpen(false)}
+        />
+      )}
+
+      {/* Overlay viewer — opened from an analysis output file in the Completed Analyses block */}
+      {overlayViewer && (
+        <SlideViewerOSD
+          slideHash={overlayViewer.slideHash}
+          slideName={overlayViewer.slideName}
+          overlays={overlayViewer.overlays}
+          onClose={() => setOverlayViewer(null)}
+        />
+      )}
+
+      {/* Renderer scatter view (UMAP / PCA) — opened from a kind-renderer
+          button in the Completed Analyses block. Same component the Analysis
+          Results view uses; bidirectional slide↔scatter highlighting comes
+          for free. */}
+      {scatterViewer && (
+        <ScatterViewerOverlay
+          jobId={scatterViewer.jobId}
+          slideHash={scatterViewer.slideHash}
+          slideName={scatterViewer.slideName}
+          rendererId={scatterViewer.rendererId}
+          rendererName={scatterViewer.rendererName}
+          onClose={() => setScatterViewer(null)}
         />
       )}
 

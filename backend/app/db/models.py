@@ -434,6 +434,17 @@ class Analysis(Base):
     command_template = Column(Text)          # Full command with {placeholders}
     postprocess_template = Column(Text)      # Post-processing command with {input_dir} {output_dir} {filename_stem}
 
+    # Plugin id of the analysis kind (see backend/app/analyses/). Determines which
+    # ops are available, and supplies the default ruleset when `transforms` is empty.
+    kind = Column(String(50), nullable=False, default='cellvit', server_default='cellvit')
+
+    # Optional admin-level override of the kind's default ruleset.
+    # JSON list of {match: glob, ops: [op_name, ...]}. When a result file is
+    # requested with apply_transforms=true, the first matching rule drives the
+    # bytes through the named ops in order. If unset, the kind's default_rules
+    # apply. See backend/app/analyses/.
+    transforms = Column(Text)                # JSON string
+
     # Parameter schema (JSON Schema string) and defaults (JSON string)
     parameters_schema = Column(Text)  # JSON Schema defining accepted parameters
     default_parameters = Column(Text)  # JSON string of default parameter values
@@ -1021,6 +1032,33 @@ def _migrate_slidecap_ids(engine):
         conn.commit()
 
 
+def _migrate_analyses(engine):
+    """Add new columns to analyses if missing."""
+    from sqlalchemy import text
+    try:
+        insp = inspect(engine)
+        if not insp.has_table('analyses'):
+            return
+        existing = {col['name'] for col in insp.get_columns('analyses')}
+        with engine.connect() as conn:
+            if 'transforms' not in existing:
+                print("[DB Migration] Adding column: analyses.transforms")
+                conn.execute(text("ALTER TABLE analyses ADD COLUMN transforms TEXT"))
+            if 'kind' not in existing:
+                # SQLite can't add a NOT NULL column without a default, so we
+                # set 'cellvit' as the server-side default. Existing rows are
+                # backfilled to the same value, which matches today's behavior
+                # (the only registered analysis was CellViT).
+                print("[DB Migration] Adding column: analyses.kind")
+                conn.execute(text(
+                    "ALTER TABLE analyses ADD COLUMN kind VARCHAR(50) NOT NULL DEFAULT 'cellvit'"
+                ))
+                conn.execute(text("UPDATE analyses SET kind = 'cellvit' WHERE kind IS NULL OR kind = ''"))
+            conn.commit()
+    except Exception as e:
+        print(f"[DB Migration] Skipping analyses migration: {e}")
+
+
 def _migrate_request_sheets(engine):
     """Add new columns to request_sheets and backfill auto_tags join table."""
     from sqlalchemy import text
@@ -1071,6 +1109,7 @@ def init_db(db_path: Path):
     Base.metadata.create_all(_engine)  # Creates new tables (patients, id_counters, external_mappings)
     _migrate_slidecap_ids(_engine)     # Adds columns to existing tables + backfills IDs
     _migrate_request_sheets(_engine)   # Adds auto_tag_id to request_sheets
+    _migrate_analyses(_engine)         # Adds transforms column to analyses
     _SessionLocal = sessionmaker(bind=_engine)
 
 

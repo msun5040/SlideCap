@@ -15,6 +15,8 @@ import {
   Hash,
   Folder,
   Archive,
+  Layers,
+  Info,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -30,7 +32,10 @@ import {
 } from '@/components/ui/dialog'
 import { DownloadModal } from '@/components/DownloadModal'
 import { CopyableText } from '@/components/CopyableText'
-import type { Analysis } from '@/types/slide'
+import { SlideViewerOSD } from '@/components/SlideViewerOSD'
+import { ScatterViewerOverlay } from '@/components/ScatterViewerOverlay'
+import { useSlideDetails } from '@/components/SlideDetailsContext'
+import type { Analysis, AnalysisKind } from '@/types/slide'
 import { signalClusterDisconnected } from '@/components/ClusterConnect'
 
 import { getApiBase } from '@/api'
@@ -41,6 +46,7 @@ import { displaySlide } from '@/lib/display'
 interface JobSummary {
   id: number
   analysis_id: number
+  analysis_kind: string | null  // plugin id from /analyses/kinds; drives which renderer buttons appear
   model_name: string
   model_version: string | null
   parameters: string | null
@@ -148,6 +154,10 @@ function CellStats({ stats }: { stats: Record<string, number> }) {
 // ---------- Component ----------
 
 export function AnalysisResults() {
+  // Imperative trigger for the global slide-details dialog — used by per-slide
+  // rows below so users can quick-look any slide from the analysis results view.
+  const { openSlideDetails } = useSlideDetails()
+
   // View mode: 'jobs' (default) or 'search'
   const [view, setView] = useState<'jobs' | 'search'>('jobs')
 
@@ -198,6 +208,38 @@ export function AnalysisResults() {
 
   // Preview
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
+
+  // OSD slide viewer with overlay
+  const [overlayViewer, setOverlayViewer] = useState<{
+    slideHash: string
+    slideName: string
+    overlays: { id: string; name: string; type: 'geojson'; url: string }[]
+  } | null>(null)
+
+  // Kind registry — used to know which slides offer renderer buttons (UMAP / PCA / …).
+  // Loaded once on mount; small and stable.
+  const [kinds, setKinds] = useState<AnalysisKind[]>([])
+  useEffect(() => {
+    fetch(`${getApiBase()}/analyses/kinds`)
+      .then(r => r.ok ? r.json() : [])
+      .then(setKinds)
+      .catch(() => setKinds([]))
+  }, [])
+
+  // Per-slide renderer view (e.g. UMAP scatter for UNI). The actual split
+  // viewer + projection fetch lives in <ScatterViewerOverlay/>; we just track
+  // which renderer is currently open.
+  const [scatterViewer, setScatterViewer] = useState<{
+    jobId: number
+    slideHash: string
+    slideName: string
+    rendererId: string
+    rendererName: string
+  } | null>(null)
+
+  const openRenderer = (jobId: number, slideHash: string, slideName: string, rendererId: string, rendererName: string) => {
+    setScatterViewer({ jobId, slideHash, slideName, rendererId, rendererName })
+  }
 
   // Delete confirmation
   const [deleteConfirm, setDeleteConfirm] = useState<{
@@ -653,10 +695,29 @@ export function AnalysisResults() {
 
   // ---------- Render file tree (recursive) ----------
 
+  const isOverlayFile = (name: string) => {
+    const lower = name.toLowerCase()
+    return lower.endsWith('.geojson')
+      || lower.endsWith('.geojson.snappy')
+      || lower.endsWith('.json.gz')
+      || lower.endsWith('.geojson.gz')
+  }
+
+  const openOverlayOn = (jobId: number, slideHash: string, slideName: string, filePath: string) => {
+    const url = `${getApiBase()}/results/${jobId}/file/${encodeFilePath(filePath)}?slide_hash=${encodeURIComponent(slideHash)}&apply_transforms=true`
+    const fileName = filePath.split('/').pop() || filePath
+    setOverlayViewer({
+      slideHash,
+      slideName,
+      overlays: [{ id: `${jobId}-${slideHash}-${filePath}`, name: fileName, type: 'geojson', url }],
+    })
+  }
+
   const renderFileTree = (
     nodes: FileTreeNode[],
     jobId: number,
     slideHash: string,
+    slideName: string = '',
     depth: number = 0,
   ): React.ReactNode => {
     const basePl = 48  // pl-12 equivalent in px
@@ -692,7 +753,7 @@ export function AnalysisResults() {
               </button>
             </div>
             {isOpen && node.children && node.children.length > 0 &&
-              renderFileTree(node.children, jobId, slideHash, depth + 1)
+              renderFileTree(node.children, jobId, slideHash, slideName, depth + 1)
             }
           </div>
         )
@@ -730,6 +791,18 @@ export function AnalysisResults() {
                 onClick={() => previewFile(jobId, slideHash, node.path)}
               >
                 Preview
+              </Button>
+            )}
+            {isOverlayFile(node.name) && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 text-xs"
+                title="View overlaid on H&E"
+                onClick={() => openOverlayOn(jobId, slideHash, slideName || slideHash.slice(0, 12), node.path)}
+              >
+                <Layers className="h-3.5 w-3.5 mr-1" />
+                Overlay
               </Button>
             )}
             <Button
@@ -928,6 +1001,27 @@ export function AnalysisResults() {
                                 : displaySlide(js)}
                               copyValue={showHashes ? js.slide_hash! : displaySlide(js)}
                             />
+                            {/* Quick-look button — opens the global slide details
+                                dialog by hash. Stops propagation so the row's
+                                expand-on-click stays intact. */}
+                            <button
+                              className="shrink-0 p-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                openSlideDetails({
+                                  slide_hash: js.slide_hash!,
+                                  accession_number: js.accession_number || '',
+                                  block_id: js.block_id || '',
+                                  slide_number: '',
+                                  stain_type: js.stain_type || '',
+                                  slide_id: js.slide_id || undefined,
+                                  case_id: js.case_id || undefined,
+                                })
+                              }}
+                              title="Slide details"
+                            >
+                              <Info className="h-3.5 w-3.5" />
+                            </button>
                             {statusBadge(js.status)}
                             {js.status === 'completed' && (
                               js.local_output_path
@@ -941,6 +1035,36 @@ export function AnalysisResults() {
                                 {js.error_message}
                               </span>
                             )}
+                            {/* Renderer buttons (UMAP / PCA / …) — only when the
+                                analysis's kind plugin declares any AND this slide
+                                has output to render. Reads kind off the job summary
+                                so it works without the slide row being expanded.
+                                Click stops propagation so the row doesn't toggle. */}
+                            {js.status === 'completed' && js.local_output_path && (() => {
+                              const kind = kinds.find(k => k.id === job.analysis_kind)
+                              const renderers = kind?.renderers || []
+                              if (renderers.length === 0) return null
+                              const name = displaySlide(js) || js.slide_hash!.slice(0, 12)
+                              return (
+                                <div className="ml-auto flex items-center gap-1">
+                                  {renderers.map(r => (
+                                    <Button
+                                      key={r.id}
+                                      size="sm"
+                                      variant="outline"
+                                      className="h-6 px-2 text-[11px]"
+                                      onClick={(e) => {
+                                        e.stopPropagation()
+                                        openRenderer(job.id, js.slide_hash!, name, r.id, r.name)
+                                      }}
+                                      title={r.description}
+                                    >
+                                      {r.name}
+                                    </Button>
+                                  ))}
+                                </div>
+                              )
+                            })()}
                           </div>
 
                           {/* Cell stats (shown even when not expanded) */}
@@ -960,7 +1084,14 @@ export function AnalysisResults() {
                                   No output files found locally. Use "Transfer All" above.
                                 </p>
                               ) : (
-                                renderFileTree(files, job.id, js.slide_hash!)
+                                renderFileTree(
+                                  files,
+                                  job.id,
+                                  js.slide_hash!,
+                                  js.accession_number
+                                    ? `${js.accession_number}${js.block_id ? ` ${js.block_id}` : ''}${js.stain_type ? ` ${js.stain_type}` : ''}`
+                                    : js.filename || js.slide_hash!,
+                                )
                               )}
                             </div>
                           )}
@@ -1067,7 +1198,12 @@ export function AnalysisResults() {
                               No output files found locally.
                             </p>
                           ) : (
-                            renderFileTree(files, r.job_id, slide.slide_hash)
+                            renderFileTree(
+                              files,
+                              r.job_id,
+                              slide.slide_hash,
+                              `${slide.accession_number || slide.slide_hash.slice(0, 12)}${slide.block_id ? ` ${slide.block_id}` : ''}${slide.stain_type ? ` ${slide.stain_type}` : ''}`,
+                            )
                           )}
                         </div>
                       )}
@@ -1121,6 +1257,29 @@ export function AnalysisResults() {
 
       {/* Content */}
       {view === 'jobs' ? renderJobList() : renderSearchResults()}
+
+      {/* Slide viewer with GeoJSON overlay */}
+      {overlayViewer && (
+        <SlideViewerOSD
+          slideHash={overlayViewer.slideHash}
+          slideName={overlayViewer.slideName}
+          overlays={overlayViewer.overlays}
+          onClose={() => setOverlayViewer(null)}
+        />
+      )}
+
+      {/* Renderer view: slide viewer + scatter side-by-side. Hovering a scatter
+          point highlights the corresponding patch box on the slide. */}
+      {scatterViewer && (
+        <ScatterViewerOverlay
+          jobId={scatterViewer.jobId}
+          slideHash={scatterViewer.slideHash}
+          slideName={scatterViewer.slideName}
+          rendererId={scatterViewer.rendererId}
+          rendererName={scatterViewer.rendererName}
+          onClose={() => setScatterViewer(null)}
+        />
+      )}
 
       {/* Image preview dialog */}
       <Dialog open={!!previewUrl} onOpenChange={(open) => { if (!open) { if (previewUrl?.startsWith('blob:')) URL.revokeObjectURL(previewUrl); setPreviewUrl(null) } }}>

@@ -18,12 +18,14 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import type { Analysis } from '@/types/slide'
+import type { Analysis, AnalysisKind } from '@/types/slide'
+import { TransformsEditor } from '@/components/TransformsEditor'
 
 import { getApiBase } from '@/api'
 
 export function AnalysisRegistry() {
   const [analyses, setAnalyses] = useState<Analysis[]>([])
+  const [kinds, setKinds] = useState<AnalysisKind[]>([])
   const [loading, setLoading] = useState(true)
   const [isDialogOpen, setIsDialogOpen] = useState(false)
   const [editingAnalysis, setEditingAnalysis] = useState<Analysis | null>(null)
@@ -32,6 +34,7 @@ export function AnalysisRegistry() {
   const [formName, setFormName] = useState('')
   const [formVersion, setFormVersion] = useState('1.0')
   const [formDescription, setFormDescription] = useState('')
+  const [formKind, setFormKind] = useState('cellvit')
   const [formScriptPath, setFormScriptPath] = useState('')
   const [formWorkingDir, setFormWorkingDir] = useState('')
   const [formEnvSetup, setFormEnvSetup] = useState('')
@@ -41,11 +44,18 @@ export function AnalysisRegistry() {
   const [formDefaultParams, setFormDefaultParams] = useState('')
   const [formGpuRequired, setFormGpuRequired] = useState(true)
   const [formEstRuntime, setFormEstRuntime] = useState(60)
+  const [formTransforms, setFormTransforms] = useState('')
   const [isSaving, setIsSaving] = useState(false)
 
   useEffect(() => {
     fetchAnalyses()
+    fetch(`${getApiBase()}/analyses/kinds`)
+      .then(r => r.ok ? r.json() : [])
+      .then(setKinds)
+      .catch(() => setKinds([]))
   }, [])
+
+  const selectedKind = kinds.find(k => k.id === formKind)
 
   const fetchAnalyses = async () => {
     setLoading(true)
@@ -65,6 +75,7 @@ export function AnalysisRegistry() {
     setFormName('')
     setFormVersion('1.0')
     setFormDescription('')
+    setFormKind('cellvit')
     setFormScriptPath('')
     setFormWorkingDir('')
     setFormEnvSetup('')
@@ -74,6 +85,7 @@ export function AnalysisRegistry() {
     setFormDefaultParams('')
     setFormGpuRequired(true)
     setFormEstRuntime(60)
+    setFormTransforms('')
     setEditingAnalysis(null)
   }
 
@@ -87,6 +99,7 @@ export function AnalysisRegistry() {
     setFormName(analysis.name)
     setFormVersion(analysis.version)
     setFormDescription(analysis.description || '')
+    setFormKind(analysis.kind || 'cellvit')
     setFormScriptPath(analysis.script_path || '')
     setFormWorkingDir(analysis.working_directory || '')
     setFormEnvSetup(analysis.env_setup || '')
@@ -96,6 +109,7 @@ export function AnalysisRegistry() {
     setFormDefaultParams(analysis.default_parameters || '')
     setFormGpuRequired(analysis.gpu_required)
     setFormEstRuntime(analysis.estimated_runtime_minutes)
+    setFormTransforms(analysis.transforms || '')
     setIsDialogOpen(true)
   }
 
@@ -108,6 +122,7 @@ export function AnalysisRegistry() {
         name: formName,
         version: formVersion,
         description: formDescription || undefined,
+        kind: formKind,
         script_path: formScriptPath || undefined,
         working_directory: formWorkingDir || undefined,
         env_setup: formEnvSetup || undefined,
@@ -117,6 +132,7 @@ export function AnalysisRegistry() {
         default_parameters: formDefaultParams || undefined,
         gpu_required: formGpuRequired,
         estimated_runtime_minutes: formEstRuntime,
+        transforms: formTransforms || undefined,
       }
 
       const url = editingAnalysis
@@ -313,6 +329,25 @@ export function AnalysisRegistry() {
             </div>
 
             <div className="space-y-2">
+              <label className="text-sm font-medium">Kind</label>
+              <select
+                className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+                value={formKind}
+                onChange={(e) => setFormKind(e.target.value)}
+              >
+                {kinds.length === 0 && (
+                  <option value={formKind}>{formKind}</option>
+                )}
+                {kinds.map((k) => (
+                  <option key={k.id} value={k.id}>{k.name} ({k.id})</option>
+                ))}
+              </select>
+              <p className="text-xs text-muted-foreground">
+                {selectedKind?.description || 'Determines which ops are available below and supplies the default ruleset.'}
+              </p>
+            </div>
+
+            <div className="space-y-2">
               <label className="text-sm font-medium">Script Path on Cluster</label>
               <Input
                 placeholder="/path/to/run_script.sh"
@@ -366,9 +401,16 @@ export function AnalysisRegistry() {
                 onChange={(e) => setFormPostprocessTemplate(e.target.value)}
               />
               <p className="text-xs text-muted-foreground">
-                Command to run on results before export. Placeholders: {'{input_dir}'}, {'{output_dir}'}, {'{filename_stem}'}
+                Legacy: shell command applied at ZIP-export time. Placeholders: {'{input_dir}'}, {'{output_dir}'}, {'{filename_stem}'}. Prefer the safer Read-time Transforms below.
               </p>
             </div>
+
+            <TransformsEditor
+              value={formTransforms}
+              onChange={setFormTransforms}
+              kind={formKind}
+              defaultRules={selectedKind?.default_rules}
+            />
 
             <div className="space-y-2">
               <label className="text-sm font-medium">Parameters Schema (JSON Schema)</label>
