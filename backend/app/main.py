@@ -2251,6 +2251,12 @@ class SlidePullExportRequest(BaseModel):
     # 'symlink' (instant but downstream tools like Halo may not follow)
     # 'auto' (legacy: symlink → hardlink → copy probe)
     method: str = "hardlink"
+    # When True (default), slides already materialized in their target bin
+    # (same filename, matching size) are left in place and reported as
+    # "skipped" rather than re-linked/re-copied. This makes a re-run of the
+    # same list resumable: an interrupted pull continues instead of redoing
+    # all the work. Set False to force every slide to be re-materialized.
+    skip_existing: bool = True
 
 
 def _resolve_link_method(output_dir: Path, sample_src: Path, requested: str) -> str:
@@ -2303,8 +2309,21 @@ def _resolve_link_method(output_dir: Path, sample_src: Path, requested: str) -> 
             pass
 
 
-def _link_or_copy(src: Path, dst: Path, preferred: str) -> str:
-    """Materialize src at dst using preferred method, falling back to weaker methods. Returns method actually used."""
+def _link_or_copy(src: Path, dst: Path, preferred: str, skip_existing: bool = False) -> str:
+    """Materialize src at dst using preferred method, falling back to weaker methods. Returns method actually used.
+
+    If skip_existing is True and dst is already a regular file whose size matches src,
+    it is left untouched and "skipped" is returned (resumable re-runs). Symlinks and
+    size-mismatched leftovers (e.g. a partial copy from an interrupted run) are always
+    re-materialized so the target ends up correct.
+    """
+    if skip_existing and dst.exists() and not dst.is_symlink():
+        try:
+            if dst.stat().st_size == src.stat().st_size:
+                return "skipped"
+        except OSError:
+            pass  # fall through and re-materialize
+
     if dst.is_symlink() or dst.exists():
         dst.unlink()
 
@@ -2329,6 +2348,47 @@ def _link_or_copy(src: Path, dst: Path, preferred: str) -> str:
             last_err = e
             continue
     raise RuntimeError(f"All link methods failed for {src.name}: {last_err}")
+
+
+_pull_history_lock = threading.Lock()
+
+
+def _pull_history_path() -> Path:
+    """JSON-lines log of every Export-to-Directory pull, one entry per line."""
+    return settings.local_data_path / "pull-history.jsonl"
+
+
+def _record_pull_history(entry: dict) -> None:
+    """Append a pull record. Best-effort: never let history logging break an export."""
+    try:
+        with _pull_history_lock:
+            with open(_pull_history_path(), "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+    except Exception as e:
+        print(f"[pull-history] failed to record entry: {e}")
+
+
+@app.get("/slides/pull-history")
+def pull_history(limit: int = 50):
+    """Return past Export-to-Directory pulls, newest first."""
+    path = _pull_history_path()
+    if not path.exists():
+        return {"entries": []}
+    entries: list[dict] = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue  # skip a corrupt line rather than failing the whole read
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Cannot read pull history: {e}")
+    entries.reverse()  # file is append-order (oldest first) → newest first for the UI
+    return {"entries": entries[: max(1, limit)]}
 
 
 @app.post("/slides/pull-export")
@@ -2392,10 +2452,13 @@ def pull_export(data: SlidePullExportRequest):
 
         manifest_rows: list[dict] = []
         bin_failures = 0
+        bin_skipped = 0
         for s in chunk:
             dst = bin_dir / s["filename"]
             try:
-                used = _link_or_copy(s["src_path"], dst, preferred_method)
+                used = _link_or_copy(s["src_path"], dst, preferred_method, skip_existing=data.skip_existing)
+                if used == "skipped":
+                    bin_skipped += 1
                 manifest_rows.append({
                     "slide_hash": s["slide_hash"],
                     "accession": s["accession"],
@@ -2421,24 +2484,28 @@ def pull_export(data: SlidePullExportRequest):
             "bin": bin_dir.name,
             "path": str(bin_dir),
             "slides": len(manifest_rows),
+            "skipped": bin_skipped,
             "failures": bin_failures,
         })
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     total_exported = sum(b["slides"] for b in bin_reports)
+    total_skipped = sum(b["skipped"] for b in bin_reports)
     with open(output_root / "pull-summary.csv", "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["exported_at", timestamp])
         w.writerow(["preferred_method", preferred_method])
+        w.writerow(["skip_existing", data.skip_existing])
         w.writerow(["bin_size", bin_size])
         w.writerow(["total_requested", len(data.slide_hashes)])
         w.writerow(["total_exported", total_exported])
+        w.writerow(["total_skipped", total_skipped])
         w.writerow(["missing_count", len(missing_hashes)])
         w.writerow(["failure_count", len(failures)])
         w.writerow([])
-        w.writerow(["bin", "path", "slides", "failures"])
+        w.writerow(["bin", "path", "slides", "skipped", "failures"])
         for b in bin_reports:
-            w.writerow([b["bin"], b["path"], b["slides"], b["failures"]])
+            w.writerow([b["bin"], b["path"], b["slides"], b["skipped"], b["failures"]])
         if missing_hashes:
             w.writerow([])
             w.writerow(["missing_slide_hashes"])
@@ -2450,13 +2517,18 @@ def pull_export(data: SlidePullExportRequest):
             for fl in failures:
                 w.writerow([fl["slide_hash"], fl["filename"], fl["bin"], fl["error"]])
 
-    return {
+    # Distinct accessions touched by this pull (for the "associated cases" history view).
+    accessions = sorted({s["accession"] for s in resolved})
+
+    result = {
         "output_dir": str(output_root),
         "preferred_method": preferred_method,
+        "skip_existing": data.skip_existing,
         "bin_size": bin_size,
         "bin_count": len(bin_reports),
         "total_requested": len(data.slide_hashes),
         "total_exported": total_exported,
+        "total_skipped": total_skipped,
         "missing_count": len(missing_hashes),
         "failure_count": len(failures),
         "bins": bin_reports,
@@ -2464,6 +2536,27 @@ def pull_export(data: SlidePullExportRequest):
         "missing_hashes": missing_hashes[:25],
         "summary_path": str(output_root / "pull-summary.csv"),
     }
+
+    _record_pull_history({
+        "id": datetime.now().strftime("%Y%m%d-%H%M%S-") + f"{os.getpid():d}",
+        "exported_at": timestamp,
+        "output_dir": str(output_root),
+        "preferred_method": preferred_method,
+        "method_requested": method_request,
+        "skip_existing": data.skip_existing,
+        "bin_size": bin_size,
+        "bin_count": len(bin_reports),
+        "total_requested": len(data.slide_hashes),
+        "total_exported": total_exported,
+        "total_skipped": total_skipped,
+        "missing_count": len(missing_hashes),
+        "failure_count": len(failures),
+        "case_count": len(accessions),
+        "accessions": accessions,
+        "bins": [{"bin": b["bin"], "slides": b["slides"], "skipped": b["skipped"], "failures": b["failures"]} for b in bin_reports],
+    })
+
+    return result
 
 
 @app.post("/slides/pull-download")

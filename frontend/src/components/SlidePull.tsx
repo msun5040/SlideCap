@@ -16,6 +16,7 @@ import {
   Copy,
   ClipboardCheck,
   FolderOutput,
+  History,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -78,14 +79,35 @@ function slideMatchesStainFilter(stain: string | undefined, buckets: Set<StainBu
 interface ExportReport {
   output_dir: string
   preferred_method: 'symlink' | 'hardlink' | 'copy'
+  skip_existing: boolean
   bin_size: number
   bin_count: number
   total_requested: number
   total_exported: number
+  total_skipped: number
   missing_count: number
   failure_count: number
-  bins: { bin: string; path: string; slides: number; failures: number }[]
+  bins: { bin: string; path: string; slides: number; skipped: number; failures: number }[]
   summary_path: string
+}
+
+interface PullHistoryEntry {
+  id: string
+  exported_at: string
+  output_dir: string
+  preferred_method: 'symlink' | 'hardlink' | 'copy'
+  method_requested: string
+  skip_existing: boolean
+  bin_size: number
+  bin_count: number
+  total_requested: number
+  total_exported: number
+  total_skipped: number
+  missing_count: number
+  failure_count: number
+  case_count: number
+  accessions: string[]
+  bins: { bin: string; slides: number; skipped: number; failures: number }[]
 }
 
 // ── Main Component ──────────────────────────────────────────────
@@ -131,9 +153,17 @@ export function SlidePull() {
   const [exportDir, setExportDir] = useState('')
   const [exportBinSize, setExportBinSize] = useState(100)
   const [exportMethod, setExportMethod] = useState<'hardlink' | 'copy' | 'symlink'>('hardlink')
+  const [exportSkipExisting, setExportSkipExisting] = useState(true)
   const [exporting, setExporting] = useState(false)
   const [exportError, setExportError] = useState('')
   const [exportReport, setExportReport] = useState<ExportReport | null>(null)
+
+  // Pull history
+  const [isHistoryOpen, setIsHistoryOpen] = useState(false)
+  const [history, setHistory] = useState<PullHistoryEntry[]>([])
+  const [historyLoading, setHistoryLoading] = useState(false)
+  const [historyError, setHistoryError] = useState('')
+  const [expandedHistoryId, setExpandedHistoryId] = useState<string | null>(null)
 
   // ── Add slides from search results (grouped by accession) ─────
   const addSlidesFromResults = useCallback((slides: Slide[]) => {
@@ -412,6 +442,7 @@ export function SlidePull() {
           output_dir: exportDir.trim(),
           bin_size: Math.max(1, exportBinSize | 0),
           method: exportMethod,
+          skip_existing: exportSkipExisting,
         }),
       })
       if (!res.ok) {
@@ -425,6 +456,27 @@ export function SlidePull() {
       setExportError(e.message || 'Export failed')
     } finally {
       setExporting(false)
+    }
+  }
+
+  const openHistory = async () => {
+    setIsHistoryOpen(true)
+    setHistoryError('')
+    setHistoryLoading(true)
+    setExpandedHistoryId(null)
+    try {
+      const res = await fetch(`${getApiBase()}/slides/pull-history?limit=100`)
+      if (!res.ok) {
+        const detail = await res.json().catch(() => null)
+        throw new Error(detail?.detail || `Failed to load history (${res.status})`)
+      }
+      const data = await res.json()
+      setHistory((data.entries || []) as PullHistoryEntry[])
+    } catch (e: any) {
+      console.error('Pull history failed:', e)
+      setHistoryError(e.message || 'Failed to load history')
+    } finally {
+      setHistoryLoading(false)
     }
   }
 
@@ -670,6 +722,22 @@ export function SlidePull() {
                 </p>
               </div>
 
+              <div className="flex items-start gap-2 pt-0.5">
+                <Checkbox
+                  id="skip-existing"
+                  checked={exportSkipExisting}
+                  onCheckedChange={(v) => setExportSkipExisting(v === true)}
+                  disabled={exporting}
+                  className="mt-0.5"
+                />
+                <label htmlFor="skip-existing" className="text-[12px] leading-tight cursor-pointer select-none">
+                  <span className="font-medium">Skip slides already in the target</span>
+                  <span className="block text-[11px] text-muted-foreground">
+                    Resumes an interrupted pull — re-pasting the same list only links what's missing. Uncheck to re-materialize everything.
+                  </span>
+                </label>
+              </div>
+
               {exportError && (
                 <div className="rounded-md border border-red-300 bg-red-50 p-2.5 text-[12px] text-red-700">
                   {exportError}
@@ -688,7 +756,12 @@ export function SlidePull() {
                   <div className="font-mono text-[11px] text-emerald-900 break-all">{exportReport.output_dir}</div>
                   <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-[12px]">
                     <span className="text-emerald-900/70">Bins created</span><span className="tabular-nums text-right">{exportReport.bin_count}</span>
-                    <span className="text-emerald-900/70">Exported</span><span className="tabular-nums text-right">{exportReport.total_exported}</span>
+                    <span className="text-emerald-900/70">In target</span><span className="tabular-nums text-right">{exportReport.total_exported}</span>
+                    {exportReport.total_skipped > 0 && (
+                      <>
+                        <span className="text-emerald-900/70">Skipped (already present)</span><span className="tabular-nums text-right">{exportReport.total_skipped}</span>
+                      </>
+                    )}
                     <span className="text-emerald-900/70">Missing</span><span className="tabular-nums text-right">{exportReport.missing_count}</span>
                     <span className="text-emerald-900/70">Failed</span><span className="tabular-nums text-right">{exportReport.failure_count}</span>
                   </div>
@@ -697,7 +770,7 @@ export function SlidePull() {
                       {exportReport.bins.map(b => (
                         <div key={b.bin} className="flex justify-between text-[11px] font-mono">
                           <span>{b.bin}</span>
-                          <span className="tabular-nums">{b.slides} slides{b.failures ? ` · ${b.failures} failed` : ''}</span>
+                          <span className="tabular-nums">{b.slides} slides{b.skipped ? ` · ${b.skipped} skipped` : ''}{b.failures ? ` · ${b.failures} failed` : ''}</span>
                         </div>
                       ))}
                     </div>
@@ -719,6 +792,83 @@ export function SlidePull() {
                   {exporting ? 'Exporting...' : `Export ${selectedSlides} slide${selectedSlides === 1 ? '' : 's'}`}
                 </Button>
               )}
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
+        {/* Pull history dialog */}
+        <Dialog open={isHistoryOpen} onOpenChange={setIsHistoryOpen}>
+          <DialogContent className="sm:max-w-2xl">
+            <DialogHeader>
+              <DialogTitle>Pull History</DialogTitle>
+              <DialogDescription>
+                Past Export-to-Directory pulls and the cases they touched. Newest first.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="py-2 max-h-[60vh] overflow-y-auto">
+              {historyLoading && <p className="text-[12px] text-muted-foreground">Loading history...</p>}
+              {historyError && (
+                <div className="rounded-md border border-red-300 bg-red-50 p-2.5 text-[12px] text-red-700">{historyError}</div>
+              )}
+              {!historyLoading && !historyError && history.length === 0 && (
+                <p className="text-[12px] text-muted-foreground">No pulls recorded yet.</p>
+              )}
+              <div className="space-y-2">
+                {history.map((h) => {
+                  const open = expandedHistoryId === h.id
+                  return (
+                    <div key={h.id} className="rounded-md border border-gray-300 bg-background">
+                      <button
+                        className="w-full flex items-center gap-2 p-2.5 text-left hover:bg-muted/40"
+                        onClick={() => setExpandedHistoryId(open ? null : h.id)}
+                      >
+                        {open ? <ChevronDown className="h-3.5 w-3.5 shrink-0" /> : <ChevronRight className="h-3.5 w-3.5 shrink-0" />}
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2">
+                            <span className="text-[12px] font-medium tabular-nums">{h.exported_at}</span>
+                            <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide">{h.preferred_method}</span>
+                            {h.skip_existing && <span className="rounded bg-blue-100 text-blue-700 px-1.5 py-0.5 text-[10px] font-medium">skip-existing</span>}
+                          </div>
+                          <div className="font-mono text-[11px] text-muted-foreground truncate">{h.output_dir}</div>
+                        </div>
+                        <div className="text-[11px] text-muted-foreground tabular-nums shrink-0 text-right">
+                          {h.case_count} case{h.case_count === 1 ? '' : 's'}<br />
+                          {h.total_exported} slide{h.total_exported === 1 ? '' : 's'}
+                        </div>
+                      </button>
+                      {open && (
+                        <div className="border-t border-gray-200 p-2.5 space-y-2 text-[12px]">
+                          <div className="grid grid-cols-3 gap-x-3 gap-y-0.5">
+                            <span className="text-muted-foreground">Requested</span><span className="col-span-2 tabular-nums">{h.total_requested}</span>
+                            <span className="text-muted-foreground">In target</span><span className="col-span-2 tabular-nums">{h.total_exported}</span>
+                            <span className="text-muted-foreground">Skipped</span><span className="col-span-2 tabular-nums">{h.total_skipped}</span>
+                            <span className="text-muted-foreground">Missing</span><span className="col-span-2 tabular-nums">{h.missing_count}</span>
+                            <span className="text-muted-foreground">Failed</span><span className="col-span-2 tabular-nums">{h.failure_count}</span>
+                            <span className="text-muted-foreground">Bins</span><span className="col-span-2 tabular-nums">{h.bin_count} × {h.bin_size}</span>
+                          </div>
+                          {h.bins.length > 0 && (
+                            <div className="border-t border-gray-200 pt-1.5 space-y-0.5 max-h-28 overflow-y-auto">
+                              {h.bins.map((b) => (
+                                <div key={b.bin} className="flex justify-between text-[11px] font-mono">
+                                  <span>{b.bin}</span>
+                                  <span className="tabular-nums">{b.slides} slides{b.skipped ? ` · ${b.skipped} skipped` : ''}{b.failures ? ` · ${b.failures} failed` : ''}</span>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                          <div className="border-t border-gray-200 pt-1.5">
+                            <p className="text-[11px] text-muted-foreground mb-1">Cases ({h.case_count})</p>
+                            <p className="text-[11px] font-mono break-words leading-relaxed">{h.accessions.join(', ') || '—'}</p>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+            <DialogFooter>
+              <Button variant="outline" size="sm" onClick={() => setIsHistoryOpen(false)}>Close</Button>
             </DialogFooter>
           </DialogContent>
         </Dialog>
@@ -978,6 +1128,15 @@ export function SlidePull() {
             >
               <FolderOutput className="h-3 w-3 mr-1.5" />
               Export to Directory
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              className="w-full h-8 text-[12px]"
+              onClick={openHistory}
+            >
+              <History className="h-3 w-3 mr-1.5" />
+              Pull History
             </Button>
             <Button
               size="sm"
