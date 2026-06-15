@@ -71,7 +71,8 @@ export function PatientTracker({ cohortId, caseGroups, onPatientsChanged }: Pati
       if (res.ok) {
         const data: CohortPatient[] = await res.json()
         setPatients(data)
-        setExpandedPatients(new Set(data.map((p) => p.id)))
+        // Patients start collapsed; the user expands the ones they want.
+        // (createPatient / assignCase still auto-expand a just-added patient.)
       }
     } catch { /* ignore */ }
     setLoading(false)
