@@ -101,6 +101,7 @@ export interface CohortPatient {
   id: number
   label: string           // user-defined de-identified label, e.g. "P001"
   note?: string
+  display_order?: number  // manual ordering within the cohort (lower = first)
   surgeries: PatientSurgery[]
 }
 

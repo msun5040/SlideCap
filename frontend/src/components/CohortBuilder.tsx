@@ -3,7 +3,7 @@ import {
   ArrowLeft, Search, Filter, X, Plus, ChevronDown, ChevronRight,
   Check, Download, FolderArchive, AlertTriangle, Users, FileText,
   CheckCircle2, Clock, XCircle, Loader2, Flag, BarChart2, Trash2, Stethoscope,
-  Microscope,
+  Microscope, ClipboardList,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -33,6 +33,7 @@ import {
 } from '@/components/ui/dialog'
 import type { Slide, CohortSlide, CohortDetail, CaseGroup, CohortFlag, CohortPatient } from '@/types/slide'
 import { PatientTracker } from '@/components/PatientTracker'
+import { CohortFromPasteDialog } from '@/components/CohortFromPasteDialog'
 
 import { getApiBase, normalizeAccession, isDemo } from '@/api'
 import { displaySlide, displayCase } from '@/lib/display'
@@ -111,6 +112,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
 
   // ── Add Slides drawer ────────────────────────────────────────────────
   const [showAddSlides, setShowAddSlides] = useState(false)
+  const [showPasteAdd, setShowPasteAdd] = useState(false)
   const [searchResults, setSearchResults] = useState<Slide[]>([])
   const [searchLoading, setSearchLoading] = useState(false)
   const [searchTerm, setSearchTerm] = useState('')
@@ -127,6 +129,10 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
   const [collapsedPatientGroups, setCollapsedPatientGroups] = useState<Set<number>>(new Set())
   const [selectedCaseHashes, setSelectedCaseHashes] = useState<Set<string>>(new Set())
   const lastClickedCase = useRef<string | null>(null)
+  // Cases tab opens with every case card collapsed; the user expands the ones
+  // they want. Only applied once on first load so adding slides later doesn't
+  // re-collapse cards the user has opened.
+  const didInitCollapse = useRef(false)
 
   // ── Cohort-specific flags ────────────────────────────────────────────
   const [cohortFlags, setCohortFlags] = useState<CohortFlag[]>([])
@@ -245,7 +251,12 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
       })),
     }))
 
-    patientGroups.sort((a, b) => a.patientLabel.localeCompare(b.patientLabel))
+    // Honor the manual patient order from the Patients tab: cohortPatients
+    // arrives sorted by display_order, so sort groups by each patient's index
+    // in that list (unknown ids fall to the end).
+    const patientOrder = new Map(cohortPatients.map((p, i) => [p.id, i]))
+    patientGroups.sort((a, b) =>
+      (patientOrder.get(a.patientId) ?? Infinity) - (patientOrder.get(b.patientId) ?? Infinity))
     for (const pg of patientGroups) {
       pg.surgeries.sort((a, b) => a.surgeryLabel.localeCompare(b.surgeryLabel))
     }
@@ -377,6 +388,14 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
       setPatientsLoading(false)
     }
   }, [cohortId])
+
+  // Collapse all case cards on first load (default view = everything closed).
+  useEffect(() => {
+    if (!didInitCollapse.current && caseGroups.length > 0) {
+      setCollapsedCases(new Set(caseGroups.map(g => g.case_hash)))
+      didInitCollapse.current = true
+    }
+  }, [caseGroups])
 
   useEffect(() => { fetchCohort() }, [fetchCohort])
   useEffect(() => { fetchFlags() }, [fetchFlags])
@@ -1287,7 +1306,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
           {/* ── Patients tab ── */}
           {activeTab === 'patients' && (
             <div className="flex-1 overflow-hidden flex flex-col">
-              <PatientTracker cohortId={cohortId} caseGroups={caseGroups} />
+              <PatientTracker cohortId={cohortId} caseGroups={caseGroups} onPatientsChanged={fetchCohortPatients} />
             </div>
           )}
 
@@ -1300,9 +1319,15 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
               {/* Add Slides drawer header */}
               <div className="flex items-center justify-between px-4 py-3 border-b border-gray-300 shrink-0">
                 <h3 className="text-sm font-semibold">Add Slides</h3>
-                <Button variant="ghost" size="sm" onClick={() => setShowAddSlides(false)}>
-                  <X className="h-4 w-4" />
-                </Button>
+                <div className="flex items-center gap-1">
+                  <Button variant="outline" size="sm" onClick={() => setShowPasteAdd(true)}>
+                    <ClipboardList className="h-3.5 w-3.5 mr-1.5" />
+                    Paste list
+                  </Button>
+                  <Button variant="ghost" size="sm" onClick={() => setShowAddSlides(false)}>
+                    <X className="h-4 w-4" />
+                  </Button>
+                </div>
               </div>
 
               {/* Search controls */}
@@ -1684,6 +1709,15 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
           </div>
         </DialogContent>
       </Dialog>
+
+      {/* Paste-flow dialog in "add" mode: resolve a pasted accession list and
+          add the chosen slides to this cohort (same UX as cohort creation). */}
+      <CohortFromPasteDialog
+        open={showPasteAdd}
+        onOpenChange={setShowPasteAdd}
+        targetCohortId={cohortId}
+        onAdded={() => { fetchCohort(); fetchAnalysisStatus() }}
+      />
 
     </div>
   )

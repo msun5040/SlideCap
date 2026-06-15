@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 from datetime import datetime
 from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import text as sa_text
+from sqlalchemy import text as sa_text, func
 
 from .config import settings
 from .db import init_db, get_db, get_session, Case, Slide, Tag, Project, Cohort, CohortFlag, CohortPatient, CohortPatientCase, Analysis, AnalysisJob, JobSlide, RequestSheet, RequestRow, Study, StudyGroup, init_lock, get_lock, Patient, ExternalMapping, generate_slidecap_id
@@ -1929,6 +1929,10 @@ class PatientCaseUpdate(BaseModel):
     surgery_label: Optional[str] = None
     note: Optional[str] = None
 
+class PatientReorder(BaseModel):
+    # Patient ids in the desired display order (first = top).
+    patient_ids: list[int]
+
 
 def _enrich_surgery(
     surgery: "CohortPatientCase",
@@ -1983,7 +1987,7 @@ def list_cohort_patients(cohort_id: int, db: Session = Depends(get_db)):
         db.query(CohortPatient)
         .options(joinedload(CohortPatient.surgeries).joinedload(CohortPatientCase.case).joinedload(Case.slides))
         .filter_by(cohort_id=cohort_id)
-        .order_by(CohortPatient.label)
+        .order_by(CohortPatient.display_order, CohortPatient.label)
         .all()
     )
     return [
@@ -1991,6 +1995,7 @@ def list_cohort_patients(cohort_id: int, db: Session = Depends(get_db)):
             "id": p.id,
             "label": p.label,
             "note": p.note,
+            "display_order": p.display_order,
             "surgeries": [_enrich_surgery(s, cohort_slide_ids) for s in p.surgeries],
         }
         for p in patients
@@ -2003,11 +2008,47 @@ def create_cohort_patient(cohort_id: int, data: PatientCreate, db: Session = Dep
     if not db.query(Cohort).filter_by(id=cohort_id).first():
         raise HTTPException(status_code=404, detail="Cohort not found")
     with get_lock().write_lock():
-        patient = CohortPatient(cohort_id=cohort_id, label=data.label, note=data.note)
+        # Append new patients at the end of the manual order.
+        max_order = (
+            db.query(func.max(CohortPatient.display_order))
+            .filter_by(cohort_id=cohort_id)
+            .scalar()
+        )
+        next_order = (max_order if max_order is not None else -1) + 1
+        patient = CohortPatient(cohort_id=cohort_id, label=data.label, note=data.note, display_order=next_order)
         db.add(patient)
         db.commit()
         db.refresh(patient)
-    return {"id": patient.id, "label": patient.label, "note": patient.note, "surgeries": []}
+    return {"id": patient.id, "label": patient.label, "note": patient.note,
+            "display_order": patient.display_order, "surgeries": []}
+
+
+@app.patch("/cohorts/{cohort_id}/patients/reorder")
+def reorder_cohort_patients(cohort_id: int, data: PatientReorder, db: Session = Depends(get_db)):
+    """Set the manual display order of patients in a cohort.
+
+    Body lists patient ids in the desired order; display_order is assigned by
+    position. Registered before /patients/{patient_id} so "reorder" isn't parsed
+    as a patient id.
+    """
+    if not db.query(Cohort).filter_by(id=cohort_id).first():
+        raise HTTPException(status_code=404, detail="Cohort not found")
+    with get_lock().write_lock():
+        patients = db.query(CohortPatient).filter_by(cohort_id=cohort_id).all()
+        by_id = {p.id: p for p in patients}
+        order = 0
+        for pid in data.patient_ids:
+            p = by_id.get(pid)
+            if p is not None:
+                p.display_order = order
+                order += 1
+        # Any patient not named in the list keeps a stable spot at the end.
+        for p in patients:
+            if p.id not in set(data.patient_ids):
+                p.display_order = order
+                order += 1
+        db.commit()
+    return {"status": "ok"}
 
 
 @app.patch("/cohorts/{cohort_id}/patients/{patient_id}")

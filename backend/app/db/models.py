@@ -350,6 +350,9 @@ class CohortPatient(Base):
     cohort_id = Column(Integer, ForeignKey('cohorts.id', ondelete='CASCADE'), nullable=False, index=True)
     label = Column(String(100), nullable=False)   # user-defined, e.g. "P001"
     note = Column(String(500))
+    # Manual display order within the cohort (lower = first). Ties fall back to
+    # label. Set explicitly by the reorder endpoint; new patients append at end.
+    display_order = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     cohort = relationship('Cohort', back_populates='patients')
@@ -1092,6 +1095,25 @@ def _migrate_request_sheets(engine):
         print(f"[DB Migration] Skipping request_sheets migration: {e}")
 
 
+def _migrate_cohort_patients(engine):
+    """Add the display_order column to cohort_patients (manual patient ordering)."""
+    from sqlalchemy import text
+    try:
+        insp = inspect(engine)
+        if not insp.has_table('cohort_patients'):
+            return
+        existing = {col['name'] for col in insp.get_columns('cohort_patients')}
+        if 'display_order' not in existing:
+            print("[DB Migration] Adding column: cohort_patients.display_order")
+            with engine.connect() as conn:
+                conn.execute(text(
+                    "ALTER TABLE cohort_patients ADD COLUMN display_order INTEGER NOT NULL DEFAULT 0"
+                ))
+                conn.commit()
+    except Exception as e:
+        print(f"[DB Migration] Skipping cohort_patients migration: {e}")
+
+
 def init_db(db_path: Path):
     """
     Initialize database schema and session factory.
@@ -1110,6 +1132,7 @@ def init_db(db_path: Path):
     _migrate_slidecap_ids(_engine)     # Adds columns to existing tables + backfills IDs
     _migrate_request_sheets(_engine)   # Adds auto_tag_id to request_sheets
     _migrate_analyses(_engine)         # Adds transforms column to analyses
+    _migrate_cohort_patients(_engine)  # Adds display_order to cohort_patients
     _SessionLocal = sessionmaker(bind=_engine)
 
 

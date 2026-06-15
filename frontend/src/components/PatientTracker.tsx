@@ -4,6 +4,8 @@ import {
   X,
   ChevronDown,
   ChevronRight,
+  ArrowUp,
+  ArrowDown,
   UserCircle2,
   Stethoscope,
 } from 'lucide-react'
@@ -25,9 +27,12 @@ import { displayCase } from '@/lib/display'
 interface PatientTrackerProps {
   cohortId: number
   caseGroups: CaseGroup[]
+  /** Fired after any patient/surgery mutation so the parent can refresh the
+   *  case→patient grouping shown on the Cases tab. */
+  onPatientsChanged?: () => void
 }
 
-export function PatientTracker({ cohortId, caseGroups }: PatientTrackerProps) {
+export function PatientTracker({ cohortId, caseGroups, onPatientsChanged }: PatientTrackerProps) {
   const [patients, setPatients] = useState<CohortPatient[]>([])
   const [loading, setLoading] = useState(true)
 
@@ -123,6 +128,7 @@ export function PatientTracker({ cohortId, caseGroups }: PatientTrackerProps) {
       const p: CohortPatient = await res.json()
       setPatients((prev) => [...prev, p])
       setExpandedPatients((prev) => new Set(prev).add(p.id))
+      onPatientsChanged?.()
     }
     setNewPatientLabel('')
     setShowNewPatient(false)
@@ -133,6 +139,7 @@ export function PatientTracker({ cohortId, caseGroups }: PatientTrackerProps) {
       const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/patients/${patientId}`, { method: 'DELETE' })
       if (res.ok) {
         setPatients((prev) => prev.filter((p) => p.id !== patientId))
+        onPatientsChanged?.()
       } else {
         const err = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }))
         console.error('Delete patient failed:', err)
@@ -152,8 +159,10 @@ export function PatientTracker({ cohortId, caseGroups }: PatientTrackerProps) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ label: trimmed }),
     })
-    if (res.ok)
+    if (res.ok) {
       setPatients((prev) => prev.map((p) => p.id === patientId ? { ...p, label: trimmed } : p))
+      onPatientsChanged?.()
+    }
     setEditingPatientId(null)
   }
 
@@ -162,10 +171,12 @@ export function PatientTracker({ cohortId, caseGroups }: PatientTrackerProps) {
       `${getApiBase()}/cohorts/${cohortId}/patients/${patientId}/cases/${caseHash}`,
       { method: 'DELETE' },
     )
-    if (res.ok)
+    if (res.ok) {
       setPatients((prev) => prev.map((p) =>
         p.id === patientId ? { ...p, surgeries: p.surgeries.filter((s) => s.case_hash !== caseHash) } : p,
       ))
+      onPatientsChanged?.()
+    }
   }
 
   const saveSurgeryLabel = async (patientId: number, caseHash: string) => {
@@ -179,12 +190,14 @@ export function PatientTracker({ cohortId, caseGroups }: PatientTrackerProps) {
         body: JSON.stringify({ surgery_label: trimmed }),
       },
     )
-    if (res.ok)
+    if (res.ok) {
       setPatients((prev) => prev.map((p) =>
         p.id === patientId
           ? { ...p, surgeries: p.surgeries.map((s) => s.case_hash === caseHash ? { ...s, surgery_label: trimmed } : s) }
           : p,
       ))
+      onPatientsChanged?.()
+    }
     setEditingSurgery(null)
   }
 
@@ -206,6 +219,7 @@ export function PatientTracker({ cohortId, caseGroups }: PatientTrackerProps) {
           }
           : p,
       ))
+      onPatientsChanged?.()
     }
   }
 
@@ -242,6 +256,26 @@ export function PatientTracker({ cohortId, caseGroups }: PatientTrackerProps) {
     setAddSurgeryPatientId(null)
     setAddSurgeryCaseHash('')
     setAddSurgeryLabel('S1')
+  }
+
+  // Move a patient up/down in the manual order and persist it. The Cases tab
+  // reads this same order, so reordering here re-sorts the case grouping there.
+  const movePatient = async (index: number, dir: -1 | 1) => {
+    const target = index + dir
+    if (target < 0 || target >= patients.length) return
+    const reordered = [...patients]
+    const [moved] = reordered.splice(index, 1)
+    reordered.splice(target, 0, moved)
+    setPatients(reordered)  // optimistic
+    try {
+      const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/patients/reorder`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ patient_ids: reordered.map((p) => p.id) }),
+      })
+      if (res.ok) onPatientsChanged?.()
+      else fetchPatients()  // resync on failure
+    } catch { fetchPatients() }
   }
 
   // ── Render ───────────────────────────────────────────────────────────────
@@ -309,7 +343,7 @@ export function PatientTracker({ cohortId, caseGroups }: PatientTrackerProps) {
         )}
 
         {/* Patient cards */}
-        {patients.map((patient) => {
+        {patients.map((patient, index) => {
           const isExpanded = expandedPatients.has(patient.id)
           const isEditingLabel = editingPatientId === patient.id
           const isAddingSurgery = addSurgeryPatientId === patient.id
@@ -355,8 +389,27 @@ export function PatientTracker({ cohortId, caseGroups }: PatientTrackerProps) {
                   {patient.surgeries.length} {patient.surgeries.length === 1 ? 'surgery' : 'surgeries'}
                 </span>
 
+                <div className="flex items-center opacity-0 group-hover/patient:opacity-100 transition-all">
+                  <button
+                    className="text-muted-foreground hover:text-foreground disabled:opacity-25 disabled:hover:text-muted-foreground"
+                    onClick={() => movePatient(index, -1)}
+                    disabled={index === 0}
+                    title="Move up"
+                  >
+                    <ArrowUp className="h-3.5 w-3.5" />
+                  </button>
+                  <button
+                    className="text-muted-foreground hover:text-foreground disabled:opacity-25 disabled:hover:text-muted-foreground"
+                    onClick={() => movePatient(index, 1)}
+                    disabled={index === patients.length - 1}
+                    title="Move down"
+                  >
+                    <ArrowDown className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+
                 <button
-                  className="opacity-0 group-hover/patient:opacity-100 text-muted-foreground hover:text-destructive transition-all"
+                  className="opacity-0 group-hover/patient:opacity-100 text-muted-foreground hover:text-destructive transition-all ml-1"
                   onClick={() => deletePatient(patient.id)}
                   title="Delete patient"
                 >

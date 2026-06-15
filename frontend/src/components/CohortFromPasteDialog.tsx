@@ -18,8 +18,15 @@ import { displaySlide } from '@/lib/display'
 interface Props {
   open: boolean
   onOpenChange: (open: boolean) => void
-  /** Fired with the new cohort's id after successful create + slide-add. */
-  onCreated: (cohortId: number) => void
+  /** Create mode (default): fired with the new cohort's id after successful
+   *  create + slide-add. */
+  onCreated?: (cohortId: number) => void
+  /** When set, the dialog runs in "add" mode: resolved slides are added to this
+   *  existing cohort instead of creating a new one. The name/description step is
+   *  hidden. */
+  targetCohortId?: number
+  /** Add mode: fired with the number of slides submitted after a successful add. */
+  onAdded?: (addedCount: number) => void
 }
 
 interface ResolveResult {
@@ -42,7 +49,8 @@ const STAIN_HE_VARIANTS = new Set(['he', 'h&e', 'hne', 'h_e'])
  * is fine for the typical cohort size (≤ a few hundred accessions). For
  * substantially bigger lists a batch-resolve endpoint would be worth adding.
  */
-export function CohortFromPasteDialog({ open, onOpenChange, onCreated }: Props) {
+export function CohortFromPasteDialog({ open, onOpenChange, onCreated, targetCohortId, onAdded }: Props) {
+  const addMode = targetCohortId != null
   // ── Paste + resolve state ────────────────────────────────────────
   const [pasteText, setPasteText] = useState('')
   const [resolving, setResolving] = useState(false)
@@ -214,9 +222,35 @@ export function CohortFromPasteDialog({ open, onOpenChange, onCreated }: Props) 
     try { await navigator.clipboard.writeText(resolved.notFound.join('\n')) } catch {}
   }
 
-  // ── Commit: create cohort + add slides ──────────────────────────
-  const handleCreate = async () => {
-    if (!cohortName.trim() || selected.size === 0) return
+  // ── Commit: add to existing cohort, or create cohort + add slides ──
+  const handleCommit = async () => {
+    if (selected.size === 0) return
+
+    // Add mode: just push the selected slides into the existing cohort.
+    if (addMode) {
+      setCreating(true)
+      setError(null)
+      try {
+        const addRes = await fetch(`${getApiBase()}/cohorts/${targetCohortId}/slides`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ slide_hashes: Array.from(selected) }),
+        })
+        if (!addRes.ok) {
+          const detail = await addRes.json().catch(() => ({}))
+          throw new Error(detail.detail || `HTTP ${addRes.status}`)
+        }
+        onAdded?.(selected.size)
+        onOpenChange(false)
+      } catch (e: any) {
+        setError(e.message || 'Failed to add slides')
+      } finally {
+        setCreating(false)
+      }
+      return
+    }
+
+    if (!cohortName.trim()) return
     setCreating(true)
     setError(null)
     try {
@@ -258,7 +292,7 @@ export function CohortFromPasteDialog({ open, onOpenChange, onCreated }: Props) 
         throw new Error(detail.detail || `HTTP ${addRes.status}`)
       }
 
-      onCreated(cohortId)
+      onCreated?.(cohortId)
       onOpenChange(false)
     } catch (e: any) {
       setError(e.message || 'Failed to create cohort')
@@ -272,10 +306,12 @@ export function CohortFromPasteDialog({ open, onOpenChange, onCreated }: Props) 
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-3xl max-h-[88vh] overflow-hidden flex flex-col">
         <DialogHeader>
-          <DialogTitle>Create cohort from accession list</DialogTitle>
+          <DialogTitle>
+            {addMode ? 'Add slides from accession list' : 'Create cohort from accession list'}
+          </DialogTitle>
           <DialogDescription>
             Paste a list of accession numbers (one per line; commas / semicolons also OK),
-            resolve to slides, then filter and pick which to include.
+            resolve to slides, then filter and pick which to {addMode ? 'add' : 'include'}.
           </DialogDescription>
         </DialogHeader>
 
@@ -440,6 +476,7 @@ export function CohortFromPasteDialog({ open, onOpenChange, onCreated }: Props) 
 
               {/* Cohort name + commit */}
               <div className="space-y-2 pt-2 border-t">
+                {!addMode && (
                 <div className="grid grid-cols-2 gap-3">
                   <div className="space-y-1">
                     <label className="text-xs font-medium">Cohort name</label>
@@ -458,6 +495,7 @@ export function CohortFromPasteDialog({ open, onOpenChange, onCreated }: Props) 
                     />
                   </div>
                 </div>
+                )}
                 {error && <p className="text-xs text-red-600">{error}</p>}
               </div>
             </>
@@ -471,11 +509,13 @@ export function CohortFromPasteDialog({ open, onOpenChange, onCreated }: Props) 
               Cancel
             </Button>
             <Button
-              onClick={handleCreate}
-              disabled={creating || !cohortName.trim() || selected.size === 0}
+              onClick={handleCommit}
+              disabled={creating || selected.size === 0 || (!addMode && !cohortName.trim())}
             >
               {creating ? (
-                <><Loader2 className="mr-2 h-4 w-4 animate-spin" /> Creating…</>
+                <><Loader2 className="mr-2 h-4 w-4 animate-spin" /> {addMode ? 'Adding…' : 'Creating…'}</>
+              ) : addMode ? (
+                <>Add {selected.size} slide{selected.size === 1 ? '' : 's'} to cohort</>
               ) : (
                 <>Create cohort with {selected.size} slide{selected.size === 1 ? '' : 's'}</>
               )}
