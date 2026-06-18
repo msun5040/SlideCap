@@ -42,6 +42,7 @@ export interface Cohort {
   source_details?: string
   slide_count: number
   case_count: number
+  auto_add_cases?: boolean
   created_by?: string
   created_at?: string
   updated_at?: string
@@ -74,6 +75,7 @@ export interface CohortDetail {
   source_details?: string
   slide_count: number
   case_count: number
+  auto_add_cases?: boolean
   created_by?: string
   created_at?: string
   updated_at?: string

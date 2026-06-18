@@ -128,7 +128,6 @@ export function PatientTracker({ cohortId, caseGroups, onPatientsChanged }: Pati
     if (res.ok) {
       const p: CohortPatient = await res.json()
       setPatients((prev) => [...prev, p])
-      setExpandedPatients((prev) => new Set(prev).add(p.id))
       onPatientsChanged?.()
     }
     setNewPatientLabel('')
@@ -239,7 +238,6 @@ export function PatientTracker({ cohortId, caseGroups, onPatientsChanged }: Pati
       const newPatient: CohortPatient = await createRes.json()
       patientId = newPatient.id
       setPatients((prev) => [...prev, newPatient])
-      setExpandedPatients((prev) => new Set(prev).add(patientId))
     } else {
       patientId = parseInt(assignToPatient)
     }

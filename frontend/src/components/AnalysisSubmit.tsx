@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useMemo } from 'react'
 import {
   Search, Send, Users, AlertTriangle, Loader2, CheckCircle, XCircle,
   ChevronDown, ChevronRight, Tag, Hash, Stethoscope, FolderOpen, Microscope,
-  FileText,
+  FileText, Play,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -23,7 +23,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import type { Analysis, AnalysisJob, Cohort, CohortDetail, CohortPatient, Slide, GpuInfo, Study, StudyDetail, StudySlide } from '@/types/slide'
+import type { Analysis, AnalysisJob, Cohort, CohortDetail, CohortPatient, CohortSlide, Slide, GpuInfo, Study, StudyDetail, StudySlide } from '@/types/slide'
 import { signalClusterDisconnected } from '@/components/ClusterConnect'
 
 import { getApiBase, normalizeAccession, isDemo } from '@/api'
@@ -59,9 +59,10 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
   const [cohortPatients, setCohortPatients] = useState<CohortPatient[]>([])
   const [loadingCohortDetail, setLoadingCohortDetail] = useState(false)
   const [patientSelectMode, setPatientSelectMode] = useState<'all' | 'specific'>('all')
-  const [selectedPatientIds, setSelectedPatientIds] = useState<Set<number>>(new Set())
-  const [includeUnassigned, setIncludeUnassigned] = useState(true)
+  // Slide-level selection used in "specific" scope — lets users drill patient → case → slide
+  const [cohortSelectedHashes, setCohortSelectedHashes] = useState<Set<string>>(new Set())
   const [expandedPatients, setExpandedPatients] = useState<Set<number>>(new Set())
+  const [expandedCases, setExpandedCases] = useState<Set<string>>(new Set())
 
   // ── Tag/Flag mode ────────────────────────────────────────────────────
   const [tags, setTags] = useState<TagInfo[]>([])
@@ -153,12 +154,15 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
           fetch(`${getApiBase()}/cohorts/${selectedCohortId}`),
           fetch(`${getApiBase()}/cohorts/${selectedCohortId}/patients`),
         ])
-        if (detailRes.ok) setCohortDetail(await detailRes.json())
+        if (detailRes.ok) {
+          const detail: CohortDetail = await detailRes.json()
+          setCohortDetail(detail)
+          // Default: every slide selected (so "specific" scope starts equivalent to "all")
+          setCohortSelectedHashes(new Set(detail.slides.map(s => s.slide_hash)))
+        }
         if (patientsRes.ok) {
           const pts: CohortPatient[] = await patientsRes.json()
           setCohortPatients(pts)
-          // Default: select all patients
-          setSelectedPatientIds(new Set(pts.map(p => p.id)))
         }
       } catch (e) { console.error(e) }
       finally { setLoadingCohortDetail(false) }
@@ -166,6 +170,7 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
     load()
     setPatientSelectMode('all')
     setExpandedPatients(new Set())
+    setExpandedCases(new Set())
   }, [selectedCohortId])
 
   // Fetch tag slides when tag selected
@@ -269,6 +274,34 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
     [cohortCaseGroups, assignedCaseHashes]
   )
 
+  // slide rows grouped by case_hash — lets us drill from a patient/case down to slides
+  const slidesByCase = useMemo(() => {
+    const m = new Map<string, CohortSlide[]>()
+    if (cohortDetail) {
+      for (const s of cohortDetail.slides) {
+        const key = s.case_hash || s.slide_hash
+        if (!m.has(key)) m.set(key, [])
+        m.get(key)!.push(s)
+      }
+    }
+    return m
+  }, [cohortDetail])
+
+  const caseHashesForPatient = (p: CohortPatient) => p.surgeries.map(s => s.case_hash)
+  const slideHashesForCase = (caseHash: string) =>
+    (slidesByCase.get(caseHash) || []).map(s => s.slide_hash)
+  const slideHashesForPatient = (p: CohortPatient) =>
+    caseHashesForPatient(p).flatMap(slideHashesForCase)
+
+  // tri-state for a group checkbox given the slide hashes it covers
+  const groupCheckState = (hashes: string[]): boolean | 'indeterminate' => {
+    if (hashes.length === 0) return false
+    const selected = hashes.reduce((n, h) => n + (cohortSelectedHashes.has(h) ? 1 : 0), 0)
+    if (selected === 0) return false
+    if (selected === hashes.length) return true
+    return 'indeterminate'
+  }
+
   // ── Slide count for "Next" button ────────────────────────────────────
   const slideCount = useMemo(() => {
     if (mode === 'search') return selectedHashes.size
@@ -279,34 +312,11 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
       if (patientSelectMode === 'all') {
         return cohorts.find(c => c.id === selectedCohortId)?.slide_count ?? 0
       }
-      // Count from selected patients + unassigned if included
-      let count = 0
-      for (const p of cohortPatients) {
-        if (selectedPatientIds.has(p.id)) {
-          count += p.surgeries.reduce((sum, s) => sum + s.slide_count, 0)
-        }
-      }
-      if (includeUnassigned) {
-        count += unassignedCases.reduce((sum, c) => sum + c.slide_count, 0)
-      }
-      return count
+      // Specific scope tracks an explicit set of slide hashes
+      return cohortSelectedHashes.size
     }
     return 0
-  }, [mode, selectedHashes, tagSelectedHashes, studySelectedHashes, selectedCohortId, cohorts, patientSelectMode, cohortPatients, selectedPatientIds, includeUnassigned, unassignedCases])
-
-  const getSelectedCaseHashes = (): string[] | undefined => {
-    if (patientSelectMode === 'all') return undefined
-    const hashes: string[] = []
-    for (const p of cohortPatients) {
-      if (selectedPatientIds.has(p.id)) {
-        for (const s of p.surgeries) hashes.push(s.case_hash)
-      }
-    }
-    if (includeUnassigned) {
-      for (const c of unassignedCases) hashes.push(c.case_hash)
-    }
-    return hashes
-  }
+  }, [mode, selectedHashes, tagSelectedHashes, studySelectedHashes, selectedCohortId, cohorts, patientSelectMode, cohortSelectedHashes])
 
   // ── Search ───────────────────────────────────────────────────────────
   const handleSearch = async () => {
@@ -389,12 +399,28 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
     else setStudySelectedHashes(new Set(studyDetail.slides.map(s => s.slide_hash)))
   }
 
-  // ── Cohort patient selection ─────────────────────────────────────────
-  const togglePatient = (patientId: number) => {
-    setSelectedPatientIds(prev => {
+  // ── Cohort slide selection (specific scope) ──────────────────────────
+  // Add/remove a batch of slide hashes from the selection.
+  const setHashesSelected = (hashes: string[], on: boolean) => {
+    setCohortSelectedHashes(prev => {
       const next = new Set(prev)
-      if (next.has(patientId)) next.delete(patientId)
-      else next.add(patientId)
+      if (on) hashes.forEach(h => next.add(h))
+      else hashes.forEach(h => next.delete(h))
+      return next
+    })
+  }
+
+  // Toggle a group (patient/case): if not fully selected, select all; else clear all.
+  const toggleGroup = (hashes: string[]) => {
+    const state = groupCheckState(hashes)
+    setHashesSelected(hashes, state !== true)
+  }
+
+  const toggleCohortSlide = (hash: string) => {
+    setCohortSelectedHashes(prev => {
+      const next = new Set(prev)
+      if (next.has(hash)) next.delete(hash)
+      else next.add(hash)
       return next
     })
   }
@@ -408,10 +434,48 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
     })
   }
 
-  const toggleAllPatients = () => {
-    if (selectedPatientIds.size >= cohortPatients.length) setSelectedPatientIds(new Set())
-    else setSelectedPatientIds(new Set(cohortPatients.map(p => p.id)))
+  const toggleExpandCase = (caseHash: string) => {
+    setExpandedCases(prev => {
+      const next = new Set(prev)
+      if (next.has(caseHash)) next.delete(caseHash)
+      else next.add(caseHash)
+      return next
+    })
   }
+
+  const allCohortHashes = cohortDetail ? cohortDetail.slides.map(s => s.slide_hash) : []
+  const toggleAllCohortSlides = () => {
+    if (cohortSelectedHashes.size >= allCohortHashes.length) setCohortSelectedHashes(new Set())
+    else setCohortSelectedHashes(new Set(allCohortHashes))
+  }
+
+  // Quick-run a single slide: select just that slide and jump to configure/submit.
+  const runSingleSlide = (hash: string) => {
+    setCohortSelectedHashes(new Set([hash]))
+    setStep(2)
+  }
+
+  // A single slide row inside the cohort drill-down (deepest level).
+  const renderCohortSlideRow = (s: CohortSlide) => (
+    <div key={s.slide_hash} className="group flex items-center gap-3 pl-16 pr-4 py-1 hover:bg-muted/30 transition-colors">
+      <Checkbox
+        checked={cohortSelectedHashes.has(s.slide_hash)}
+        onCheckedChange={() => toggleCohortSlide(s.slide_hash)}
+      />
+      <Microscope className="h-3 w-3 shrink-0 text-muted-foreground" />
+      <span className="text-xs font-mono flex-1 truncate">{displaySlide(s)}</span>
+      <span className="text-[10px] text-muted-foreground shrink-0">{s.stain_type}</span>
+      <Button
+        variant="ghost"
+        size="sm"
+        className="h-6 px-2 text-xs opacity-0 group-hover:opacity-100 transition-opacity"
+        onClick={() => runSingleSlide(s.slide_hash)}
+        title="Configure & run analysis on just this slide"
+      >
+        <Play className="h-3 w-3 mr-1" /> Run
+      </Button>
+    </div>
+  )
 
   // ── Slide name helper ────────────────────────────────────────────────
   const slideName = (s: Slide) => displaySlide(s)
@@ -440,7 +504,7 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
       let url: string
       let body: Record<string, unknown>
 
-      if (mode === 'cohort' && selectedCohortId) {
+      if (mode === 'cohort' && selectedCohortId && patientSelectMode === 'all') {
         url = `${getApiBase()}/jobs/submit-cohort/${selectedCohortId}`
         body = {
           analysis_id: selectedAnalysisId,
@@ -450,14 +514,14 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
           parameters: parameters || undefined,
           submitted_by: submittedBy || undefined,
         }
-        const caseHashes = getSelectedCaseHashes()
-        if (caseHashes) body.case_hashes = caseHashes
       } else {
         const hashes = mode === 'tag'
           ? Array.from(tagSelectedHashes)
           : mode === 'study'
             ? Array.from(studySelectedHashes)
-            : Array.from(selectedHashes)
+            : mode === 'cohort'
+              ? Array.from(cohortSelectedHashes)
+              : Array.from(selectedHashes)
         url = `${getApiBase()}/jobs/submit`
         body = {
           analysis_id: selectedAnalysisId,
@@ -815,44 +879,42 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
                           </button>
                           <button
                             className={`text-sm px-3 py-1 rounded-md border transition-colors ${patientSelectMode === 'specific' ? 'bg-primary text-primary-foreground border-primary' : 'border-input hover:bg-muted'}`}
-                            onClick={() => {
-                              setPatientSelectMode('specific')
-                              setSelectedPatientIds(new Set(cohortPatients.map(p => p.id)))
-                            }}
+                            onClick={() => setPatientSelectMode('specific')}
                           >
-                            Select patients
+                            Select slides
                           </button>
                         </div>
                       </div>
 
                       {patientSelectMode === 'specific' && (
-                        <div className="rounded-lg border divide-y max-h-72 overflow-auto">
+                        <div className="rounded-lg border divide-y max-h-96 overflow-auto">
                           {/* Select all header */}
                           <div
-                            className="flex items-center gap-3 px-4 py-2.5 bg-muted/30 cursor-pointer sticky top-0"
-                            onClick={toggleAllPatients}
+                            className="flex items-center gap-3 px-4 py-2.5 bg-muted/30 cursor-pointer sticky top-0 z-10"
+                            onClick={toggleAllCohortSlides}
                           >
                             <Checkbox
-                              checked={selectedPatientIds.size === cohortPatients.length && cohortPatients.length > 0}
-                              onCheckedChange={toggleAllPatients}
+                              checked={groupCheckState(allCohortHashes)}
+                              onCheckedChange={toggleAllCohortSlides}
                             />
                             <span className="text-sm font-medium">
-                              {selectedPatientIds.size === cohortPatients.length
-                                ? `All ${cohortPatients.length} patients`
-                                : `${selectedPatientIds.size} / ${cohortPatients.length} patients`}
+                              {cohortSelectedHashes.size} / {allCohortHashes.length} slides selected
+                            </span>
+                            <span className="text-xs text-muted-foreground ml-auto">
+                              Expand a patient → case to pick individual slides
                             </span>
                           </div>
 
-                          {/* Assigned patients with surgeries */}
+                          {/* Assigned patients → surgeries (cases) → slides */}
                           {cohortPatients.map(patient => {
+                            const pHashes = slideHashesForPatient(patient)
                             const isExpanded = expandedPatients.has(patient.id)
-                            const checked = selectedPatientIds.has(patient.id)
                             return (
                               <div key={patient.id}>
                                 <div className="flex items-center gap-3 px-4 py-2 hover:bg-muted/30 transition-colors">
                                   <Checkbox
-                                    checked={checked}
-                                    onCheckedChange={() => togglePatient(patient.id)}
+                                    checked={groupCheckState(pHashes)}
+                                    onCheckedChange={() => toggleGroup(pHashes)}
                                     onClick={e => e.stopPropagation()}
                                   />
                                   <button
@@ -867,44 +929,78 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
                                     <span className="text-xs text-muted-foreground">
                                       {patient.surgeries.length} surger{patient.surgeries.length !== 1 ? 'ies' : 'y'}
                                       {' · '}
-                                      {patient.surgeries.reduce((s, sg) => s + sg.slide_count, 0)} slides
+                                      {pHashes.length} slides
                                     </span>
                                   </button>
                                 </div>
-                                {isExpanded && patient.surgeries.length > 0 && (
-                                  <div className="pb-1 bg-muted/5">
-                                    {patient.surgeries.map(surgery => (
-                                      <div key={surgery.id} className="flex items-center gap-3 pl-10 pr-4 py-1.5 text-sm text-muted-foreground">
-                                        <Stethoscope className="h-3.5 w-3.5 shrink-0" />
-                                        <span className="font-medium text-foreground">{surgery.surgery_label}</span>
-                                        <span>{displayCase(surgery)}</span>
-                                        <span className="ml-auto">{surgery.slide_count} slides</span>
+                                {isExpanded && patient.surgeries.map(surgery => {
+                                  const cHashes = slideHashesForCase(surgery.case_hash)
+                                  const caseSlides = slidesByCase.get(surgery.case_hash) || []
+                                  const caseExpanded = expandedCases.has(surgery.case_hash)
+                                  return (
+                                    <div key={surgery.id} className="bg-muted/5">
+                                      <div className="flex items-center gap-3 pl-9 pr-4 py-1.5 hover:bg-muted/30 transition-colors">
+                                        <Checkbox
+                                          checked={groupCheckState(cHashes)}
+                                          onCheckedChange={() => toggleGroup(cHashes)}
+                                          onClick={e => e.stopPropagation()}
+                                        />
+                                        <button
+                                          className="flex-1 flex items-center gap-2 text-left"
+                                          onClick={() => caseSlides.length > 0 && toggleExpandCase(surgery.case_hash)}
+                                        >
+                                          {caseSlides.length > 0
+                                            ? (caseExpanded
+                                              ? <ChevronDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                                              : <ChevronRight className="h-3.5 w-3.5 text-muted-foreground shrink-0" />)
+                                            : <span className="w-3.5 shrink-0" />
+                                          }
+                                          <Stethoscope className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                                          <span className="text-sm font-medium">{surgery.surgery_label}</span>
+                                          <span className="text-xs text-muted-foreground">{displayCase(surgery)}</span>
+                                          <span className="ml-auto text-xs text-muted-foreground">{cHashes.length} slides</span>
+                                        </button>
                                       </div>
-                                    ))}
-                                  </div>
-                                )}
+                                      {caseExpanded && caseSlides.map(renderCohortSlideRow)}
+                                    </div>
+                                  )
+                                })}
                               </div>
                             )
                           })}
 
-                          {/* Unassigned cases */}
-                          {unassignedCases.length > 0 && (
-                            <div
-                              className="flex items-center gap-3 px-4 py-2 hover:bg-muted/30 cursor-pointer transition-colors"
-                              onClick={() => setIncludeUnassigned(v => !v)}
-                            >
-                              <Checkbox
-                                checked={includeUnassigned}
-                                onCheckedChange={() => setIncludeUnassigned(v => !v)}
-                              />
-                              <span className="text-sm text-muted-foreground italic">
-                                Unassigned cases ({unassignedCases.length})
-                              </span>
-                              <span className="text-xs text-muted-foreground ml-auto">
-                                {unassignedCases.reduce((s, c) => s + c.slide_count, 0)} slides
-                              </span>
-                            </div>
-                          )}
+                          {/* Unassigned cases → slides */}
+                          {unassignedCases.map(c => {
+                            const cHashes = slideHashesForCase(c.case_hash)
+                            const caseSlides = slidesByCase.get(c.case_hash) || []
+                            const caseExpanded = expandedCases.has(c.case_hash)
+                            return (
+                              <div key={c.case_hash}>
+                                <div className="flex items-center gap-3 px-4 py-2 hover:bg-muted/30 transition-colors">
+                                  <Checkbox
+                                    checked={groupCheckState(cHashes)}
+                                    onCheckedChange={() => toggleGroup(cHashes)}
+                                    onClick={e => e.stopPropagation()}
+                                  />
+                                  <button
+                                    className="flex-1 flex items-center gap-2 text-left"
+                                    onClick={() => caseSlides.length > 0 && toggleExpandCase(c.case_hash)}
+                                  >
+                                    {caseSlides.length > 0
+                                      ? (caseExpanded
+                                        ? <ChevronDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                                        : <ChevronRight className="h-3.5 w-3.5 text-muted-foreground shrink-0" />)
+                                      : <span className="w-3.5 shrink-0" />
+                                    }
+                                    <span className="text-sm text-muted-foreground italic">{displayCase(c)}</span>
+                                    <span className="text-[10px] text-muted-foreground">unassigned</span>
+                                    <span className="ml-auto text-xs text-muted-foreground">{cHashes.length} slides</span>
+                                  </button>
+                                </div>
+                                {caseExpanded && caseSlides.map(renderCohortSlideRow)}
+                              </div>
+                            )
+                          })}
                         </div>
                       )}
 

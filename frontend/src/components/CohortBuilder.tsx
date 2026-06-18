@@ -656,6 +656,29 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
     } catch { setCohort(prev) }
   }
 
+  // Toggle the "follow cases" setting. Turning it on back-fills existing
+  // sibling slides server-side; we refetch to show them.
+  const toggleAutoAddCases = async (next: boolean) => {
+    if (!cohort) return
+    setCohort({ ...cohort, auto_add_cases: next })  // optimistic
+    try {
+      const res = await fetch(`${getApiBase()}/cohorts/${cohortId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ auto_add_cases: next }),
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json()
+      if (next && data.slides_added > 0) {
+        fetchCohort()          // pull in the newly back-filled slides
+        fetchAnalysisStatus()
+      }
+    } catch (e) {
+      console.error('Failed to update auto-add setting:', e)
+      setCohort(c => c ? { ...c, auto_add_cases: !next } : c)  // revert
+    }
+  }
+
   const removeSlide = async (slideHash: string) => {
     if (!cohort) return
     const prev = cohort
@@ -776,6 +799,16 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
               <span key={s}> · {s}: {n}</span>
             ))}
           </p>
+          <label
+            className="mt-1.5 inline-flex items-center gap-2 text-xs text-muted-foreground cursor-pointer"
+            title="When on, any newly-onboarded slide whose case is already in this cohort is added automatically — no need to add new slides by hand. Turning it on also pulls in existing slides for those cases."
+          >
+            <Checkbox
+              checked={!!cohort.auto_add_cases}
+              onCheckedChange={(c) => toggleAutoAddCases(!!c)}
+            />
+            <span>Auto-add new slides for these cases</span>
+          </label>
         </div>
         <div className="flex items-center gap-2 shrink-0 mt-0.5">
           <Button

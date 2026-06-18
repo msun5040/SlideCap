@@ -317,6 +317,11 @@ class Cohort(Base):
     source_type = Column(String(50))  # 'upload', 'filter', 'tag', 'manual'
     source_details = Column(String(2000))  # JSON with filter criteria, tag names, etc.
 
+    # When True, the cohort "follows" the cases it contains: any newly-indexed
+    # slide whose case already has a slide in this cohort is auto-added (at
+    # startup and after each index run). See reconcile_auto_cohorts in main.py.
+    auto_add_cases = Column(Boolean, nullable=False, default=False)
+
     # Metadata
     created_by = Column(String(100))
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -1114,6 +1119,25 @@ def _migrate_cohort_patients(engine):
         print(f"[DB Migration] Skipping cohort_patients migration: {e}")
 
 
+def _migrate_cohorts(engine):
+    """Add the auto_add_cases column to cohorts (case-following cohorts)."""
+    from sqlalchemy import text
+    try:
+        insp = inspect(engine)
+        if not insp.has_table('cohorts'):
+            return
+        existing = {col['name'] for col in insp.get_columns('cohorts')}
+        if 'auto_add_cases' not in existing:
+            print("[DB Migration] Adding column: cohorts.auto_add_cases")
+            with engine.connect() as conn:
+                conn.execute(text(
+                    "ALTER TABLE cohorts ADD COLUMN auto_add_cases BOOLEAN NOT NULL DEFAULT 0"
+                ))
+                conn.commit()
+    except Exception as e:
+        print(f"[DB Migration] Skipping cohorts migration: {e}")
+
+
 def init_db(db_path: Path):
     """
     Initialize database schema and session factory.
@@ -1133,6 +1157,7 @@ def init_db(db_path: Path):
     _migrate_request_sheets(_engine)   # Adds auto_tag_id to request_sheets
     _migrate_analyses(_engine)         # Adds transforms column to analyses
     _migrate_cohort_patients(_engine)  # Adds display_order to cohort_patients
+    _migrate_cohorts(_engine)          # Adds auto_add_cases to cohorts
     _SessionLocal = sessionmaker(bind=_engine)
 
 

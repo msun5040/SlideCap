@@ -115,6 +115,10 @@ async def lifespan(app: FastAPI):
             print(f"Indexed {index_stats['new_slides_indexed']} new slides")
         else:
             print("No new slides found")
+        # Pull newly-onboarded slides into any case-following cohorts.
+        added = reconcile_auto_cohorts(startup_db)
+        if added:
+            print(f"Auto-added {added} slide(s) to case-following cohorts")
     except Exception:
         startup_db.rollback()
         raise
@@ -405,6 +409,37 @@ def get_thumbnail_stats():
 # Indexing Endpoints
 # ============================================================
 
+def reconcile_auto_cohorts(db: Session, cohort_id: Optional[int] = None) -> int:
+    """Ensure every "case-following" cohort contains all slides of the cases it
+    tracks (the cases that already have at least one slide in the cohort).
+
+    Called after indexing so newly-onboarded slides auto-join, and when the
+    auto_add_cases flag is turned on so existing siblings back-fill immediately.
+    Returns the number of slides added. If cohort_id is given, only that cohort
+    is processed.
+    """
+    q = db.query(Cohort).filter(Cohort.auto_add_cases == True)  # noqa: E712
+    if cohort_id is not None:
+        q = q.filter(Cohort.id == cohort_id)
+    cohorts = q.all()
+
+    total_added = 0
+    for cohort in cohorts:
+        member_slide_ids = {s.id for s in cohort.slides}
+        case_ids = {s.case_id for s in cohort.slides if s.case_id is not None}
+        if not case_ids:
+            continue
+        siblings = db.query(Slide).filter(Slide.case_id.in_(case_ids)).all()
+        to_add = [s for s in siblings if s.id not in member_slide_ids]
+        if to_add:
+            cohort.slides.extend(to_add)
+            total_added += len(to_add)
+            print(f"[AutoCohort] '{cohort.name}': added {len(to_add)} slide(s) for tracked cases")
+    if total_added:
+        db.commit()
+    return total_added
+
+
 @app.post("/index/full")
 def run_full_index(db: Session = Depends(get_db)):
     """
@@ -423,6 +458,8 @@ def run_full_index(db: Session = Depends(get_db)):
     cache_count = indexer.build_path_cache()
     stats['cache_rebuilt'] = cache_count
 
+    stats['auto_cohort_slides_added'] = reconcile_auto_cohorts(db)
+
     print(f"Index complete: {stats}")
     return stats
 
@@ -439,6 +476,7 @@ def run_incremental_index(db: Session = Depends(get_db)):
 
     print("Starting incremental index...")
     stats = indexer.build_incremental_index(db)
+    stats['auto_cohort_slides_added'] = reconcile_auto_cohorts(db)
     print(f"Incremental index complete: {stats['new_slides_indexed']} new slides")
     return stats
 
@@ -1662,6 +1700,13 @@ class CohortCreate(BaseModel):
     name: str
     description: Optional[str] = None
     created_by: Optional[str] = None
+    auto_add_cases: bool = False
+
+
+class CohortUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    auto_add_cases: Optional[bool] = None
 
 
 class CohortFromTag(BaseModel):
@@ -1697,6 +1742,7 @@ def list_cohorts(db: Session = Depends(get_db)):
             "source_type": c.source_type,
             "slide_count": c.slide_count,
             "case_count": c.case_count,
+            "auto_add_cases": c.auto_add_cases,
             "created_by": c.created_by,
             "created_at": c.created_at.isoformat() if c.created_at else None,
             "updated_at": c.updated_at.isoformat() if c.updated_at else None
@@ -1713,7 +1759,8 @@ def create_cohort(cohort_data: CohortCreate, db: Session = Depends(get_db)):
             name=cohort_data.name,
             description=cohort_data.description,
             source_type='manual',
-            created_by=cohort_data.created_by
+            created_by=cohort_data.created_by,
+            auto_add_cases=cohort_data.auto_add_cases,
         )
         db.add(cohort)
         db.commit()
@@ -1721,7 +1768,39 @@ def create_cohort(cohort_data: CohortCreate, db: Session = Depends(get_db)):
     return {
         "id": cohort.id,
         "name": cohort.name,
-        "slide_count": 0
+        "slide_count": 0,
+        "auto_add_cases": cohort.auto_add_cases,
+    }
+
+
+@app.patch("/cohorts/{cohort_id}")
+def update_cohort(cohort_id: int, data: CohortUpdate, db: Session = Depends(get_db)):
+    """Update a cohort's name/description or its auto-add-cases setting.
+
+    Turning auto_add_cases on immediately back-fills any existing sibling slides
+    of the cohort's cases so the user doesn't have to add them by hand.
+    """
+    cohort = db.query(Cohort).filter_by(id=cohort_id).first()
+    if not cohort:
+        raise HTTPException(status_code=404, detail="Cohort not found")
+    turned_on = False
+    with get_lock().write_lock():
+        if data.name is not None:
+            cohort.name = data.name
+        if data.description is not None:
+            cohort.description = data.description
+        if data.auto_add_cases is not None:
+            turned_on = data.auto_add_cases and not cohort.auto_add_cases
+            cohort.auto_add_cases = data.auto_add_cases
+        db.commit()
+
+    added = reconcile_auto_cohorts(db, cohort_id=cohort_id) if turned_on else 0
+    return {
+        "id": cohort.id,
+        "name": cohort.name,
+        "description": cohort.description,
+        "auto_add_cases": cohort.auto_add_cases,
+        "slides_added": added,
     }
 
 
@@ -1770,6 +1849,7 @@ def get_cohort(cohort_id: int, db: Session = Depends(get_db)):
         "updated_at": cohort.updated_at.isoformat() if cohort.updated_at else None,
         "slide_count": cohort.slide_count,
         "case_count": cohort.case_count,
+        "auto_add_cases": cohort.auto_add_cases,
         "slides": slides_data
     }
 
