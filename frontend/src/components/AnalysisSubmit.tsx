@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useMemo } from 'react'
 import {
   Search, Send, Users, AlertTriangle, Loader2, CheckCircle, XCircle,
   ChevronDown, ChevronRight, Tag, Hash, Stethoscope, FolderOpen, Microscope,
-  FileText, Play,
+  FileText, Play, Flag, Clock,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -23,7 +23,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import type { Analysis, AnalysisJob, Cohort, CohortDetail, CohortPatient, CohortSlide, Slide, GpuInfo, Study, StudyDetail, StudySlide } from '@/types/slide'
+import type { Analysis, AnalysisJob, Cohort, CohortDetail, CohortFlag, CohortPatient, CohortSlide, Slide, GpuInfo, Study, StudyDetail, StudySlide } from '@/types/slide'
 import { signalClusterDisconnected } from '@/components/ClusterConnect'
 
 import { getApiBase, normalizeAccession, isDemo } from '@/api'
@@ -40,6 +40,24 @@ interface TagInfo {
   name: string
   color?: string
   slide_count?: number
+}
+
+interface SlideAnalysisEntry {
+  status: 'pending' | 'transferring' | 'running' | 'completed' | 'failed'
+  job_id: number
+  analysis_id?: number
+  analysis_name: string
+}
+
+// Global tag used to mark a slide as "flagged" from the Cohort view.
+const SLIDE_FLAG_TAG = 'flagged'
+
+function analysisStatusIcon(status: string) {
+  if (status === 'completed') return <CheckCircle className="h-3 w-3 text-green-600" />
+  if (status === 'running' || status === 'transferring') return <Loader2 className="h-3 w-3 text-blue-500 animate-spin" />
+  if (status === 'pending') return <Clock className="h-3 w-3 text-amber-500" />
+  if (status === 'failed') return <XCircle className="h-3 w-3 text-red-500" />
+  return null
 }
 
 export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps) {
@@ -63,6 +81,9 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
   const [cohortSelectedHashes, setCohortSelectedHashes] = useState<Set<string>>(new Set())
   const [expandedPatients, setExpandedPatients] = useState<Set<number>>(new Set())
   const [expandedCases, setExpandedCases] = useState<Set<string>>(new Set())
+  // Per-slide analysis history + cohort flags, shown as badges in the drill-down
+  const [slideAnalysisStatus, setSlideAnalysisStatus] = useState<Record<string, Record<string, SlideAnalysisEntry>>>({})
+  const [cohortFlags, setCohortFlags] = useState<CohortFlag[]>([])
 
   // ── Tag/Flag mode ────────────────────────────────────────────────────
   const [tags, setTags] = useState<TagInfo[]>([])
@@ -145,14 +166,18 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
     if (!selectedCohortId) {
       setCohortDetail(null)
       setCohortPatients([])
+      setSlideAnalysisStatus({})
+      setCohortFlags([])
       return
     }
     const load = async () => {
       setLoadingCohortDetail(true)
       try {
-        const [detailRes, patientsRes] = await Promise.all([
+        const [detailRes, patientsRes, statusRes, flagsRes] = await Promise.all([
           fetch(`${getApiBase()}/cohorts/${selectedCohortId}`),
           fetch(`${getApiBase()}/cohorts/${selectedCohortId}/patients`),
+          fetch(`${getApiBase()}/cohorts/${selectedCohortId}/analysis-status`),
+          fetch(`${getApiBase()}/cohorts/${selectedCohortId}/flags`),
         ])
         if (detailRes.ok) {
           const detail: CohortDetail = await detailRes.json()
@@ -164,6 +189,11 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
           const pts: CohortPatient[] = await patientsRes.json()
           setCohortPatients(pts)
         }
+        if (statusRes.ok) {
+          const data = await statusRes.json()
+          setSlideAnalysisStatus(data.slides || {})
+        }
+        if (flagsRes.ok) setCohortFlags(await flagsRes.json())
       } catch (e) { console.error(e) }
       finally { setLoadingCohortDetail(false) }
     }
@@ -456,26 +486,72 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
   }
 
   // A single slide row inside the cohort drill-down (deepest level).
-  const renderCohortSlideRow = (s: CohortSlide) => (
-    <div key={s.slide_hash} className="group flex items-center gap-3 pl-16 pr-4 py-1 hover:bg-muted/30 transition-colors">
-      <Checkbox
-        checked={cohortSelectedHashes.has(s.slide_hash)}
-        onCheckedChange={() => toggleCohortSlide(s.slide_hash)}
-      />
-      <Microscope className="h-3 w-3 shrink-0 text-muted-foreground" />
-      <span className="text-xs font-mono flex-1 truncate">{displaySlide(s)}</span>
-      <span className="text-[10px] text-muted-foreground shrink-0">{s.stain_type}</span>
-      <Button
-        variant="ghost"
-        size="sm"
-        className="h-6 px-2 text-xs opacity-0 group-hover:opacity-100 transition-opacity"
-        onClick={() => runSingleSlide(s.slide_hash)}
-        title="Configure & run analysis on just this slide"
-      >
-        <Play className="h-3 w-3 mr-1" /> Run
-      </Button>
-    </div>
-  )
+  const renderCohortSlideRow = (s: CohortSlide) => {
+    const statusMap = slideAnalysisStatus[s.slide_hash]
+    const analysisEntries = statusMap ? Object.values(statusMap) : []
+    const flagged = s.tags?.includes(SLIDE_FLAG_TAG)
+    const caseFlagNames = s.case_hash
+      ? cohortFlags.filter(f => f.case_hashes.includes(s.case_hash!)).map(f => f.name)
+      : []
+    return (
+      <div key={s.slide_hash} className="group flex items-center gap-2 pl-16 pr-4 py-1 hover:bg-muted/30 transition-colors">
+        <Checkbox
+          checked={cohortSelectedHashes.has(s.slide_hash)}
+          onCheckedChange={() => toggleCohortSlide(s.slide_hash)}
+        />
+        <Microscope className="h-3 w-3 shrink-0 text-muted-foreground" />
+        <span className="text-xs font-mono truncate max-w-[160px]">{displaySlide(s)}</span>
+        <span className="text-[10px] text-muted-foreground shrink-0">{s.stain_type}</span>
+
+        {/* Analyses already run + flags */}
+        <div className="flex items-center gap-1 flex-wrap min-w-0 flex-1">
+          {analysisEntries.map(entry => (
+            <span
+              key={entry.analysis_name}
+              className={`inline-flex items-center gap-0.5 rounded-full border text-[10px] h-5 px-1.5 shrink-0 ${
+                entry.status === 'completed'
+                  ? 'bg-green-50 border-green-200 text-green-700'
+                  : entry.status === 'failed'
+                    ? 'bg-red-50 border-red-200 text-red-600'
+                    : entry.status === 'running' || entry.status === 'transferring'
+                      ? 'bg-blue-50 border-blue-200 text-blue-700'
+                      : 'bg-muted/60 border-border text-muted-foreground'
+              }`}
+              title={`${entry.analysis_name}: ${entry.status}`}
+            >
+              {analysisStatusIcon(entry.status)}
+              {entry.analysis_name.length > 12 ? entry.analysis_name.slice(0, 12) + '…' : entry.analysis_name}
+            </span>
+          ))}
+          {flagged && (
+            <span title="Flagged in cohort" className="shrink-0 inline-flex items-center text-red-500">
+              <Flag className="h-3 w-3 fill-current" />
+            </span>
+          )}
+          {caseFlagNames.map(name => (
+            <span
+              key={name}
+              className="inline-flex items-center gap-0.5 bg-amber-50 text-amber-700 text-[10px] rounded-full px-1.5 py-0.5 border border-amber-200 shrink-0"
+              title={`Cohort flag: ${name}`}
+            >
+              <Flag className="h-2 w-2" />
+              {name}
+            </span>
+          ))}
+        </div>
+
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-6 px-2 text-xs shrink-0 opacity-0 group-hover:opacity-100 transition-opacity"
+          onClick={() => runSingleSlide(s.slide_hash)}
+          title="Configure & run analysis on just this slide"
+        >
+          <Play className="h-3 w-3 mr-1" /> Run
+        </Button>
+      </div>
+    )
+  }
 
   // ── Slide name helper ────────────────────────────────────────────────
   const slideName = (s: Slide) => displaySlide(s)
@@ -568,6 +644,52 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
     }
   }
 
+  // ── Retry failed slides of the tracked job ───────────────────────────
+  const [retrying, setRetrying] = useState(false)
+  const retryFailed = async () => {
+    if (!trackedJobId || retrying) return
+    setRetrying(true)
+    try {
+      const res = await fetch(`${getApiBase()}/jobs/${trackedJobId}/retry-failed`, { method: 'POST' })
+      if (res.ok) {
+        const data = await res.json()
+        if (data.job_id) {
+          setTrackedJobId(data.job_id)
+          setTrackedJob(null)
+          setOutputGroups(null)
+          setSubmitResult({ success: true, message: `Retrying ${data.slides_created} failed slide(s) as Job #${data.job_id}.` })
+        } else {
+          setSubmitResult({ success: false, message: data.errors?.[0] || 'Nothing to retry.' })
+        }
+      } else if (res.status === 503) {
+        signalClusterDisconnected()
+        setSubmitResult({ success: false, message: 'Not connected to cluster.' })
+      }
+    } catch {
+      setSubmitResult({ success: false, message: 'Network error' })
+    } finally {
+      setRetrying(false)
+    }
+  }
+
+  const formatEta = (seconds?: number | null): string | null => {
+    if (!seconds || seconds <= 0) return null
+    if (seconds < 60) return `${Math.round(seconds)}s`
+    const m = Math.floor(seconds / 60)
+    if (m < 60) return `${m}m`
+    return `${Math.floor(m / 60)}h ${m % 60}m`
+  }
+
+  // Color for a per-slide status cell in the progress grid
+  const slideCellClass = (status: string): string => (
+    status === 'completed' ? 'bg-green-500' :
+    status === 'failed' ? 'bg-red-500' :
+    status === 'running' ? 'bg-blue-500 animate-pulse' :
+    status === 'transferring' ? 'bg-purple-400 animate-pulse' :
+    status === 'queued' ? 'bg-amber-400' :
+    'bg-gray-300'
+  )
+
   // ── Render ───────────────────────────────────────────────────────────
   return (
     <div className="space-y-6">
@@ -635,6 +757,45 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
               )}
             </div>
           </div>
+
+          {/* Stats row: throughput / ETA / GPUs (sharded jobs report these) */}
+          <div className="flex items-center gap-4 text-xs text-muted-foreground flex-wrap">
+            <span><span className="font-medium text-green-700">{trackedJob.completed_count}</span> done</span>
+            {trackedJob.failed_count > 0 && <span><span className="font-medium text-red-600">{trackedJob.failed_count}</span> failed</span>}
+            {trackedJob.throughput_per_min != null && (
+              <span>{trackedJob.throughput_per_min}/min</span>
+            )}
+            {formatEta(trackedJob.eta_seconds) && trackedJob.status === 'running' && (
+              <span>ETA {formatEta(trackedJob.eta_seconds)}</span>
+            )}
+            {trackedJob.gpus_in_use && trackedJob.gpus_in_use.length > 0 && (
+              <span>GPU {trackedJob.gpus_in_use.join(', ')}</span>
+            )}
+            {(trackedJob.status === 'completed' || trackedJob.status === 'failed') && trackedJob.failed_count > 0 && (
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-6 px-2 text-xs ml-auto"
+                onClick={retryFailed}
+                disabled={retrying}
+              >
+                {retrying ? <Loader2 className="h-3 w-3 animate-spin" /> : <><Play className="h-3 w-3 mr-1" /> Retry {trackedJob.failed_count} failed</>}
+              </Button>
+            )}
+          </div>
+
+          {/* Per-slide status grid */}
+          {trackedJob.slides && trackedJob.slides.length > 0 && (
+            <div className="flex flex-wrap gap-1">
+              {trackedJob.slides.map((s) => (
+                <span
+                  key={s.id}
+                  className={`h-3 w-3 rounded-sm ${slideCellClass(s.status)}`}
+                  title={`${displaySlide(s as any)} — ${s.status}${s.gpu_index != null ? ` (GPU ${s.gpu_index})` : ''}${s.error_message ? `: ${s.error_message}` : ''}`}
+                />
+              ))}
+            </div>
+          )}
 
           {trackedJob.slides && trackedJob.slides.length > 0 && (
             <div className="grid gap-1 max-h-50 overflow-auto">

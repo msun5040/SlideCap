@@ -442,6 +442,20 @@ class Analysis(Base):
     command_template = Column(Text)          # Full command with {placeholders}
     postprocess_template = Column(Text)      # Post-processing command with {input_dir} {output_dir} {filename_stem}
 
+    # ── Execution model ──────────────────────────────────────────────────
+    # 'batch'   = legacy: one tmux session over the whole job directory, one GPU.
+    #             Per-slide status is coarse (all-or-nothing).
+    # 'sharded' = split slides across the available GPUs, one warm tmux session
+    #             per GPU, each running command_template over its shard directory.
+    #             Per-slide status is derived from per-slide output files.
+    execution_mode = Column(String(20), default='batch', server_default='batch')
+    # Pattern (with {stem} placeholder) identifying a slide's output file, used by
+    # the poller to mark that one slide completed — e.g. "{stem}_cells.pt". When
+    # empty, completion falls back to "any output present in the job directory".
+    done_glob = Column(String(200))
+    # Cap on GPUs used for sharded mode. 0 / null = use all GPUs the cluster reports.
+    max_parallel_gpus = Column(Integer, default=0, server_default='0')
+
     # Plugin id of the analysis kind (see backend/app/analyses/). Determines which
     # ops are available, and supplies the default ruleset when `transforms` is empty.
     kind = Column(String(50), nullable=False, default='cellvit', server_default='cellvit')
@@ -526,7 +540,8 @@ class JobSlide(Base):
     slide_id = Column(Integer, ForeignKey('slides.id', ondelete='CASCADE'), nullable=False)
 
     # Cluster execution
-    cluster_job_id = Column(String(100))      # tmux session name (shared across all slides in a batch job)
+    cluster_job_id = Column(String(100))      # tmux session name (shared across all slides in a batch/shard job)
+    gpu_index = Column(Integer)               # Physical GPU this slide's shard runs on (sharded mode)
     remote_wsi_path = Column(String(500))     # Where the slide was rsynced to
     remote_output_path = Column(String(500))  # Shared batch output directory on cluster
     local_output_path = Column(String(500))   # Per-slide path on network drive after distribution
@@ -871,6 +886,9 @@ def _migrate_analysis_jobs(engine):
                 'env_setup': "ALTER TABLE analyses ADD COLUMN env_setup TEXT",
                 'command_template': "ALTER TABLE analyses ADD COLUMN command_template TEXT",
                 'postprocess_template': "ALTER TABLE analyses ADD COLUMN postprocess_template TEXT",
+                'execution_mode': "ALTER TABLE analyses ADD COLUMN execution_mode VARCHAR(20) DEFAULT 'batch'",
+                'done_glob': "ALTER TABLE analyses ADD COLUMN done_glob VARCHAR(200)",
+                'max_parallel_gpus': "ALTER TABLE analyses ADD COLUMN max_parallel_gpus INTEGER DEFAULT 0",
             }
 
             with engine.connect() as conn:
@@ -890,6 +908,7 @@ def _migrate_analysis_jobs(engine):
                 'local_output_path': "ALTER TABLE job_slides ADD COLUMN local_output_path VARCHAR(500)",
                 'filename': "ALTER TABLE job_slides ADD COLUMN filename VARCHAR(500)",
                 'cell_stats': "ALTER TABLE job_slides ADD COLUMN cell_stats TEXT",
+                'gpu_index': "ALTER TABLE job_slides ADD COLUMN gpu_index INTEGER",
             }
 
             with engine.connect() as conn:

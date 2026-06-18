@@ -118,6 +118,9 @@ export interface Analysis {
   env_setup?: string
   command_template?: string
   postprocess_template?: string  // Post-processing command template
+  execution_mode?: 'batch' | 'sharded'  // batch = one session over all slides; sharded = one warm session per GPU
+  done_glob?: string             // per-slide completion pattern with {stem}, e.g. "{stem}_cells.pt"
+  max_parallel_gpus?: number     // cap on GPUs for sharded mode; 0 = all available
   parameters_schema?: string   // JSON Schema string
   default_parameters?: string  // JSON string
   gpu_required: boolean
@@ -150,7 +153,8 @@ export interface JobSlide {
   id: number
   slide_hash?: string
   cluster_job_id?: string
-  status: 'pending' | 'transferring' | 'running' | 'completed' | 'failed'
+  gpu_index?: number
+  status: 'pending' | 'transferring' | 'queued' | 'running' | 'completed' | 'failed'
   started_at?: string
   completed_at?: string
   error_message?: string
@@ -161,11 +165,15 @@ export interface JobSlide {
 export interface AnalysisJob {
   id: number
   analysis_id?: number
+  execution_mode?: 'batch' | 'sharded'
   model_name: string
   model_version?: string
   parameters?: string
   gpu_index?: number
-  status: 'pending' | 'transferring' | 'running' | 'completed' | 'failed'
+  gpus_in_use?: number[]
+  throughput_per_min?: number | null
+  eta_seconds?: number | null
+  status: 'pending' | 'transferring' | 'queued' | 'running' | 'completed' | 'failed'
   submitted_by?: string
   submitted_at?: string
   started_at?: string

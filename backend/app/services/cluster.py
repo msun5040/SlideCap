@@ -299,13 +299,17 @@ class ClusterService:
         remote_output_dir: str,
         gpu_index: int,
         parameters: Optional[dict] = None,
+        session_suffix: str = "",
     ) -> str:
         """
         Start a batch analysis job in a tmux session covering all slides in remote_wsi_dir.
         Returns the tmux session name.
+
+        session_suffix distinguishes parallel sessions of the same job (one per
+        GPU shard) so they don't collide on the tmux session name.
         """
         import shlex as _shlex
-        session_name = f"slidecap_{analysis.name.lower().replace(' ', '_')}_{job_id}"
+        session_name = f"slidecap_{analysis.name.lower().replace(' ', '_')}_{job_id}{session_suffix}"
 
         params = parameters or {}
         template_vars = {
@@ -472,6 +476,59 @@ class JobStatusPoller:
                 if info.get("log_tail"):
                     for js in group:
                         js.log_tail = info["log_tail"]
+
+                # Sharded jobs: detect completion per-slide via the analysis's
+                # done_glob, independently of siblings — even while the session
+                # is still alive (the warm worker finishes slides one at a time).
+                job = (
+                    db.query(AnalysisJob)
+                    .options(joinedload(AnalysisJob.analysis))
+                    .filter_by(id=representative.job_id)
+                    .first()
+                )
+                is_sharded = bool(job and job.analysis and job.analysis.execution_mode == "sharded")
+                if is_sharded:
+                    done_glob = job.analysis.done_glob if job.analysis else None
+                    output_dir = representative.remote_output_path
+                    present: set[str] = set()
+                    if output_dir:
+                        listing, _, _ = self.cluster.run_command(f"ls {output_dir}/ 2>/dev/null")
+                        present = {p for p in listing.split("\n") if p.strip()}
+
+                    for js in group:
+                        if js.status == "completed":
+                            continue
+                        stem = Path(js.filename).stem if js.filename else None
+                        done = False
+                        if stem and present:
+                            if done_glob:
+                                expected = done_glob.replace("{stem}", stem)
+                                done = expected in present
+                            else:
+                                done = any(stem in p for p in present)
+                        if done:
+                            js.status = "completed"
+                            js.completed_at = datetime.utcnow()
+                            updated += 1
+                            affected_job_ids.add(js.job_id)
+                        elif info["alive"]:
+                            if js.status != "running":
+                                js.status = "running"
+                                if not js.started_at:
+                                    js.started_at = datetime.utcnow()
+                                updated += 1
+                                affected_job_ids.add(js.job_id)
+                        else:
+                            # Shard session ended and this slide has no output → failed
+                            js.status = "failed"
+                            js.error_message = (
+                                self._detect_log_error(info.get("log_tail", ""))
+                                or "shard ended without output for this slide"
+                            )
+                            js.completed_at = datetime.utcnow()
+                            updated += 1
+                            affected_job_ids.add(js.job_id)
+                    continue  # handled this (sharded) session group
 
                 if info["alive"]:
                     for js in group:

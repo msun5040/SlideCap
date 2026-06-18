@@ -3149,6 +3149,9 @@ class AnalysisCreate(BaseModel):
     env_setup: Optional[str] = None
     command_template: Optional[str] = None
     postprocess_template: Optional[str] = None
+    execution_mode: str = 'batch'
+    done_glob: Optional[str] = None
+    max_parallel_gpus: int = 0
     parameters_schema: Optional[str] = None
     default_parameters: Optional[str] = None
     gpu_required: bool = True
@@ -3166,6 +3169,9 @@ class AnalysisUpdate(BaseModel):
     env_setup: Optional[str] = None
     command_template: Optional[str] = None
     postprocess_template: Optional[str] = None
+    execution_mode: Optional[str] = None
+    done_glob: Optional[str] = None
+    max_parallel_gpus: Optional[int] = None
     parameters_schema: Optional[str] = None
     default_parameters: Optional[str] = None
     gpu_required: Optional[bool] = None
@@ -3207,6 +3213,9 @@ def list_analyses(
             "env_setup": a.env_setup,
             "command_template": a.command_template,
             "postprocess_template": a.postprocess_template,
+            "execution_mode": a.execution_mode,
+            "done_glob": a.done_glob,
+            "max_parallel_gpus": a.max_parallel_gpus,
             "parameters_schema": a.parameters_schema,
             "default_parameters": a.default_parameters,
             "gpu_required": a.gpu_required,
@@ -3243,6 +3252,9 @@ def create_analysis(data: AnalysisCreate, db: Session = Depends(get_db)):
         env_setup=data.env_setup,
         command_template=data.command_template,
         postprocess_template=data.postprocess_template,
+        execution_mode=data.execution_mode or 'batch',
+        done_glob=data.done_glob,
+        max_parallel_gpus=data.max_parallel_gpus or 0,
         parameters_schema=data.parameters_schema,
         default_parameters=data.default_parameters,
         gpu_required=data.gpu_required,
@@ -3277,6 +3289,9 @@ def get_analysis(analysis_id: int, db: Session = Depends(get_db)):
         "env_setup": analysis.env_setup,
         "command_template": analysis.command_template,
         "postprocess_template": analysis.postprocess_template,
+        "execution_mode": analysis.execution_mode,
+        "done_glob": analysis.done_glob,
+        "max_parallel_gpus": analysis.max_parallel_gpus,
         "parameters_schema": analysis.parameters_schema,
         "default_parameters": analysis.default_parameters,
         "gpu_required": analysis.gpu_required,
@@ -3322,6 +3337,12 @@ def update_analysis(analysis_id: int, data: AnalysisUpdate, db: Session = Depend
         analysis.command_template = data.command_template
     if data.postprocess_template is not None:
         analysis.postprocess_template = data.postprocess_template
+    if data.execution_mode is not None:
+        analysis.execution_mode = data.execution_mode
+    if data.done_glob is not None:
+        analysis.done_glob = data.done_glob
+    if data.max_parallel_gpus is not None:
+        analysis.max_parallel_gpus = data.max_parallel_gpus
     if data.parameters_schema is not None:
         analysis.parameters_schema = data.parameters_schema
     if data.default_parameters is not None:
@@ -3498,6 +3519,8 @@ def submit_jobs(data: JobSubmitRequest, db: Session = Depends(get_db)):
         "env_setup": analysis.env_setup,
         "command_template": analysis.command_template,
         "gpu_required": analysis.gpu_required,
+        "execution_mode": analysis.execution_mode or "batch",
+        "max_parallel_gpus": analysis.max_parallel_gpus or 0,
     }
 
     # --- Phase 1: Create all DB records and commit (fast, releases DB) ---
@@ -3758,7 +3781,153 @@ def submit_jobs(data: JobSubmitRequest, db: Session = Depends(get_db)):
 
         _recompute_job_status_standalone(job_id)
 
-    t = threading.Thread(target=_run_submissions, daemon=True)
+    def _run_sharded_submissions():
+        """
+        Sharded execution: split slides across the GPUs the cluster reports,
+        rsync each slide (updating its status live), then launch ONE warm tmux
+        session per GPU running the analysis over its shard directory.
+
+        Per-slide completion is detected later by the poller via the analysis's
+        done_glob. The whole point is GPU parallelism + real per-slide status,
+        so this path always rsyncs into per-shard dirs (no batch symlink mode).
+        """
+        from concurrent.futures import as_completed
+        from collections import defaultdict
+
+        n = len(slides_to_process)
+
+        # ── 1. Decide which GPUs to use ──────────────────────────────────
+        try:
+            gpus = cluster_service.get_gpu_status()
+        except Exception:
+            gpus = []
+        gpu_list = [g["index"] for g in gpus] or [gpu_index]
+        cap = analysis_snapshot.get("max_parallel_gpus") or 0
+        if cap > 0:
+            gpu_list = gpu_list[:cap]
+        G = max(1, len(gpu_list))
+        print(f"[Job {job_id}] Sharded across {G} GPU(s): {gpu_list}")
+
+        # Round-robin assignment: slide i → shard (i % G), running on gpu_list[shard]
+        shard_of = {t[0]: i % G for i, t in enumerate(slides_to_process)}
+
+        def shard_wsi_dir(shard: int) -> str:
+            return f"{data.remote_wsi_dir}/{job_id}/shard{shard}"
+
+        shared_output_dir = f"{data.remote_output_dir}/{job_id}"
+
+        # ── 2. Mark all transferring + record GPU assignment ─────────────
+        local_by_js = {js_id: lp for (js_id, _h, lp, _rp) in slides_to_process}
+        bg_db = get_session()
+        try:
+            for (js_id, _h, _lp, _rp) in slides_to_process:
+                js = bg_db.query(JobSlide).filter_by(id=js_id).first()
+                if js:
+                    js.status = "transferring"
+                    js.gpu_index = gpu_list[shard_of[js_id]]
+            bg_db.commit()
+        except Exception:
+            bg_db.rollback()
+        finally:
+            bg_db.close()
+
+        # ── 3. Transfer each slide, flipping its status live as it lands ──
+        transfer_ok_by_shard: dict[int, list[int]] = defaultdict(list)
+
+        def _transfer_one(js_id: int):
+            shard = shard_of[js_id]
+            local_path = Path(local_by_js[js_id])
+            if not local_path.exists():
+                return js_id, shard, f"Local file not found: {local_path}"
+            try:
+                cluster_service.rsync_slide(local_path, shard_wsi_dir(shard))
+                return js_id, shard, None
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                return js_id, shard, f"Transfer failed: {e}"
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(_transfer_one, js_id)
+                       for (js_id, _h, _lp, _rp) in slides_to_process]
+            for fut in as_completed(futures):
+                js_id, shard, error = fut.result()
+                sdb = get_session()
+                try:
+                    js = sdb.query(JobSlide).filter_by(id=js_id).first()
+                    if js:
+                        if error:
+                            js.status = "failed"
+                            js.error_message = error
+                        else:
+                            js.status = "queued"
+                            js.remote_wsi_path = f"{shard_wsi_dir(shard)}/{Path(local_by_js[js_id]).name}"
+                            js.remote_output_path = shared_output_dir
+                            transfer_ok_by_shard[shard].append(js_id)
+                        sdb.commit()
+                except Exception:
+                    sdb.rollback()
+                finally:
+                    sdb.close()
+
+        if not any(transfer_ok_by_shard.values()):
+            print(f"[Job {job_id}] All transfers failed.")
+            _recompute_job_status_standalone(job_id)
+            return
+
+        # ── 4. Launch one warm tmux session per shard (one per GPU) ──────
+        for shard, ok_ids in transfer_ok_by_shard.items():
+            if not ok_ids:
+                continue
+            gpu = gpu_list[shard]
+            bg_db = get_session()
+            try:
+                _analysis = bg_db.query(Analysis).filter_by(id=analysis_snapshot["id"]).first()
+                if not _analysis:
+                    raise RuntimeError("Analysis not found")
+                session_name = cluster_service.start_job(
+                    analysis=_analysis,
+                    job_id=job_id,
+                    remote_wsi_dir=shard_wsi_dir(shard),
+                    remote_output_dir=shared_output_dir,
+                    gpu_index=gpu,
+                    parameters=params,
+                    session_suffix=f"_g{gpu}",
+                )
+                started = datetime.utcnow()
+                for js_id in ok_ids:
+                    js = bg_db.query(JobSlide).filter_by(id=js_id).first()
+                    if js:
+                        js.cluster_job_id = session_name
+                        js.status = "running"
+                        js.started_at = started
+                bg_db.commit()
+                print(f"[Job {job_id}] Shard {shard} on GPU {gpu}: session '{session_name}', {len(ok_ids)} slides")
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                bg_db.rollback()
+                err_db = get_session()
+                try:
+                    for js_id in ok_ids:
+                        js = err_db.query(JobSlide).filter_by(id=js_id).first()
+                        if js:
+                            js.status = "failed"
+                            js.error_message = f"Shard start failed: {e}"
+                    err_db.commit()
+                except Exception:
+                    err_db.rollback()
+                finally:
+                    err_db.close()
+            finally:
+                bg_db.close()
+
+        _recompute_job_status_standalone(job_id)
+
+    if analysis_snapshot.get("execution_mode") == "sharded":
+        t = threading.Thread(target=_run_sharded_submissions, daemon=True)
+    else:
+        t = threading.Thread(target=_run_submissions, daemon=True)
     t.start()
 
     return {
@@ -4019,14 +4188,28 @@ def get_job(job_id: int, db: Session = Depends(get_db)):
     failed_count = sum(1 for js in job.slides if js.status == "failed")
     postprocess_available = bool(job.analysis and job.analysis.postprocess_template)
 
+    # Throughput + ETA from elapsed time and finished-slide count. Meaningful
+    # while running; derived here so no extra columns are needed.
+    finished = completed_count + failed_count
+    elapsed_s = (datetime.utcnow() - job.started_at).total_seconds() if job.started_at else 0
+    throughput_per_min = (finished / (elapsed_s / 60)) if elapsed_s > 0 and finished > 0 else None
+    remaining = slide_count - finished
+    eta_seconds = (remaining / throughput_per_min * 60) if throughput_per_min and remaining > 0 else None
+    # GPUs actually in use (sharded mode assigns one shard per GPU)
+    gpus_in_use = sorted({js.gpu_index for js in job.slides if js.gpu_index is not None})
+
     return {
         "id": job.id,
         "analysis_id": job.analysis_id,
         "analysis_kind": job.analysis.kind if job.analysis else None,
+        "execution_mode": job.analysis.execution_mode if job.analysis else None,
         "model_name": job.model_name,
         "model_version": job.model_version,
         "parameters": job.parameters,
         "gpu_index": job.gpu_index,
+        "gpus_in_use": gpus_in_use,
+        "throughput_per_min": round(throughput_per_min, 2) if throughput_per_min else None,
+        "eta_seconds": int(eta_seconds) if eta_seconds else None,
         "status": job.status,
         "submitted_by": job.submitted_by,
         "submitted_at": job.submitted_at.isoformat() if job.submitted_at else None,
@@ -4055,6 +4238,7 @@ def get_job(job_id: int, db: Session = Depends(get_db)):
                 "block_id": js.slide.block_id if js.slide else None,
                 "stain_type": js.slide.stain_type if js.slide else None,
                 "cluster_job_id": js.cluster_job_id,
+                "gpu_index": js.gpu_index,
                 "status": js.status,
                 "started_at": js.started_at.isoformat() if js.started_at else None,
                 "completed_at": js.completed_at.isoformat() if js.completed_at else None,
@@ -4067,6 +4251,36 @@ def get_job(job_id: int, db: Session = Depends(get_db)):
             for js in job.slides
         ],
     }
+
+
+@app.post("/jobs/{job_id}/retry-failed")
+def retry_failed_slides(job_id: int, db: Session = Depends(get_db)):
+    """Resubmit only the failed slides of a job as a new job (same analysis/config)."""
+    job = db.query(AnalysisJob).options(
+        joinedload(AnalysisJob.slides).joinedload(JobSlide.slide)
+    ).filter_by(id=job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not job.analysis_id:
+        raise HTTPException(status_code=400, detail="Job has no analysis to retry")
+
+    failed_hashes = [
+        js.slide.slide_hash for js in job.slides
+        if js.status == "failed" and js.slide
+    ]
+    if not failed_hashes:
+        return {"job_id": None, "slides_created": 0, "errors": ["No failed slides to retry"]}
+
+    req = JobSubmitRequest(
+        analysis_id=job.analysis_id,
+        slide_hashes=failed_hashes,
+        gpu_index=job.gpu_index or 0,
+        remote_wsi_dir=job.remote_wsi_dir or "/tmp/slidecap_wsi",
+        remote_output_dir=job.remote_output_dir or "/tmp/slidecap_output",
+        parameters=job.parameters,
+        submitted_by=job.submitted_by,
+    )
+    return submit_jobs(req, db)
 
 
 @app.get("/jobs/{job_id}/log")

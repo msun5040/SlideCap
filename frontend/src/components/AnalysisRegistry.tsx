@@ -40,6 +40,9 @@ export function AnalysisRegistry() {
   const [formEnvSetup, setFormEnvSetup] = useState('')
   const [formCommandTemplate, setFormCommandTemplate] = useState('')
   const [formPostprocessTemplate, setFormPostprocessTemplate] = useState('')
+  const [formExecutionMode, setFormExecutionMode] = useState<'batch' | 'sharded'>('batch')
+  const [formDoneGlob, setFormDoneGlob] = useState('')
+  const [formMaxGpus, setFormMaxGpus] = useState(0)
   const [formParamsSchema, setFormParamsSchema] = useState('')
   const [formDefaultParams, setFormDefaultParams] = useState('')
   const [formGpuRequired, setFormGpuRequired] = useState(true)
@@ -81,6 +84,9 @@ export function AnalysisRegistry() {
     setFormEnvSetup('')
     setFormCommandTemplate('')
     setFormPostprocessTemplate('')
+    setFormExecutionMode('batch')
+    setFormDoneGlob('')
+    setFormMaxGpus(0)
     setFormParamsSchema('')
     setFormDefaultParams('')
     setFormGpuRequired(true)
@@ -105,6 +111,9 @@ export function AnalysisRegistry() {
     setFormEnvSetup(analysis.env_setup || '')
     setFormCommandTemplate(analysis.command_template || '')
     setFormPostprocessTemplate(analysis.postprocess_template || '')
+    setFormExecutionMode(analysis.execution_mode === 'sharded' ? 'sharded' : 'batch')
+    setFormDoneGlob(analysis.done_glob || '')
+    setFormMaxGpus(analysis.max_parallel_gpus || 0)
     setFormParamsSchema(analysis.parameters_schema || '')
     setFormDefaultParams(analysis.default_parameters || '')
     setFormGpuRequired(analysis.gpu_required)
@@ -128,6 +137,9 @@ export function AnalysisRegistry() {
         env_setup: formEnvSetup || undefined,
         command_template: formCommandTemplate || undefined,
         postprocess_template: formPostprocessTemplate || undefined,
+        execution_mode: formExecutionMode,
+        done_glob: formDoneGlob || undefined,
+        max_parallel_gpus: formMaxGpus,
         parameters_schema: formParamsSchema || undefined,
         default_parameters: formDefaultParams || undefined,
         gpu_required: formGpuRequired,
@@ -403,6 +415,60 @@ export function AnalysisRegistry() {
               <p className="text-xs text-muted-foreground">
                 Legacy: shell command applied at ZIP-export time. Placeholders: {'{input_dir}'}, {'{output_dir}'}, {'{filename_stem}'}. Prefer the safer Read-time Transforms below.
               </p>
+            </div>
+
+            {/* ── Execution model ── */}
+            <div className="rounded-md border p-3 space-y-3 bg-muted/20">
+              <div className="space-y-2">
+                <label className="text-sm font-medium">Execution Mode</label>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    className={`text-sm px-3 py-1.5 rounded-md border transition-colors ${formExecutionMode === 'batch' ? 'bg-primary text-primary-foreground border-primary' : 'border-input hover:bg-muted'}`}
+                    onClick={() => setFormExecutionMode('batch')}
+                  >
+                    Batch (1 session / 1 GPU)
+                  </button>
+                  <button
+                    type="button"
+                    className={`text-sm px-3 py-1.5 rounded-md border transition-colors ${formExecutionMode === 'sharded' ? 'bg-primary text-primary-foreground border-primary' : 'border-input hover:bg-muted'}`}
+                    onClick={() => setFormExecutionMode('sharded')}
+                  >
+                    Sharded (parallel across GPUs)
+                  </button>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Sharded splits slides across all GPUs (one warm session each) and reports live per-slide status. Batch is the legacy single-session behavior.
+                </p>
+              </div>
+
+              {formExecutionMode === 'sharded' && (
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-1.5">
+                    <label className="text-sm font-medium">Per-slide Done Pattern</label>
+                    <input
+                      className="w-full rounded-md border bg-background px-3 py-2 text-sm font-mono"
+                      placeholder="{stem}_cells.pt"
+                      value={formDoneGlob}
+                      onChange={(e) => setFormDoneGlob(e.target.value)}
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Output file marking one slide done. {'{stem}'} = slide filename without extension. Empty = any output containing the stem.
+                    </p>
+                  </div>
+                  <div className="space-y-1.5">
+                    <label className="text-sm font-medium">Max GPUs</label>
+                    <input
+                      type="number"
+                      min={0}
+                      className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+                      value={formMaxGpus}
+                      onChange={(e) => setFormMaxGpus(Number(e.target.value))}
+                    />
+                    <p className="text-xs text-muted-foreground">0 = use every GPU the cluster reports.</p>
+                  </div>
+                </div>
+              )}
             </div>
 
             <TransformsEditor
