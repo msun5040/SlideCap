@@ -5356,13 +5356,56 @@ def download_result_folder_zip(
 
 
 def _resolve_job_slide_output(js) -> Optional[Path]:
-    """Get the output directory for a JobSlide, if it exists locally."""
+    """Get the output directory for a JobSlide, if it exists locally.
+
+    Stored output paths are absolute and machine-specific — they embed whatever
+    NETWORK_ROOT was when the job ran (e.g. a macOS '/Volumes/...' mount). After
+    migrating the host (Mac -> Windows server) those prefixes no longer exist,
+    even though the files are still on the network drive under
+    <NETWORK_ROOT>/analyses/<slide_hash>/. Re-anchor the per-slide output dir
+    under the CURRENT settings.analyses_path before falling back to the stored
+    path as-is (which still works when running on the original host).
+    """
+    candidates: list[Path] = []
+
+    # Recover the slide hash (from the relationship, or from the stored path).
+    slide_hash = None
+    try:
+        slide = getattr(js, "slide", None)
+        slide_hash = getattr(slide, "slide_hash", None) if slide is not None else None
+    except Exception:
+        slide_hash = None
+
+    for attr in ("local_output_path", "remote_output_path"):
+        val = getattr(js, attr, None)
+        if not val:
+            continue
+        # Re-anchor everything after an 'analyses/' segment under the current
+        # analyses_path (preserves any sub-structure, fixes the prefix).
+        m = re.search(r"analyses[/\\](.+)$", val)
+        if m:
+            candidates.append(settings.analyses_path / m.group(1).replace("\\", "/"))
+        if not slide_hash:
+            mh = re.search(r"analyses[/\\]([0-9a-fA-F]{16,})", val)
+            if mh:
+                slide_hash = mh.group(1)
+
+    # Canonical machine-independent location: <analyses_path>/<slide_hash>
+    if slide_hash:
+        candidates.append(settings.analyses_path / slide_hash)
+
+    # Stored paths as-is (correct when on the original host).
     for attr in ("local_output_path", "remote_output_path"):
         val = getattr(js, attr, None)
         if val:
-            p = Path(val)
+            candidates.append(Path(val))
+
+    for p in candidates:
+        try:
             if p.is_dir():
                 return p
+        except OSError:
+            continue
     return None
 
 
