@@ -63,7 +63,15 @@ class Settings(BaseSettings):
 
     @property
     def thumbnail_cache_path(self) -> Path:
-        return self.local_data_path / "thumbnails"
+        # Thumbnails include the slide *label* and *macro* images, which are
+        # photographs of the printed slide label (accession / MRN / name) and
+        # therefore contain PHI that cannot be hashed or obscured. Keep them on
+        # the access-controlled network drive (next to .salt), NOT scattered on
+        # each workstation's local disk. Bonus: the cache is then shared across
+        # all users of the multi-user server instead of regenerated per machine.
+        p = self.app_data_path / "thumbnails"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
     
     # Server settings
     # HOST: str = "127.0.0.1"
