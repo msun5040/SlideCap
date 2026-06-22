@@ -207,3 +207,13 @@ frontend/release/
 frontend/dist/
 backend/dist/
 backend/build/
+
+# SlideCap local data — never commit (also prevents a git pull from ever
+# clobbering a real DB if LOCAL_DATA_DIR is ever pointed inside the repo)
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.salt
+.salt
+.slidecap/
+pull-history.jsonl
