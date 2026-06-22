@@ -827,7 +827,7 @@ export function SlideLibrary() {
   const stainTypes = ['HE', 'IHC', 'Special']
 
   return (
-    <div className="space-y-6">
+    <div className="h-full flex flex-col gap-6 min-h-0">
       <div>
         <h1 className="text-2xl font-semibold mb-2">Slide Library</h1>
         <p className="text-muted-foreground">
@@ -987,8 +987,8 @@ export function SlideLibrary() {
         )}
       </div>
 
-      <div className="rounded-lg border overflow-hidden">
-        <Table containerClassName="h-[calc(100vh-300px)] min-h-[280px]">
+      <div className="rounded-lg border overflow-hidden flex-1 min-h-0">
+        <Table containerClassName="h-full">
           <TableHeader className="sticky top-0 z-10 [&_th]:bg-muted/95 [&_th]:backdrop-blur-sm [&_tr]:border-b shadow-[0_1px_0_0_var(--border)]">
             <TableRow>
               <TableHead className="w-12.5">

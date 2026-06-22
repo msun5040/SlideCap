@@ -582,7 +582,7 @@ export default function App() {
                 <div className={viewClass('dashboard')}>
                   <Dashboard onSortStarted={handleSortStarted} sortStatus={sortStatus} />
                 </div>
-                <div className={viewClass('slides')}>
+                <div className={`${viewClass('slides')} h-full min-h-0`}>
                   <SlideLibrary />
                 </div>
                 <div className={viewClass('cohorts')}>
