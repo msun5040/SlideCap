@@ -650,27 +650,18 @@ def search_slides(
     # Use empty string if no query provided - indexer will return all slides
     search_query = q or ""
 
+    # Pass the tag INTO the search so it drives candidate selection from the DB
+    # (direct or via case), restricted to live slides. Post-filtering here would
+    # apply the tag only AFTER the result set was already truncated to `limit`,
+    # silently dropping tagged slides past the cap.
     results = indexer.search(
         db=db,
         query=search_query,
         year=year,
         stain_type=stain,
+        tags=[tag] if tag else None,
         limit=limit
     )
-
-    # Filter by tag if specified
-    if tag:
-        tag_obj = db.query(Tag).filter_by(name=tag).first()
-        if tag_obj:
-            # Get slide hashes that have this tag
-            tagged_hashes = set()
-            for slide in tag_obj.slides:
-                tagged_hashes.add(slide.slide_hash)
-            # Filter results to only include slides with this tag
-            results = [r for r in results if r.get('slide_hash') in tagged_hashes]
-        else:
-            # Tag doesn't exist, return empty results
-            results = []
 
     # Enrich results with request sheet info
     if results:
