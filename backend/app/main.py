@@ -1329,15 +1329,37 @@ class TagUpdate(BaseModel):
 
 @app.get("/tags")
 def list_tags(db: Session = Depends(get_db)):
-    """List all tags with usage counts."""
-    tags = db.query(Tag).order_by(Tag.name).all()
+    """List all tags with usage counts.
+
+    slide_count reflects only *live* slides — those whose files are currently
+    in the index (path cache). DB rows for slides whose files no longer exist
+    ("ghost" slides) are excluded so the badge matches what a tag search can
+    actually return. Falls back to the raw DB count if the indexer is unavailable.
+    """
+    tags = db.query(Tag).options(
+        joinedload(Tag.slides),
+        joinedload(Tag.cases).joinedload(Case.slides),
+    ).order_by(Tag.name).all()
+    live = indexer.slide_hash_to_path if indexer else None
+
+    def live_slide_count(t: Tag) -> int:
+        # Mirror search: count distinct live slides tagged directly OR via case.
+        if live is None:
+            return len(t.slides)
+        hs = {s.slide_hash for s in t.slides if s.slide_hash in live}
+        for c in t.cases:
+            for s in c.slides:
+                if s.slide_hash in live:
+                    hs.add(s.slide_hash)
+        return len(hs)
+
     return [
         {
             "id": t.id,
             "name": t.name,
             "color": t.color,
             "category": t.category,
-            "slide_count": len(t.slides),
+            "slide_count": live_slide_count(t),
             "case_count": len(t.cases)
         }
         for t in tags

@@ -8,12 +8,13 @@ import time
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional, Callable
+from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
 from .filename_parser import FilenameParser
 from .hasher import SlideHasher
 import re
-from ..db.models import Case, Slide, JobSlide, AnalysisJob, Patient, generate_slidecap_id
+from ..db.models import Case, Slide, JobSlide, AnalysisJob, Patient, Tag, generate_slidecap_id
 
 
 class SlideIndexer:
@@ -637,10 +638,39 @@ class SlideIndexer:
             if sid_results is not None:
                 return sid_results
 
+        # Tag filter: drive candidates from the DB, not a capped path-cache scan.
+        # An empty query matches every slide, so the limit*2 early-break below
+        # would cap the scan at ~1000 entries BEFORE the tag filter runs (Step 3),
+        # silently dropping tagged slides past that point. Collecting the tagged
+        # slide hashes up front (direct + via case) and iterating only those —
+        # restricted to live/indexed slides — makes tag search complete.
+        tag_candidate_hashes: Optional[set] = None
+        if tags:
+            tag_set = {t.lower() for t in tags}
+            tag_rows = db.query(Tag).options(
+                joinedload(Tag.slides),
+                joinedload(Tag.cases).joinedload(Case.slides),
+            ).filter(func.lower(Tag.name).in_(tag_set)).all()
+            tag_candidate_hashes = set()
+            for tr in tag_rows:
+                for s in tr.slides:
+                    tag_candidate_hashes.add(s.slide_hash)
+                for c in tr.cases:
+                    for s in c.slides:
+                        tag_candidate_hashes.add(s.slide_hash)
+
         # Step 1: Filter in-memory cache (fast)
         t0 = time.time()
         matching = []
-        for slide_hash, filepath in self.slide_hash_to_path.items():
+        if tag_candidate_hashes is not None:
+            scan_items = (
+                (h, self.slide_hash_to_path[h])
+                for h in tag_candidate_hashes
+                if h in self.slide_hash_to_path
+            )
+        else:
+            scan_items = self.slide_hash_to_path.items()
+        for slide_hash, filepath in scan_items:
             filename = filepath.name.lower()
 
             if query_lower and query_lower not in filename:
@@ -672,8 +702,10 @@ class SlideIndexer:
 
             matching.append((slide_hash, filepath, parsed))
 
-            # Fetch a bit more than limit to allow for tag filtering
-            if len(matching) >= limit * 2:
+            # Fetch a bit more than limit to allow for tag filtering. Skip this
+            # cap when scanning tag candidates — that set is already bounded by
+            # the tag, and capping it would drop valid matches.
+            if tag_candidate_hashes is None and len(matching) >= limit * 2:
                 break
 
         print(f"  [SEARCH TIMING] Step 1 - Filter cache ({len(matching)} matches): {time.time()-t0:.3f}s")
