@@ -563,6 +563,52 @@ class JobSlide(Base):
         return f"<JobSlide(id={self.id}, job_id={self.job_id}, status={self.status})>"
 
 
+class SlideQC(Base):
+    """
+    Quality-control result for a slide, evaluated locally BEFORE it's submitted
+    to the cluster. Cheap CPU checks (file openable, MPP/magnification present,
+    tissue fraction) catch slides that would waste a transfer + GPU slot.
+
+    One row per (slide, qc_kind). qc_kind is 'universal' for the shared checks;
+    analysis-kind-specific QC can add its own rows later without a schema change.
+
+    Effective status = manual_status if a human set one, else auto_status — so a
+    reviewer can always override the automated verdict (pass a borderline slide,
+    or fail one that passed the cheap checks).
+    """
+    __tablename__ = 'slide_qc'
+
+    id = Column(Integer, primary_key=True)
+    slide_id = Column(Integer, ForeignKey('slides.id', ondelete='CASCADE'), nullable=False, index=True)
+    qc_kind = Column(String(50), nullable=False, default='universal', server_default='universal')
+
+    # Automated result
+    auto_status = Column(String(10))   # pass | warn | fail
+    metrics = Column(Text)             # JSON: tissue_pct, mpp, mpp_source, width, height, magnification
+    checks = Column(Text)              # JSON: [{name, status, detail}]
+    qc_version = Column(String(20))    # bump to invalidate stale cached results
+    checked_at = Column(DateTime)
+
+    # Manual human override (takes precedence over auto_status)
+    manual_status = Column(String(10))  # pass | fail | None
+    manual_note = Column(String(1000))
+    manual_by = Column(String(100))
+    manual_at = Column(DateTime)
+
+    slide = relationship('Slide')
+
+    __table_args__ = (
+        UniqueConstraint('slide_id', 'qc_kind', name='uq_slide_qc_slide_kind'),
+    )
+
+    @property
+    def effective_status(self) -> str:
+        return self.manual_status or self.auto_status or 'unchecked'
+
+    def __repr__(self):
+        return f"<SlideQC(slide_id={self.slide_id}, kind={self.qc_kind}, status={self.effective_status})>"
+
+
 class RequestSheet(Base):
     """
     A tracking sheet for managing slide requests.

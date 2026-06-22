@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import text as sa_text, func
 
 from .config import settings
-from .db import init_db, get_db, get_session, Case, Slide, Tag, Project, Cohort, CohortFlag, CohortPatient, CohortPatientCase, Analysis, AnalysisJob, JobSlide, RequestSheet, RequestRow, Study, StudyGroup, init_lock, get_lock, Patient, ExternalMapping, generate_slidecap_id
+from .db import init_db, get_db, get_session, Case, Slide, Tag, Project, Cohort, CohortFlag, CohortPatient, CohortPatientCase, Analysis, AnalysisJob, JobSlide, SlideQC, RequestSheet, RequestRow, Study, StudyGroup, init_lock, get_lock, Patient, ExternalMapping, generate_slidecap_id
 from .services import SlideHasher, SlideIndexer, ClusterService, JobStatusPoller
 from .auth import AuthMiddleware, create_challenge, verify_challenge, create_token, verify_token, cleanup_expired_challenges
 from . import demo as demo_mod
@@ -1355,6 +1355,125 @@ def list_tags(db: Session = Depends(get_db)):
         }
         for t in tags
     ]
+
+
+# ============================================================
+# Slide QC (pre-flight quality control)
+# ============================================================
+
+class QCRunRequest(BaseModel):
+    slide_hashes: List[str]
+    force: bool = False  # re-run even if a current-version result is cached
+
+
+class QCManualRequest(BaseModel):
+    slide_hash: str
+    status: Optional[str] = None  # 'pass' | 'fail' | None (clear override)
+    note: Optional[str] = None
+    reviewer: Optional[str] = None
+
+
+def _qc_payload(q: SlideQC, slide_hash: str) -> dict:
+    return {
+        "slide_hash": slide_hash,
+        "status": q.effective_status,
+        "auto_status": q.auto_status,
+        "manual_status": q.manual_status,
+        "manual_note": q.manual_note,
+        "manual_by": q.manual_by,
+        "metrics": json.loads(q.metrics) if q.metrics else None,
+        "checks": json.loads(q.checks) if q.checks else None,
+        "qc_version": q.qc_version,
+        "checked_at": q.checked_at.isoformat() if q.checked_at else None,
+    }
+
+
+@app.get("/qc")
+def get_qc(slide_hashes: str = Query(..., description="Comma-separated slide hashes"),
+           db: Session = Depends(get_db)):
+    """Return cached QC results for the given slides, keyed by slide_hash."""
+    wanted = [h.strip() for h in slide_hashes.split(",") if h.strip()]
+    if not wanted:
+        return {"results": {}}
+    rows = (
+        db.query(SlideQC, Slide.slide_hash)
+        .join(Slide, SlideQC.slide_id == Slide.id)
+        .filter(Slide.slide_hash.in_(wanted), SlideQC.qc_kind == "universal")
+        .all()
+    )
+    return {"results": {sh: _qc_payload(q, sh) for q, sh in rows}}
+
+
+@app.post("/qc/run")
+def run_qc_endpoint(data: QCRunRequest, db: Session = Depends(get_db)):
+    """Run universal QC on the given slides (locally, CPU-only) and cache results."""
+    from .services import qc as _qc
+    if not indexer:
+        raise HTTPException(status_code=503, detail="Indexer not initialized")
+
+    results: dict = {}
+    errors: list[str] = []
+    for slide_hash in dict.fromkeys(data.slide_hashes):  # dedupe, preserve order
+        slide = db.query(Slide).filter_by(slide_hash=slide_hash).first()
+        if not slide:
+            errors.append(f"Slide not found: {slide_hash[:12]}")
+            continue
+
+        existing = (
+            db.query(SlideQC)
+            .filter_by(slide_id=slide.id, qc_kind="universal")
+            .first()
+        )
+        # Skip recompute if a current-version automated result already exists
+        if existing and not data.force and existing.qc_version == _qc.QC_VERSION and existing.auto_status:
+            results[slide_hash] = _qc_payload(existing, slide_hash)
+            continue
+
+        filepath = indexer.get_filepath(slide_hash)
+        if not filepath:
+            errors.append(f"No file for {slide_hash[:12]}")
+            continue
+
+        try:
+            res = _qc.run_qc(slide_hash, filepath)
+        except Exception as e:
+            errors.append(f"QC failed for {slide_hash[:12]}: {e}")
+            continue
+
+        row = existing or SlideQC(slide_id=slide.id, qc_kind="universal")
+        row.auto_status = res["status"]
+        row.metrics = json.dumps(res["metrics"])
+        row.checks = json.dumps(res["checks"])
+        row.qc_version = res["qc_version"]
+        row.checked_at = datetime.utcnow()
+        if existing is None:
+            db.add(row)
+        db.flush()
+        results[slide_hash] = _qc_payload(row, slide_hash)
+
+    db.commit()
+    return {"results": results, "errors": errors}
+
+
+@app.post("/qc/manual")
+def set_manual_qc(data: QCManualRequest, db: Session = Depends(get_db)):
+    """Set or clear a human QC override for a slide (takes precedence over auto)."""
+    if data.status not in (None, "pass", "fail"):
+        raise HTTPException(status_code=400, detail="status must be 'pass', 'fail', or null")
+    slide = db.query(Slide).filter_by(slide_hash=data.slide_hash).first()
+    if not slide:
+        raise HTTPException(status_code=404, detail="Slide not found")
+
+    row = db.query(SlideQC).filter_by(slide_id=slide.id, qc_kind="universal").first()
+    if row is None:
+        row = SlideQC(slide_id=slide.id, qc_kind="universal")
+        db.add(row)
+    row.manual_status = data.status
+    row.manual_note = data.note
+    row.manual_by = data.reviewer
+    row.manual_at = datetime.utcnow() if data.status else None
+    db.commit()
+    return _qc_payload(row, data.slide_hash)
 
 
 @app.get("/tags/search")
