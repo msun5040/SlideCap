@@ -1,82 +1,84 @@
+/* Direction A — Instrument. Neutral grotesque + IBM Plex Mono. */
+@import url('https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
 @import "tailwindcss";
 
-@font-face {
-  font-family: 'Geist';
-  src: url('https://cdn.jsdelivr.net/npm/@fontsource/geist-sans@5.0.3/files/geist-sans-latin-400-normal.woff2') format('woff2');
-  font-weight: 400;
-  font-style: normal;
-  font-display: swap;
-}
-@font-face {
-  font-family: 'Geist';
-  src: url('https://cdn.jsdelivr.net/npm/@fontsource/geist-sans@5.0.3/files/geist-sans-latin-500-normal.woff2') format('woff2');
-  font-weight: 500;
-  font-style: normal;
-  font-display: swap;
-}
-@font-face {
-  font-family: 'Geist';
-  src: url('https://cdn.jsdelivr.net/npm/@fontsource/geist-sans@5.0.3/files/geist-sans-latin-600-normal.woff2') format('woff2');
-  font-weight: 600;
-  font-style: normal;
-  font-display: swap;
-}
-@font-face {
-  font-family: 'Geist Mono';
-  src: url('https://cdn.jsdelivr.net/npm/@fontsource/geist-mono@5.0.3/files/geist-mono-latin-400-normal.woff2') format('woff2');
-  font-weight: 400;
-  font-style: normal;
-  font-display: swap;
-}
-
 :root {
-  --background: #fafafa;
-  --foreground: #111111;
+  /* ── Surfaces & text (cool neutral) ── */
+  --background: #f4f6f8;
+  --foreground: #1a1d23;
   --card: #ffffff;
-  --card-foreground: #111111;
+  --card-foreground: #1a1d23;
   --popover: #ffffff;
-  --popover-foreground: #111111;
-  --primary: #0d9488;
+  --popover-foreground: #1a1d23;
+
+  /* ── Accent: ONE restrained slate-blue, action + selection only ── */
+  --primary: #36577a;
   --primary-foreground: #ffffff;
-  --secondary: #f0f0f0;
-  --secondary-foreground: #111111;
-  --muted: #f0f0f0;
-  --muted-foreground: #6b6b6b;
-  --accent: #0d9488;
+  --accent: #36577a;
   --accent-foreground: #ffffff;
-  --destructive: #dc2626;
+
+  --secondary: #eef1f4;
+  --secondary-foreground: #1a1d23;
+  --muted: #eef1f4;
+  --muted-foreground: #6b7280;
+
+  --destructive: #b4452f;
   --destructive-foreground: #ffffff;
-  --border: #e2e2e2;
-  --input: #e2e2e2;
-  --ring: #0d9488;
+
+  --border: #e4e7eb;
+  --input: #e4e7eb;
+  --ring: #36577a;
   --radius: 3px;
-  --sidebar-bg: #111111;
-  --sidebar-foreground: #a3a3a3;
+
+  /* ── Sidebar (always dark) ── */
+  --sidebar-bg: #1b2129;
+  --sidebar-foreground: #9aa3ad;
   --sidebar-active: #ffffff;
-  --sidebar-hover: #1a1a1a;
-  --sidebar-accent: #0d9488;
+  --sidebar-hover: #262b33;
+  --sidebar-accent: #6f9bc7;
+
+  /* ── Selected / active state (tabs, toggles, nav) ──
+     tint fill + slate text + solid accent edge. */
+  --selected-bg: color-mix(in srgb, var(--primary) 11%, transparent);
+  --selected-foreground: #2c4a6b;
+  --selected-accent: var(--primary);
+
+  /* ── Semantic status hues (dot + label first; soft tint for emphasis) ── */
+  --success: #3f9d6b;  --success-ink: #2f6b4f;  --success-soft: #e7f3ec;
+  --info:    #3f6bb0;  --info-ink:    #2f4f86;  --info-soft:    #e9eff8;
+  --warning: #cd8a2a;  --warning-ink: #8a5a16;  --warning-soft: #fbf1e1;
+  --danger:  #b4452f;  --danger-ink:  #8a3322;  --danger-soft:  #f8e9e6;
+  --neutral-st: #6b7280; --neutral-st-ink: #4b5563; --neutral-st-soft: #eef0f3;
+
+  /* ── Tag preset palette (clinical-muted) ── */
+  --tag-red: #b4452f;  --tag-orange: #c4682a; --tag-yellow: #bf9020;
+  --tag-green: #3f9d6b; --tag-teal: #2c8a7d;  --tag-blue: #3f6bb0;
+  --tag-purple: #7a52b3; --tag-pink: #c0568f; --tag-gray: #6b7280;
 }
 
 .dark {
-  --background: #0a0a0a;
-  --foreground: #ededed;
-  --card: #111111;
-  --card-foreground: #ededed;
-  --popover: #111111;
-  --popover-foreground: #ededed;
-  --primary: #14b8a6;
-  --primary-foreground: #ffffff;
-  --secondary: #1a1a1a;
-  --secondary-foreground: #ededed;
-  --muted: #1a1a1a;
-  --muted-foreground: #888888;
-  --accent: #14b8a6;
-  --accent-foreground: #ffffff;
-  --destructive: #dc2626;
+  --background: #0a0d12;
+  --foreground: #e7eaee;
+  --card: #1b2129;
+  --card-foreground: #e7eaee;
+  --popover: #1b2129;
+  --popover-foreground: #e7eaee;
+  --primary: #6f9bc7;
+  --primary-foreground: #0a0d12;
+  --secondary: #262b33;
+  --secondary-foreground: #e7eaee;
+  --muted: #262b33;
+  --muted-foreground: #8b929b;
+  --accent: #6f9bc7;
+  --accent-foreground: #0a0d12;
+  --destructive: #b4452f;
   --destructive-foreground: #ffffff;
-  --border: #262626;
-  --input: #262626;
-  --ring: #14b8a6;
+  --border: #262b33;
+  --input: #262b33;
+  --ring: #6f9bc7;
+  --selected-bg: color-mix(in srgb, #6f9bc7 18%, transparent);
+  --selected-foreground: #6f9bc7;
+  --selected-accent: #6f9bc7;
 }
 
 * {
@@ -86,14 +88,15 @@
 body {
   background-color: var(--background);
   color: var(--foreground);
-  font-family: 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-family: 'Archivo', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   letter-spacing: -0.011em;
 }
 
 code, pre, .font-mono {
-  font-family: 'Geist Mono', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+  font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+  font-feature-settings: "tnum" 1;
 }
 
 /* Transition utilities */
@@ -113,26 +116,16 @@ button:active:not(:disabled),
   outline-offset: 1px;
 }
 
-/* Table row hover lift */
+/* Table row hover */
 tbody tr {
   transition: background-color 0.1s ease;
 }
 
 /* Scrollbar styling */
-::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
-}
-::-webkit-scrollbar-track {
-  background: transparent;
-}
-::-webkit-scrollbar-thumb {
-  background: var(--border);
-  border-radius: 3px;
-}
-::-webkit-scrollbar-thumb:hover {
-  background: var(--muted-foreground);
-}
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--muted-foreground); }
 
 @theme inline {
   --color-background: var(--background);
@@ -159,6 +152,25 @@ tbody tr {
   --color-sidebar-active: var(--sidebar-active);
   --color-sidebar-hover: var(--sidebar-hover);
   --color-sidebar-accent: var(--sidebar-accent);
+
+  /* selection + status, now available as Tailwind utilities
+     (bg-selected-bg, text-success-ink, bg-warning-soft, …) */
+  --color-selected-bg: var(--selected-bg);
+  --color-selected-foreground: var(--selected-foreground);
+  --color-selected-accent: var(--selected-accent);
+  --color-success: var(--success);
+  --color-success-ink: var(--success-ink);
+  --color-success-soft: var(--success-soft);
+  --color-info: var(--info);
+  --color-info-ink: var(--info-ink);
+  --color-info-soft: var(--info-soft);
+  --color-warning: var(--warning);
+  --color-warning-ink: var(--warning-ink);
+  --color-warning-soft: var(--warning-soft);
+  --color-danger: var(--danger);
+  --color-danger-ink: var(--danger-ink);
+  --color-danger-soft: var(--danger-soft);
+
   --radius-sm: var(--radius);
   --radius-md: var(--radius);
   --radius-lg: calc(var(--radius) + 1px);

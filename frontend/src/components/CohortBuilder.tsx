@@ -849,11 +849,12 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
         ).map(({ key, label, icon, count }) => (
           <button
             key={key}
-            className={`flex items-center gap-1.5 px-4 py-2.5 text-sm font-medium border-b-2 transition-colors ${
+            className={`flex items-center gap-1.5 px-4 py-2.5 text-sm border-b-[3px] rounded-t-sm transition-colors ${
               activeTab === key
-                ? 'border-primary text-foreground'
-                : 'border-transparent text-muted-foreground hover:text-foreground'
+                ? 'font-semibold bg-selected-bg text-selected-foreground'
+                : 'font-medium border-transparent text-muted-foreground hover:text-foreground'
             }`}
+            style={activeTab === key ? { borderBottomColor: 'var(--selected-accent)' } : undefined}
             onClick={() => setActiveTab(key)}
           >
             {icon}
@@ -1409,7 +1410,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                       {availableTags.filter(t => (t.slide_count ?? 0) > 0).map(tag => (
                         <SelectItem key={tag.id} value={tag.name}>
                           <div className="flex items-center gap-2">
-                            {tag.color && <span className="w-2 h-2 rounded-full" style={{ backgroundColor: tag.color }} />}
+                            {tag.color && <span className="w-2 h-2 rounded-[2px]" style={{ backgroundColor: tag.color }} />}
                             {tag.name}
                           </div>
                         </SelectItem>

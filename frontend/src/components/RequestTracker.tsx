@@ -32,6 +32,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import { toneFor } from '@/lib/status'
 import {
   Dialog,
   DialogContent,
@@ -76,25 +77,15 @@ const RECUT_STATUSES = [
 ] as const
 
 // ── Status badge colors ─────────────────────────────────────────
+// Direction A: clinical soft-tint chips driven by the shared tone system.
 function statusColor(status: string): string {
-  switch (status) {
-    case 'Scanned':
-      return 'bg-violet-100 text-violet-800 border-violet-200'
-    case 'Complete':
-    case 'Slides Received':
-      return 'bg-emerald-100 text-emerald-800 border-emerald-200'
-    case 'Partial':
-      return 'bg-amber-100 text-amber-800 border-amber-200'
-    case 'Slides Requested':
-    case 'Recut Blocks Requested':
-      return 'bg-blue-100 text-blue-800 border-blue-200'
-    case 'Missing':
-    case 'No Blocks/Slides':
-      return 'bg-red-100 text-red-800 border-red-200'
-    case 'Not Started':
-      return 'bg-gray-100 text-gray-600 border-gray-200'
-    default:
-      return 'bg-gray-100 text-gray-600 border-gray-200'
+  const t = toneFor(status)
+  switch (t) {
+    case 'success': return 'bg-success-soft text-success-ink border-transparent'
+    case 'info':    return 'bg-info-soft text-info-ink border-transparent'
+    case 'warning': return 'bg-warning-soft text-warning-ink border-transparent'
+    case 'danger':  return 'bg-danger-soft text-danger-ink border-transparent'
+    default:        return 'bg-[var(--neutral-st-soft)] text-[var(--neutral-st-ink)] border-transparent'
   }
 }
 
@@ -119,10 +110,10 @@ function statusDot(status: string): string {
 }
 
 function scanColor(val: string): string {
-  if (val === 'Yes') return 'bg-emerald-100 text-emerald-800 border-emerald-200'
-  if (val === 'No') return 'bg-red-100 text-red-800 border-red-200'
-  if (val === 'Partial') return 'bg-amber-100 text-amber-800 border-amber-200'
-  return 'bg-gray-100 text-gray-600 border-gray-200'
+  if (val === 'Yes') return 'bg-success-soft text-success-ink border-transparent'
+  if (val === 'No') return 'bg-danger-soft text-danger-ink border-transparent'
+  if (val === 'Partial') return 'bg-warning-soft text-warning-ink border-transparent'
+  return 'bg-[var(--neutral-st-soft)] text-[var(--neutral-st-ink)] border-transparent'
 }
 
 // ── Section definitions for detail panel ─────────────────────────
@@ -1688,12 +1679,12 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
                       onClick={() => toggleSettingsTag(t.id)}
                       className={`inline-flex items-center gap-1 rounded-sm px-2 py-1 text-[12px] transition-colors ${
                         selected
-                          ? 'border-2 border-black bg-muted'
+                          ? 'bg-selected-bg text-selected-foreground font-semibold border border-[var(--selected-accent)]'
                           : 'border border-input hover:bg-muted'
                       }`}
                       style={!selected && t.color ? { borderColor: t.color, color: t.color } : undefined}
                     >
-                      {t.color && <span className="h-2 w-2 rounded-full" style={{ backgroundColor: t.color }} />}
+                      {t.color && <span className="h-2 w-2 rounded-[2px]" style={{ backgroundColor: t.color }} />}
                       <span className={selected ? 'text-foreground font-medium' : ''}>{t.name}</span>
                       {selected && <Check className="h-3 w-3" />}
                     </button>

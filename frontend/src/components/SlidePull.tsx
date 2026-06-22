@@ -747,9 +747,9 @@ export function SlidePull() {
               {exportReport && (
                 <div className="rounded-md border border-emerald-300 bg-emerald-50 p-3 text-[12px] space-y-2">
                   <div className="flex items-center gap-2">
-                    <Check className="h-3.5 w-3.5 text-emerald-700" />
-                    <span className="font-medium text-emerald-900">Export complete</span>
-                    <span className="ml-auto rounded bg-emerald-100 text-emerald-800 px-1.5 py-0.5 text-[11px] font-medium">
+                    <Check className="h-3.5 w-3.5 text-success-ink" />
+                    <span className="font-medium text-success-ink">Export complete</span>
+                    <span className="ml-auto rounded-sm bg-success-soft text-success-ink px-1.5 py-0.5 text-[11px] font-medium">
                       {exportReport.preferred_method}
                     </span>
                   </div>

@@ -7,6 +7,8 @@ import { SlideViewerOSD } from '@/components/SlideViewerOSD'
 import { TagInput } from '@/components/TagInput'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
+import { StatusBadge } from '@/components/ui/StatusBadge'
+import { TagChip } from '@/components/ui/TagChip'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
   Select,
@@ -322,19 +324,6 @@ export function SlideLibrary() {
   })
 
   const { sorted: sortedSlides, sortConfig, handleSort } = useSortable(filteredSlides)
-
-  const getStatusColor = (status?: string) => {
-    switch (status) {
-      case 'available':
-        return 'bg-green-500/10 text-green-700 hover:bg-green-500/20'
-      case 'in-analysis':
-        return 'bg-orange-500/10 text-orange-700 hover:bg-orange-500/20'
-      case 'archived':
-        return 'bg-gray-500/10 text-gray-700 hover:bg-gray-500/20'
-      default:
-        return 'bg-gray-500/10 text-gray-500'
-    }
-  }
 
   const openTagDialog = async (slide: Slide, e: React.MouseEvent) => {
     e.stopPropagation()
@@ -1067,9 +1056,7 @@ export function SlideLibrary() {
                   </TableCell>
                   <TableCell className="text-sm">{slide.year || '-'}</TableCell>
                   <TableCell>
-                    <Badge className={getStatusColor(slide.status)}>
-                      {slide.status || 'unknown'}
-                    </Badge>
+                    <StatusBadge status={slide.status || 'unknown'} />
                   </TableCell>
                   <TableCell onClick={(e) => e.stopPropagation()}>
                     <div className="flex items-center gap-1 flex-wrap">
@@ -1082,19 +1069,9 @@ export function SlideLibrary() {
                           ).map((tagName: string) => {
                             const tagInfo = availableTags.find(t => t.name === tagName)
                             return (
-                              <Badge
-                                key={tagName}
-                                variant="secondary"
-                                className="text-xs cursor-pointer hover:opacity-80"
-                                style={tagInfo?.color ? {
-                                  backgroundColor: `${tagInfo.color}20`,
-                                  color: tagInfo.color,
-                                  borderColor: tagInfo.color
-                                } : undefined}
-                                onClick={(e) => openTagDialog(slide, e)}
-                              >
-                                {tagName}
-                              </Badge>
+                              <span key={tagName} onClick={(e) => openTagDialog(slide, e)} className="cursor-pointer hover:opacity-80">
+                                <TagChip name={tagName} color={tagInfo?.color} />
+                              </span>
                             )
                           })}
                           {/* Show +N more button if there are more than 2 tags */}
@@ -1267,9 +1244,10 @@ export function SlideLibrary() {
                 <div className="col-span-2">
                   <label className="text-sm text-muted-foreground">Tags</label>
                   <div className="flex flex-wrap gap-2 mt-1">
-                    {selectedSlide.slide_tags.map((tag: string) => (
-                      <Badge key={tag} variant="secondary">{tag}</Badge>
-                    ))}
+                    {selectedSlide.slide_tags.map((tag: string) => {
+                      const tagInfo = availableTags.find(t => t.name === tag)
+                      return <TagChip key={tag} name={tag} color={tagInfo?.color} />
+                    })}
                   </div>
                 </div>
               )}

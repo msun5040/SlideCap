@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
-import { X, Plus } from 'lucide-react'
+import { Plus } from 'lucide-react'
 import { Input } from '@/components/ui/input'
-import { Badge } from '@/components/ui/badge'
+import { TagChip } from '@/components/ui/TagChip'
 import type { Tag } from '@/types/slide'
 
 import { getApiBase } from '@/api'
@@ -182,30 +182,12 @@ export function TagInput({ slideHash, currentTags, onTagsChange }: TagInputProps
           <span className="text-sm text-muted-foreground py-1">No tags yet</span>
         ) : (
           currentTags.map((tag) => (
-            <Badge
+            <TagChip
               key={tag.name}
-              variant="secondary"
-              className="gap-1 pr-1"
-              style={{
-                backgroundColor: tag.color ? `${tag.color}20` : undefined,
-                borderColor: tag.color || undefined,
-                borderWidth: tag.color ? 1 : undefined,
-              }}
-            >
-              {tag.color && (
-                <span
-                  className="w-2 h-2 rounded-full mr-1"
-                  style={{ backgroundColor: tag.color }}
-                />
-              )}
-              {tag.name}
-              <button
-                onClick={() => removeTag(tag.name)}
-                className="ml-1 hover:bg-destructive/20 rounded p-0.5"
-              >
-                <X className="h-3 w-3" />
-              </button>
-            </Badge>
+              name={tag.name}
+              color={tag.color}
+              onRemove={() => removeTag(tag.name)}
+            />
           ))
         )}
       </div>

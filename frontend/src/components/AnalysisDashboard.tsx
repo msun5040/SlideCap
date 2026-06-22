@@ -70,11 +70,12 @@ export function AnalysisDashboard() {
           <button
             key={tab.id}
             onClick={() => setSubView(tab.id)}
-            className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
+            className={`px-4 py-2 text-sm border-b-[3px] rounded-t-sm transition-colors ${
               subView === tab.id
-                ? 'border-primary text-foreground'
-                : 'border-transparent text-muted-foreground hover:text-foreground hover:border-muted-foreground/30'
+                ? 'font-semibold bg-selected-bg text-selected-foreground'
+                : 'font-medium border-transparent text-muted-foreground hover:text-foreground hover:border-muted-foreground/30'
             }`}
+            style={subView === tab.id ? { borderBottomColor: 'var(--selected-accent)' } : undefined}
           >
             {tab.label}
           </button>

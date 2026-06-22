@@ -321,12 +321,20 @@ export default function App() {
                 <button
                   key={item.id}
                   onClick={() => setCurrentView(item.id)}
-                  className={`flex w-full items-center gap-2.5 rounded-sm px-2.5 py-2 text-[13px] transition-all duration-150 ${
+                  className={`flex w-full items-center gap-2.5 px-2.5 py-2 text-[13px] font-medium transition-all duration-150 ${
                     isActive
-                      ? 'text-white bg-white/10'
-                      : 'hover:bg-white/5'
+                      ? 'rounded-r-sm'
+                      : 'rounded-sm hover:bg-white/5'
                   }`}
-                  style={{ color: isActive ? 'var(--sidebar-active)' : 'var(--sidebar-foreground)' }}
+                  style={
+                    isActive
+                      ? {
+                          color: 'var(--sidebar-active)',
+                          background: 'var(--selected-bg)',
+                          boxShadow: 'inset 3px 0 0 0 var(--selected-accent)',
+                        }
+                      : { color: 'var(--sidebar-foreground)' }
+                  }
                 >
                   <Icon className="h-4 w-4" style={isActive ? { color: 'var(--sidebar-accent)' } : {}} />
                   {item.label}

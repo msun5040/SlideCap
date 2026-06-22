@@ -2,6 +2,8 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Badge } from '@/components/ui/badge'
+import { StatusBadge as UIStatusBadge } from '@/components/ui/StatusBadge'
+import { TagChip } from '@/components/ui/TagChip'
 import {
   Microscope,
   FolderOpen,
@@ -108,19 +110,15 @@ function timeAgo(dateStr: string | null): string {
 }
 
 function StatusBadge({ status }: { status: string }) {
-  const variants: Record<string, { class: string; icon: React.ReactNode }> = {
-    completed: { class: 'bg-green-100 text-green-800', icon: <CheckCircle className="h-3 w-3" /> },
-    failed: { class: 'bg-red-100 text-red-800', icon: <XCircle className="h-3 w-3" /> },
-    running: { class: 'bg-blue-100 text-blue-800', icon: <Loader2 className="h-3 w-3 animate-spin" /> },
-    pending: { class: 'bg-yellow-100 text-yellow-800', icon: <Clock className="h-3 w-3" /> },
-    transferring: { class: 'bg-purple-100 text-purple-800', icon: <ArrowRightLeft className="h-3 w-3" /> },
+  // Direction A: shared tone system; keep per-status icons in place of the dot.
+  const icons: Record<string, React.ReactNode> = {
+    completed: <CheckCircle className="h-3 w-3" />,
+    failed: <XCircle className="h-3 w-3" />,
+    running: <Loader2 className="h-3 w-3 animate-spin" />,
+    pending: <Clock className="h-3 w-3" />,
+    transferring: <ArrowRightLeft className="h-3 w-3" />,
   }
-  const v = variants[status] || variants.pending
-  return (
-    <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium ${v.class}`}>
-      {v.icon} {status}
-    </span>
-  )
+  return <UIStatusBadge status={status} icon={icons[status]} />
 }
 
 interface DashboardProps {
@@ -362,16 +360,7 @@ export function Dashboard({ onSortStarted, sortStatus }: DashboardProps) {
                 <span className="font-medium">Tags on sort:</span>
               </div>
               {stagingTags.map(t => (
-                <span
-                  key={t.name}
-                  className="inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-medium text-white"
-                  style={{ backgroundColor: t.color }}
-                >
-                  {t.name}
-                  <button onClick={() => removeStagingTag(t.name)} className="hover:opacity-70">
-                    <X className="h-3 w-3" />
-                  </button>
-                </span>
+                <TagChip key={t.name} name={t.name} color={t.color} onRemove={() => removeStagingTag(t.name)} />
               ))}
               {showStagingTagInput ? (
                 <div className="relative">
@@ -435,7 +424,7 @@ export function Dashboard({ onSortStarted, sortStatus }: DashboardProps) {
                           className="w-full text-left px-3 py-1.5 text-sm hover:bg-muted flex items-center gap-2"
                           onMouseDown={e => { e.preventDefault(); addStagingTag(tag.name, tag.color || stagingTagColor) }}
                         >
-                          <span className="w-3 h-3 rounded-full shrink-0" style={{ backgroundColor: tag.color || '#6B7280' }} />
+                          <span className="w-3 h-3 rounded-[2px] shrink-0" style={{ backgroundColor: tag.color || '#6B7280' }} />
                           {tag.name}
                           {tag.slide_count != null && (
                             <span className="text-xs text-muted-foreground ml-auto">{tag.slide_count} slides</span>
@@ -545,13 +534,7 @@ export function Dashboard({ onSortStarted, sortStatus }: DashboardProps) {
                     <>
                       <TagIcon className="h-3.5 w-3.5 text-muted-foreground" />
                       {stagingTags.map(t => (
-                        <span
-                          key={t.name}
-                          className="inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium text-white"
-                          style={{ backgroundColor: t.color }}
-                        >
-                          {t.name}
-                        </span>
+                        <TagChip key={t.name} name={t.name} color={t.color} />
                       ))}
                     </>
                   )}

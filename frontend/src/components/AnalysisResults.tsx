@@ -21,6 +21,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
+import { StatusBadge } from '@/components/ui/StatusBadge'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
   Dialog,
@@ -677,21 +678,8 @@ export function AnalysisResults() {
 
   // ---------- Status badge helper ----------
 
-  const statusBadge = (status: string) => {
-    const colors: Record<string, string> = {
-      completed: 'bg-green-500/10 text-green-700',
-      running: 'bg-blue-500/10 text-blue-700',
-      pending: 'bg-yellow-500/10 text-yellow-700',
-      failed: 'bg-red-500/10 text-red-700',
-      submitted: 'bg-purple-500/10 text-purple-700',
-      transferring: 'bg-cyan-500/10 text-cyan-700',
-    }
-    return (
-      <Badge variant="outline" className={colors[status] || ''}>
-        {status}
-      </Badge>
-    )
-  }
+  const statusBadge = (status: string) => <StatusBadge status={status} />
+
 
   // ---------- Render file tree (recursive) ----------
 
