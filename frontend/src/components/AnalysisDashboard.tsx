@@ -2,14 +2,16 @@ import { useState, useEffect, useRef } from 'react'
 import { ClusterConnect } from '@/components/ClusterConnect'
 import { AnalysisRegistry } from '@/components/AnalysisRegistry'
 import { AnalysisSubmit } from '@/components/AnalysisSubmit'
+import { AnalysisQC } from '@/components/AnalysisQC'
 import { AnalysisInstrument } from '@/components/AnalysisInstrument'
 import { AnalysisResults } from '@/components/AnalysisResults'
 
-type SubView = 'registry' | 'submit' | 'jobs' | 'results'
+type SubView = 'registry' | 'submit' | 'qc' | 'jobs' | 'results'
 
 const tabs: { id: SubView; label: string }[] = [
   { id: 'registry', label: 'Registry' },
   { id: 'submit', label: 'Submit' },
+  { id: 'qc', label: 'QC & Submit' },
   { id: 'jobs', label: 'Jobs' },
   { id: 'results', label: 'Results' },
 ]
@@ -85,6 +87,7 @@ export function AnalysisDashboard() {
       {/* Tab content */}
       {subView === 'registry' && <AnalysisRegistry />}
       {subView === 'submit' && <AnalysisSubmit clusterConnected={clusterConnected} />}
+      {subView === 'qc' && <AnalysisQC clusterConnected={clusterConnected} />}
       {subView === 'jobs' && <AnalysisInstrument />}
       {subView === 'results' && <AnalysisResults />}
     </div>
