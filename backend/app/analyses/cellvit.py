@@ -41,18 +41,39 @@ _SNAPPY_STREAM_MAGIC = b"\xff\x06\x00\x00sNaPpY"
     "Decompress Snappy-compressed bytes (raw block or stream/framing format — auto-detected)",
 )
 def _decompress_snappy(data: bytes) -> bytes:
-    import snappy
-
     # Stream/framing format ("snappy framed") starts with this 10-byte magic.
     # That's what most language libraries produce when they want a
     # self-delimiting file (the format Hadoop and SnappyOutputStream use).
-    if data.startswith(_SNAPPY_STREAM_MAGIC):
-        out = io.BytesIO()
-        snappy.stream_decompress(io.BytesIO(data), out)
-        return out.getvalue()
+    framed = data.startswith(_SNAPPY_STREAM_MAGIC)
+    errors = []
 
-    # Otherwise assume raw block format (one compressed chunk, no framing).
-    return snappy.decompress(data)
+    # Prefer cramjam — a pure prebuilt wheel that installs cleanly on Windows,
+    # macOS and Linux with no native snappy C library (python-snappy needs one,
+    # which routinely breaks Windows deployments).
+    try:
+        import cramjam
+        if framed:
+            return bytes(cramjam.snappy.decompress(data))
+        return bytes(cramjam.snappy.decompress_raw(data))
+    except Exception as e:  # not installed, or API/format mismatch — try the next
+        errors.append(f"cramjam: {e}")
+
+    # Fall back to python-snappy if it's available.
+    try:
+        import snappy
+        if framed:
+            out = io.BytesIO()
+            snappy.stream_decompress(io.BytesIO(data), out)
+            return out.getvalue()
+        return snappy.decompress(data)
+    except Exception as e:
+        errors.append(f"python-snappy: {e}")
+
+    raise RuntimeError(
+        "Snappy decompression is unavailable in this environment. Install the "
+        "'cramjam' package (recommended — has prebuilt Windows wheels): "
+        "pip install cramjam.  Tried: " + "; ".join(errors)
+    )
 
 
 @CELLVIT.register_op(
@@ -65,8 +86,14 @@ def _fix_geojson_geometry(data: bytes) -> bytes:
     Mirrors the logic in scripts/postprocess_cellvit.py so on-demand transforms
     behave identically to the script-based pipeline.
     """
-    from shapely import from_geojson, to_geojson
-    from shapely.validation import make_valid
+    # shapely is optional: if it isn't installed, skip geometry repair and serve
+    # the GeoJSON as-is rather than failing the whole overlay with a 500. Most
+    # CellViT polygons are already valid; the repair is a best-effort cleanup.
+    try:
+        from shapely import from_geojson, to_geojson
+        from shapely.validation import make_valid
+    except Exception:
+        return data
 
     try:
         doc = json.loads(data)
