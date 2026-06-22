@@ -839,6 +839,7 @@ class JobStatusPoller:
         # Set per-slide log_tail and compute+cache cell_stats
         import ast as _ast
         import json as _json
+        full_log_tail = full_log[-4000:] if run_log_src.exists() else ""
         for js in group:
             if js.filename:
                 stem = Path(js.filename).stem
@@ -849,6 +850,11 @@ class JobStatusPoller:
                     stats = self._extract_cell_stats_from_text(section)
                     if stats:
                         js.cell_stats = _json.dumps(stats)
+                elif js.status == "failed" and full_log_tail:
+                    # No per-slide section (e.g. the script died before printing its
+                    # "Processing WSI:" marker). Keep the tail of the whole run.log so
+                    # the failure is still debuggable after the cluster dir is cleaned up.
+                    js.log_tail = full_log_tail
 
         # Cleanup: remove staging dir and cluster output dir
         shutil.rmtree(staging_dir, ignore_errors=True)

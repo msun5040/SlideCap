@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useMemo } from 'react'
 import {
   Loader2, Clock, AlertTriangle, CheckCircle2, X, RefreshCw, RotateCw,
-  Upload, Cpu, Sparkles, PackageCheck, Check, Layers,
+  Upload, Cpu, Sparkles, PackageCheck, Check, Layers, ChevronRight, ChevronDown,
 } from 'lucide-react'
 import { signalClusterDisconnected } from '@/components/ClusterConnect'
 import { getApiBase, isDemo } from '@/api'
@@ -17,6 +17,7 @@ interface DetailSlide {
   gpu_index?: number | null
   status: string
   error_message?: string | null
+  log_tail?: string | null
 }
 type JobDetail = Omit<AnalysisJob, 'slides'> & {
   throughput_per_min?: number | null
@@ -137,7 +138,14 @@ export function AnalysisInstrument() {
   const [detail, setDetail] = useState<JobDetail | null>(null)
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [retrying, setRetrying] = useState(false)
+  const [expandedFails, setExpandedFails] = useState<Set<number>>(new Set())
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
+  const toggleFail = (id: number) => setExpandedFails(prev => {
+    const next = new Set(prev)
+    next.has(id) ? next.delete(id) : next.add(id)
+    return next
+  })
 
   // ── Fetching ─────────────────────────────────────────────────────────
   const fetchJobs = async () => {
@@ -435,15 +443,47 @@ export function AnalysisInstrument() {
                       </button>
                     )}
                   </div>
-                  {failedSlides.map(s => (
-                    <div key={s.id} className="flex items-center gap-3 px-4 py-2 text-xs border-b border-red-100 last:border-0">
-                      <span className="font-mono">{s.slide_id || '—'}</span>
-                      <span className="font-mono text-muted-foreground">
-                        {s.accession_number || '—'}{s.block_id ? ` · ${s.block_id}` : ''}
-                      </span>
-                      <span className="text-muted-foreground truncate ml-auto text-right">{s.error_message || 'failed'}</span>
-                    </div>
-                  ))}
+                  {failedSlides.map(s => {
+                    const open = expandedFails.has(s.id)
+                    const hasDetail = !!(s.log_tail || s.error_message)
+                    return (
+                      <div key={s.id} className="border-b border-red-100 last:border-0">
+                        <button
+                          type="button"
+                          onClick={() => hasDetail && toggleFail(s.id)}
+                          className={`w-full flex items-center gap-3 px-4 py-2 text-xs text-left ${hasDetail ? 'hover:bg-red-100/40' : 'cursor-default'}`}
+                        >
+                          {hasDetail
+                            ? (open ? <ChevronDown className="h-3.5 w-3.5 shrink-0 text-red-500" /> : <ChevronRight className="h-3.5 w-3.5 shrink-0 text-red-500" />)
+                            : <span className="w-3.5 shrink-0" />}
+                          <span className="font-mono">{s.slide_id || '—'}</span>
+                          <span className="font-mono text-muted-foreground">
+                            {s.accession_number || '—'}{s.block_id ? ` · ${s.block_id}` : ''}
+                          </span>
+                          <span className="text-muted-foreground truncate ml-auto text-right">{s.error_message || 'failed'}</span>
+                        </button>
+                        {open && (
+                          <div className="px-4 pb-3 pt-1 space-y-2">
+                            {s.error_message && (
+                              <div className="text-[11px] text-red-700">
+                                <span className="font-semibold">Error: </span>{s.error_message}
+                              </div>
+                            )}
+                            {s.log_tail ? (
+                              <pre className="max-h-72 overflow-auto rounded bg-zinc-900 text-zinc-100 text-[11px] leading-relaxed font-mono p-3 whitespace-pre-wrap break-words">
+                                {s.log_tail}
+                              </pre>
+                            ) : (
+                              <p className="text-[11px] text-muted-foreground italic">
+                                No captured script log for this slide. The run.log section may have been
+                                empty or cleaned up — check the cluster output dir before it's removed.
+                              </p>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
                 </div>
               )}
               <div className="h-4" />
