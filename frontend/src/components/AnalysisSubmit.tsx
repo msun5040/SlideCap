@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useMemo } from 'react'
 import {
   Search, Send, Users, AlertTriangle, Loader2, CheckCircle, XCircle,
   ChevronDown, ChevronRight, Tag, Hash, Stethoscope, FolderOpen, Microscope,
-  FileText, Play, Flag, Clock,
+  FileText, Play, Flag, Clock, ShieldCheck,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -49,6 +49,17 @@ interface SlideAnalysisEntry {
   analysis_name: string
 }
 
+interface QCResult {
+  status: 'pass' | 'warn' | 'fail' | 'unchecked'
+  auto_status?: string | null
+  manual_status?: string | null
+  manual_note?: string | null
+  manual_by?: string | null
+  metrics?: { tissue_pct?: number | null; mpp?: number | null; width?: number; height?: number; magnification?: number | null } | null
+  checks?: { name: string; status: string; detail: string }[] | null
+  checked_at?: string | null
+}
+
 // Global tag used to mark a slide as "flagged" from the Cohort view.
 const SLIDE_FLAG_TAG = 'flagged'
 
@@ -84,6 +95,10 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
   // Per-slide analysis history + cohort flags, shown as badges in the drill-down
   const [slideAnalysisStatus, setSlideAnalysisStatus] = useState<Record<string, Record<string, SlideAnalysisEntry>>>({})
   const [cohortFlags, setCohortFlags] = useState<CohortFlag[]>([])
+  // Per-slide QC status (pre-flight quality control), keyed by slide_hash
+  const [qcStatus, setQcStatus] = useState<Record<string, QCResult>>({})
+  const [runningQc, setRunningQc] = useState(false)
+  const [qcMenuFor, setQcMenuFor] = useState<string | null>(null)
 
   // ── Tag/Flag mode ────────────────────────────────────────────────────
   const [tags, setTags] = useState<TagInfo[]>([])
@@ -168,6 +183,7 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
       setCohortPatients([])
       setSlideAnalysisStatus({})
       setCohortFlags([])
+      setQcStatus({})
       return
     }
     const load = async () => {
@@ -194,6 +210,7 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
           setSlideAnalysisStatus(data.slides || {})
         }
         if (flagsRes.ok) setCohortFlags(await flagsRes.json())
+        // QC badges are loaded by a separate effect (chunked, hash-keyed).
       } catch (e) { console.error(e) }
       finally { setLoadingCohortDetail(false) }
     }
@@ -202,6 +219,18 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
     setExpandedPatients(new Set())
     setExpandedCases(new Set())
   }, [selectedCohortId])
+
+  // Fetch cached QC whenever the cohort's slide set changes (chunked — cohorts
+  // can have many slides and /qc is hash-keyed via the query string).
+  useEffect(() => {
+    if (!cohortDetail || cohortDetail.slides.length === 0) { setQcStatus({}); return }
+    let cancelled = false
+    ;(async () => {
+      const merged = await fetchQcFor(cohortDetail.slides.map(s => s.slide_hash))
+      if (!cancelled) setQcStatus(merged)
+    })()
+    return () => { cancelled = true }
+  }, [cohortDetail])
 
   // Fetch tag slides when tag selected
   useEffect(() => {
@@ -485,6 +514,82 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
     setStep(2)
   }
 
+  // ── QC helpers ───────────────────────────────────────────────────────
+  // Fetch cached QC for many hashes, chunked to keep the GET URL bounded.
+  const fetchQcFor = async (hashes: string[]): Promise<Record<string, QCResult>> => {
+    const merged: Record<string, QCResult> = {}
+    for (let i = 0; i < hashes.length; i += 100) {
+      const batch = hashes.slice(i, i + 100)
+      try {
+        const res = await fetch(`${getApiBase()}/qc?slide_hashes=${batch.map(encodeURIComponent).join(',')}`)
+        if (res.ok) {
+          const data = await res.json()
+          Object.assign(merged, data.results || {})
+        }
+      } catch (e) { console.error('QC fetch failed', e) }
+    }
+    return merged
+  }
+
+  // Run automated QC on every slide in the loaded cohort, then refresh badges.
+  const runCohortQc = async () => {
+    if (!cohortDetail || runningQc) return
+    setRunningQc(true)
+    try {
+      const hashes = cohortDetail.slides.map(s => s.slide_hash)
+      for (let i = 0; i < hashes.length; i += 100) {
+        const batch = hashes.slice(i, i + 100)
+        await fetch(`${getApiBase()}/qc/run`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ slide_hashes: batch }),
+        })
+      }
+      setQcStatus(await fetchQcFor(hashes))
+    } catch (e) { console.error('Run QC failed', e) }
+    finally { setRunningQc(false) }
+  }
+
+  // Human override: mark a slide pass/fail, or clear (status=null).
+  const setManualQc = async (slideHash: string, status: 'pass' | 'fail' | null) => {
+    setQcMenuFor(null)
+    try {
+      const res = await fetch(`${getApiBase()}/qc/manual`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ slide_hash: slideHash, status }),
+      })
+      if (res.ok) {
+        const updated: QCResult = await res.json()
+        setQcStatus(prev => ({ ...prev, [slideHash]: updated }))
+      }
+    } catch (e) { console.error('Manual QC failed', e) }
+  }
+
+  const qcTone = (status?: string) => (
+    status === 'pass' ? { dot: 'bg-emerald-500', text: 'text-emerald-700', label: 'QC pass' } :
+    status === 'warn' ? { dot: 'bg-amber-500', text: 'text-amber-700', label: 'QC warn' } :
+    status === 'fail' ? { dot: 'bg-red-500', text: 'text-red-700', label: 'QC fail' } :
+    { dot: 'bg-gray-300', text: 'text-muted-foreground', label: 'QC ?' }
+  )
+
+  const qcTooltip = (q?: QCResult): string => {
+    if (!q) return 'Not QC-checked'
+    const parts: string[] = []
+    if (q.manual_status) parts.push(`manual: ${q.manual_status}`)
+    if (q.metrics?.tissue_pct != null) parts.push(`tissue ${q.metrics.tissue_pct}%`)
+    if (q.metrics?.mpp != null) parts.push(`mpp ${q.metrics.mpp}`)
+    for (const c of q.checks || []) if (c.status !== 'pass') parts.push(`${c.name}: ${c.detail}`)
+    return parts.length ? parts.join(' · ') : 'QC passed'
+  }
+
+  // Count of currently-selected slides whose effective QC status is "fail".
+  const qcFailedSelectedCount = useMemo(() => {
+    let n = 0
+    for (const h of cohortSelectedHashes) if (qcStatus[h]?.status === 'fail') n++
+    return n
+  }, [cohortSelectedHashes, qcStatus])
+
   // A single slide row inside the cohort drill-down (deepest level).
   const renderCohortSlideRow = (s: CohortSlide) => {
     const statusMap = slideAnalysisStatus[s.slide_hash]
@@ -502,6 +607,33 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
         <Microscope className="h-3 w-3 shrink-0 text-muted-foreground" />
         <span className="text-xs font-mono truncate max-w-[160px]">{displaySlide(s)}</span>
         <span className="text-[10px] text-muted-foreground shrink-0">{s.stain_type}</span>
+
+        {/* QC badge — click to set a manual override */}
+        {(() => {
+          const q = qcStatus[s.slide_hash]
+          const tone = qcTone(q?.status)
+          const open = qcMenuFor === s.slide_hash
+          return (
+            <span className="relative shrink-0">
+              <button
+                type="button"
+                onClick={() => setQcMenuFor(open ? null : s.slide_hash)}
+                title={qcTooltip(q)}
+                className={`inline-flex items-center gap-1 rounded-sm border border-border bg-card px-1.5 h-5 text-[10px] ${tone.text} hover:bg-muted/60`}
+              >
+                <span className={`h-2 w-2 rounded-full ${tone.dot}`} />
+                {q?.manual_status ? `${tone.label}*` : tone.label}
+              </button>
+              {open && (
+                <div className="absolute z-20 mt-1 left-0 w-28 rounded-md border bg-popover shadow-md text-[11px] py-1">
+                  <button className="block w-full text-left px-2 py-1 hover:bg-muted" onClick={() => setManualQc(s.slide_hash, 'pass')}>Mark pass</button>
+                  <button className="block w-full text-left px-2 py-1 hover:bg-muted" onClick={() => setManualQc(s.slide_hash, 'fail')}>Mark fail</button>
+                  <button className="block w-full text-left px-2 py-1 hover:bg-muted text-muted-foreground" onClick={() => setManualQc(s.slide_hash, null)}>Clear override</button>
+                </div>
+              )}
+            </span>
+          )
+        })()}
 
         {/* Analyses already run + flags */}
         <div className="flex items-center gap-1 flex-wrap min-w-0 flex-1">
@@ -1045,6 +1177,28 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
                             Select slides
                           </button>
                         </div>
+
+                        {/* QC toolbar — run pre-flight checks + show fail count */}
+                        <div className="ml-auto flex items-center gap-3">
+                          {Object.keys(qcStatus).length > 0 && (() => {
+                            const vals = Object.values(qcStatus)
+                            const pass = vals.filter(q => q.status === 'pass').length
+                            const warn = vals.filter(q => q.status === 'warn').length
+                            const fail = vals.filter(q => q.status === 'fail').length
+                            return (
+                              <span className="text-xs text-muted-foreground flex items-center gap-2">
+                                <span className="text-emerald-700">{pass} pass</span>
+                                {warn > 0 && <span className="text-amber-700">{warn} warn</span>}
+                                {fail > 0 && <span className="text-red-700">{fail} fail</span>}
+                              </span>
+                            )
+                          })()}
+                          <Button variant="outline" size="sm" onClick={runCohortQc} disabled={runningQc}>
+                            {runningQc
+                              ? <><Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" /> Running QC…</>
+                              : <><ShieldCheck className="mr-2 h-3.5 w-3.5" /> Run QC</>}
+                          </Button>
+                        </div>
                       </div>
 
                       {patientSelectMode === 'specific' && (
@@ -1365,6 +1519,17 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
                   )}
                 </>
               )}
+            </div>
+          )}
+
+          {/* Soft QC gate: warn (don't block) if QC-failed slides are selected */}
+          {mode === 'cohort' && qcFailedSelectedCount > 0 && (
+            <div className="flex items-center gap-2 p-3 rounded-lg bg-red-500/10 text-red-700 border border-red-300 text-sm">
+              <AlertTriangle className="h-4 w-4 shrink-0" />
+              <span>
+                {qcFailedSelectedCount} selected slide{qcFailedSelectedCount !== 1 ? 's' : ''} failed QC —
+                they'll likely fail on the cluster. You can deselect them, or proceed anyway.
+              </span>
             </div>
           )}
 
