@@ -7,7 +7,6 @@ import { SlideViewerOSD } from '@/components/SlideViewerOSD'
 import { TagInput } from '@/components/TagInput'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
-import { StatusBadge } from '@/components/ui/StatusBadge'
 import { TagChip } from '@/components/ui/TagChip'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
@@ -988,9 +987,9 @@ export function SlideLibrary() {
         )}
       </div>
 
-      <div className="rounded-lg border">
-        <Table>
-          <TableHeader>
+      <div className="rounded-lg border overflow-hidden">
+        <Table containerClassName="h-[calc(100vh-300px)] min-h-[280px]">
+          <TableHeader className="sticky top-0 z-10 [&_th]:bg-muted/95 [&_th]:backdrop-blur-sm [&_tr]:border-b shadow-[0_1px_0_0_var(--border)]">
             <TableRow>
               <TableHead className="w-12.5">
                 <Checkbox
@@ -1003,9 +1002,9 @@ export function SlideLibrary() {
               <TableHead><SortableHeader label="Slide #" sortKey="slide_number" sortConfig={sortConfig} onSort={handleSort} /></TableHead>
               <TableHead><SortableHeader label="Stain" sortKey="stain_type" sortConfig={sortConfig} onSort={handleSort} /></TableHead>
               <TableHead><SortableHeader label="Year" sortKey="year" sortConfig={sortConfig} onSort={handleSort} /></TableHead>
-              <TableHead><SortableHeader label="Status" sortKey="status" sortConfig={sortConfig} onSort={handleSort} /></TableHead>
               <TableHead>Tags</TableHead>
               <TableHead>Analyses</TableHead>
+              <TableHead className="w-12 text-right" />
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -1050,14 +1049,11 @@ export function SlideLibrary() {
                   <TableCell className="text-sm">{slide.block_id}</TableCell>
                   <TableCell className="text-sm">{slide.slide_number}</TableCell>
                   <TableCell>
-                    <Badge variant="outline" className="text-xs">
+                    <span className="inline-flex items-center h-[21px] px-2 rounded-sm border border-border font-mono text-[11px] font-medium text-foreground">
                       {slide.stain_type}
-                    </Badge>
+                    </span>
                   </TableCell>
                   <TableCell className="text-sm">{slide.year || '-'}</TableCell>
-                  <TableCell>
-                    <StatusBadge status={slide.status || 'unknown'} />
-                  </TableCell>
                   <TableCell onClick={(e) => e.stopPropagation()}>
                     <div className="flex items-center gap-1 flex-wrap">
                       {slide.slide_tags && slide.slide_tags.length > 0 ? (
@@ -1129,6 +1125,17 @@ export function SlideLibrary() {
                         <span className="text-xs text-muted-foreground">-</span>
                       )}
                     </div>
+                  </TableCell>
+                  <TableCell className="text-right" onClick={(e) => e.stopPropagation()}>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-7 w-7 text-muted-foreground hover:text-foreground"
+                      title="View slide"
+                      onClick={() => { setSelectedSlide(slide); setIsViewerOpen(true) }}
+                    >
+                      <Eye className="h-4 w-4" />
+                    </Button>
                   </TableCell>
                 </TableRow>
               ))
