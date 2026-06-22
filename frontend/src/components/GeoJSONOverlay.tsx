@@ -326,7 +326,6 @@ export function GeoJSONOverlay({ viewer, spec, onFieldsDetected, onClassesDetect
       <canvas
         ref={canvasRef}
         className="absolute inset-0 pointer-events-none"
-        style={{ mixBlendMode: 'multiply' }}
       />
       {errorMsg && (
         <div className="absolute top-4 right-4 bg-red-500/20 border border-red-500 text-red-200 px-3 py-1.5 rounded text-xs z-30">
