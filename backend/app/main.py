@@ -5056,15 +5056,13 @@ def list_result_files(
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    # Determine output directory (prefer local path if available)
+    # Determine output directory — _resolve_job_slide_output re-anchors stored
+    # paths under the current NETWORK_ROOT (handles host migration).
     output_dir = None
     if slide_hash:
         js = next((js for js in job.slides if js.slide and js.slide.slide_hash == slide_hash), None)
         if js:
-            if js.local_output_path:
-                output_dir = Path(js.local_output_path)
-            elif js.remote_output_path:
-                output_dir = Path(js.remote_output_path)
+            output_dir = _resolve_job_slide_output(js)
     elif job.output_path:
         output_dir = Path(job.output_path)
 
@@ -5101,15 +5099,13 @@ def get_result_file(
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    # Determine output directory (prefer local path if available)
+    # Determine output directory — _resolve_job_slide_output re-anchors stored
+    # paths under the current NETWORK_ROOT (handles host migration).
     output_dir = None
     if slide_hash:
         js = next((js for js in job.slides if js.slide and js.slide.slide_hash == slide_hash), None)
         if js:
-            if js.local_output_path:
-                output_dir = Path(js.local_output_path)
-            elif js.remote_output_path:
-                output_dir = Path(js.remote_output_path)
+            output_dir = _resolve_job_slide_output(js)
     elif job.output_path:
         output_dir = Path(job.output_path)
 
@@ -5218,11 +5214,12 @@ def render_result(
     js = next((js for js in job.slides if js.slide and js.slide.slide_hash == slide_hash), None)
     if not js:
         raise HTTPException(status_code=404, detail=f"Slide {slide_hash} not in job {job_id}")
-    output_dir = Path(js.local_output_path or js.remote_output_path or "")
+    # Re-anchor under the current NETWORK_ROOT (handles host migration).
+    output_dir = _resolve_job_slide_output(js)
     if not output_dir or not output_dir.exists():
         raise HTTPException(
             status_code=404,
-            detail=f"No local output dir for slide {slide_hash} (path: {output_dir or '<unset>'})",
+            detail=f"No local output dir for slide {slide_hash}",
         )
     # `filename` is the WSI name as recorded by the cluster runner; strip its
     # extension to get the stem that UNI uses for all its sibling files.
