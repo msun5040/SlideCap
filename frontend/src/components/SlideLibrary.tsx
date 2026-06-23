@@ -97,6 +97,27 @@ export function SlideLibrary() {
   const [isDeletingTag, setIsDeletingTag] = useState<number | null>(null)
   const [expandedSlideTags, setExpandedSlideTags] = useState<Set<string>>(new Set())
   const [colorPickerForTag, setColorPickerForTag] = useState<number | null>(null)
+  // Slides whose QC verdict is 'fail' (manual or auto) — shown as a small marker.
+  const [qcFailHashes, setQcFailHashes] = useState<Set<string>>(new Set())
+
+  // Fetch cached QC for the given slides and record which failed (chunked).
+  const loadQcFail = async (hashes: string[]) => {
+    if (hashes.length === 0) { setQcFailHashes(new Set()); return }
+    const fails = new Set<string>()
+    for (let i = 0; i < hashes.length; i += 100) {
+      const batch = hashes.slice(i, i + 100)
+      try {
+        const res = await fetch(`${getApiBase()}/qc?slide_hashes=${batch.map(encodeURIComponent).join(',')}`)
+        if (res.ok) {
+          const data = await res.json()
+          for (const [h, q] of Object.entries(data.results || {})) {
+            if ((q as { status?: string }).status === 'fail') fails.add(h)
+          }
+        }
+      } catch (e) { console.error('QC fetch failed', e) }
+    }
+    setQcFailHashes(fails)
+  }
 
   // Download with analysis state
   const [isJobPickerOpen, setIsJobPickerOpen] = useState(false)
@@ -267,6 +288,7 @@ export function SlideLibrary() {
           const data = await response.json()
           setSlides(data.results)
           setResultsTruncated(data.truncated || false)
+          loadQcFail((data.results || []).map((s: Slide) => s.slide_hash))
         }
       } else {
         // Multiple comma-separated accessions
@@ -292,6 +314,7 @@ export function SlideLibrary() {
         }
         setSlides(allResults)
         setResultsTruncated(false)
+        loadQcFail(allResults.map(s => s.slide_hash))
       }
     } catch (error) {
       console.error('Search error:', error)
@@ -1039,6 +1062,14 @@ export function SlideLibrary() {
                       {slide.request_sheets && slide.request_sheets.length > 0 && (
                         <span className="inline-flex items-center rounded px-1 py-0.5 text-[9px] font-medium bg-violet-100 text-violet-700 dark:bg-violet-900 dark:text-violet-300 whitespace-nowrap" title={slide.request_sheets.map(rs => rs.sheet_name).join(', ')}>
                           REQ
+                        </span>
+                      )}
+                      {qcFailHashes.has(slide.slide_hash) && (
+                        <span
+                          className="inline-flex items-center gap-0.5 rounded px-1 py-0.5 text-[9px] font-semibold bg-red-100 text-red-700 dark:bg-red-950 dark:text-red-300 whitespace-nowrap"
+                          title="Failed QC"
+                        >
+                          QC✗
                         </span>
                       )}
                     </div>

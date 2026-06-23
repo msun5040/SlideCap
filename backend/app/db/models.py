@@ -549,8 +549,13 @@ class JobSlide(Base):
     log_tail = Column(Text)                   # Last ~50 lines of progress log
     cell_stats = Column(Text)                 # Cached JSON of parsed cell statistics
 
+    # Live per-slide progress, read from the analysis's <stem>.progress JSON file
+    # during the run (optional; only set when the analysis writes one).
+    progress_pct = Column(Integer)            # 0–100, in-flight percent
+    progress_stage = Column(String(40))       # e.g. starting | inference | postprocessing
+
     # Status tracking
-    status = Column(String(20), default='pending')  # pending, transferring, running, completed, failed
+    status = Column(String(20), default='pending')  # pending, transferring, queued, running, completed, failed, ignored
     started_at = Column(DateTime)
     completed_at = Column(DateTime)
     error_message = Column(String(1000))
@@ -955,6 +960,8 @@ def _migrate_analysis_jobs(engine):
                 'filename': "ALTER TABLE job_slides ADD COLUMN filename VARCHAR(500)",
                 'cell_stats': "ALTER TABLE job_slides ADD COLUMN cell_stats TEXT",
                 'gpu_index': "ALTER TABLE job_slides ADD COLUMN gpu_index INTEGER",
+                'progress_pct': "ALTER TABLE job_slides ADD COLUMN progress_pct INTEGER",
+                'progress_stage': "ALTER TABLE job_slides ADD COLUMN progress_stage VARCHAR(40)",
             }
 
             with engine.connect() as conn:

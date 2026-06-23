@@ -39,7 +39,6 @@ export function AnalysisRegistry() {
   const [formWorkingDir, setFormWorkingDir] = useState('')
   const [formEnvSetup, setFormEnvSetup] = useState('')
   const [formCommandTemplate, setFormCommandTemplate] = useState('')
-  const [formPostprocessTemplate, setFormPostprocessTemplate] = useState('')
   const [formExecutionMode, setFormExecutionMode] = useState<'batch' | 'sharded'>('batch')
   const [formDoneGlob, setFormDoneGlob] = useState('')
   const [formMaxGpus, setFormMaxGpus] = useState(0)
@@ -83,7 +82,6 @@ export function AnalysisRegistry() {
     setFormWorkingDir('')
     setFormEnvSetup('')
     setFormCommandTemplate('')
-    setFormPostprocessTemplate('')
     setFormExecutionMode('batch')
     setFormDoneGlob('')
     setFormMaxGpus(0)
@@ -110,7 +108,6 @@ export function AnalysisRegistry() {
     setFormWorkingDir(analysis.working_directory || '')
     setFormEnvSetup(analysis.env_setup || '')
     setFormCommandTemplate(analysis.command_template || '')
-    setFormPostprocessTemplate(analysis.postprocess_template || '')
     setFormExecutionMode(analysis.execution_mode === 'sharded' ? 'sharded' : 'batch')
     setFormDoneGlob(analysis.done_glob || '')
     setFormMaxGpus(analysis.max_parallel_gpus || 0)
@@ -136,7 +133,6 @@ export function AnalysisRegistry() {
         working_directory: formWorkingDir || undefined,
         env_setup: formEnvSetup || undefined,
         command_template: formCommandTemplate || undefined,
-        postprocess_template: formPostprocessTemplate || undefined,
         execution_mode: formExecutionMode,
         done_glob: formDoneGlob || undefined,
         max_parallel_gpus: formMaxGpus,
@@ -401,19 +397,6 @@ export function AnalysisRegistry() {
               />
               <p className="text-xs text-muted-foreground">
                 Available placeholders: {'{wsi_path}'}, {'{wsi_dir}'}, {'{outdir}'}, {'{gpu}'}, {'{batch_size}'}, {'{model_path}'}
-              </p>
-            </div>
-
-            <div className="space-y-2">
-              <label className="text-sm font-medium">Post-processing Command</label>
-              <textarea
-                className="w-full rounded-md border bg-background px-3 py-2 text-sm font-mono min-h-[60px]"
-                placeholder="python /path/to/postprocess.py --input-dir {input_dir} --output-dir {output_dir}"
-                value={formPostprocessTemplate}
-                onChange={(e) => setFormPostprocessTemplate(e.target.value)}
-              />
-              <p className="text-xs text-muted-foreground">
-                Legacy: shell command applied at ZIP-export time. Placeholders: {'{input_dir}'}, {'{output_dir}'}, {'{filename_stem}'}. Prefer the safer Read-time Transforms below.
               </p>
             </div>
 

@@ -2894,8 +2894,11 @@ def export_cohort_analyses(
     if not cohort:
         raise HTTPException(status_code=404, detail="Cohort not found")
 
-    # Collect (output_dir, archive_prefix, postprocess_template) for each completed slide analysis
-    export_items: list[tuple[Path, str, str | None]] = []
+    # Collect (output_dir, archive_prefix, kind_id, transforms_json) per completed
+    # slide analysis. Files are run through the analysis's read-time transforms at
+    # zip time (decompress/geometry-fix) — same pipeline overlays use — so the ZIP
+    # is cross-platform and we no longer shell out to a per-analysis postprocess script.
+    export_items: list[tuple[Path, str, str | None, str | None]] = []
 
     for slide in cohort.slides:
         # Resolve accession number for folder name
@@ -2909,10 +2912,8 @@ def export_cohort_analyses(
         for js in slide.job_slides:
             if js.status != "completed":
                 continue
-            if not js.local_output_path:
-                continue
-            local_out = Path(js.local_output_path)
-            if not local_out.is_dir():
+            out_dir = _resolve_job_slide_output(js)  # re-anchors under current NETWORK_ROOT
+            if not out_dir or not out_dir.is_dir():
                 continue
 
             job = js.job
@@ -2923,9 +2924,10 @@ def export_cohort_analyses(
             if analysis_name and a_name != analysis_name:
                 continue
 
-            pp_template = job.analysis.postprocess_template if job.analysis else None
+            kind_id = job.analysis.kind if job.analysis else None
+            transforms_json = job.analysis.transforms if job.analysis else None
             arc_prefix = f"{folder}/{a_name}"
-            export_items.append((local_out, arc_prefix, pp_template))
+            export_items.append((out_dir, arc_prefix, kind_id, transforms_json))
 
     if not export_items:
         raise HTTPException(status_code=404, detail="No completed analysis results available for export")
@@ -2933,34 +2935,36 @@ def export_cohort_analyses(
     def generate():
         q: queue.Queue = queue.Queue(maxsize=32)
 
+        from . import analyses as _ax
+
         def writer():
             try:
                 stream = _ZipStreamWriter(q)
                 with zipfile.ZipFile(stream, 'w', zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
-                    for output_dir, arc_prefix, pp_template in export_items:
-                        if pp_template:
-                            # Run postprocess into a temp dir
-                            with tempfile.TemporaryDirectory() as tmpdir:
-                                cmd = pp_template.format(
-                                    input_dir=str(output_dir),
-                                    output_dir=tmpdir,
-                                    filename_stem=output_dir.name,
-                                )
-                                try:
-                                    subprocess.run(cmd, shell=True, check=True, timeout=300)
-                                    src_dir = Path(tmpdir)
-                                except Exception as e:
-                                    print(f"Postprocess failed for {arc_prefix}: {e}, using raw files")
-                                    src_dir = output_dir
-
-                                for f in sorted(src_dir.iterdir()):
-                                    if f.is_file():
-                                        zf.write(str(f), f"{arc_prefix}/{f.name}")
-                        else:
-                            # No postprocessing — copy raw files
-                            for f in sorted(output_dir.iterdir()):
-                                if f.is_file():
-                                    zf.write(str(f), f"{arc_prefix}/{f.name}")
+                    for output_dir, arc_prefix, kind_id, transforms_json in export_items:
+                        kind = _ax.get_kind(kind_id) if kind_id else None
+                        rules = _ax.resolve_rules(kind, transforms_json) if kind else []
+                        for f in sorted(output_dir.iterdir()):
+                            if not f.is_file():
+                                continue
+                            # Skip transient/bookkeeping files (live progress, temp).
+                            if f.name.endswith((".progress", ".progress.tmp")):
+                                continue
+                            out_name = f.name
+                            try:
+                                data = f.read_bytes()
+                                if rules:
+                                    data, applied = _ax.apply_rules(kind, f.name, data, rules)
+                                    if applied:
+                                        for suffix in (".snappy", ".gz"):
+                                            if out_name.endswith(suffix):
+                                                out_name = out_name[: -len(suffix)]
+                                                break
+                                zf.writestr(f"{arc_prefix}/{out_name}", data)
+                            except Exception as e:
+                                # Never drop a result over a transform error — ship it raw.
+                                print(f"Export transform failed for {arc_prefix}/{f.name}: {e}; shipping raw")
+                                zf.write(str(f), f"{arc_prefix}/{f.name}")
                 stream.flush()
             except Exception as e:
                 print(f"Analysis export error: {e}")
@@ -4086,18 +4090,25 @@ def _recompute_job_status_standalone(job_id: int):
 
 
 def _recompute_job_status(job: AnalysisJob):
-    """Derive parent job status from its child JobSlides."""
+    """Derive parent job status from its child JobSlides.
+
+    A job is only 'completed' when every slide is resolved AND none failed —
+    where 'resolved' means completed or explicitly ignored. A job with any
+    unresolved failed slide is 'failed' (not completed), so a partial failure
+    is never hidden behind a green 'completed' badge.
+    """
     if not job.slides:
         return
     statuses = [js.status for js in job.slides]
-    if any(s in ("running", "transferring") for s in statuses):
+    active = ("running", "transferring", "queued", "pending")
+    if any(s in ("running", "transferring", "queued") for s in statuses):
         job.status = "running"
         if not job.started_at:
             job.started_at = datetime.utcnow()
-    elif all(s == "completed" for s in statuses):
+    elif all(s in ("completed", "ignored") for s in statuses):
         job.status = "completed"
         job.completed_at = datetime.utcnow()
-    elif any(s == "failed" for s in statuses) and not any(s in ("running", "transferring", "pending") for s in statuses):
+    elif any(s == "failed" for s in statuses) and not any(s in active for s in statuses):
         job.status = "failed"
         job.completed_at = datetime.utcnow()
     elif all(s == "pending" for s in statuses):
@@ -4372,6 +4383,8 @@ def get_job(job_id: int, db: Session = Depends(get_db)):
                 "cluster_job_id": js.cluster_job_id,
                 "gpu_index": js.gpu_index,
                 "status": js.status,
+                "progress_pct": js.progress_pct,
+                "progress_stage": js.progress_stage,
                 "started_at": js.started_at.isoformat() if js.started_at else None,
                 "completed_at": js.completed_at.isoformat() if js.completed_at else None,
                 "error_message": js.error_message,
@@ -4385,9 +4398,17 @@ def get_job(job_id: int, db: Session = Depends(get_db)):
     }
 
 
+class RetryFailedRequest(BaseModel):
+    gpu_index: Optional[int] = None  # let the user pick a different GPU on retry
+
+
 @app.post("/jobs/{job_id}/retry-failed")
-def retry_failed_slides(job_id: int, db: Session = Depends(get_db)):
-    """Resubmit only the failed slides of a job as a new job (same analysis/config)."""
+def retry_failed_slides(job_id: int, data: RetryFailedRequest = RetryFailedRequest(), db: Session = Depends(get_db)):
+    """Resubmit only the failed slides of a job as a new job (same analysis/config).
+
+    Accepts an optional gpu_index so the user can pick a different GPU if the one
+    the original run used is busy.
+    """
     job = db.query(AnalysisJob).options(
         joinedload(AnalysisJob.slides).joinedload(JobSlide.slide)
     ).filter_by(id=job_id).first()
@@ -4406,13 +4427,41 @@ def retry_failed_slides(job_id: int, db: Session = Depends(get_db)):
     req = JobSubmitRequest(
         analysis_id=job.analysis_id,
         slide_hashes=failed_hashes,
-        gpu_index=job.gpu_index or 0,
+        gpu_index=data.gpu_index if data.gpu_index is not None else (job.gpu_index or 0),
         remote_wsi_dir=job.remote_wsi_dir or "/tmp/slidecap_wsi",
         remote_output_dir=job.remote_output_dir or "/tmp/slidecap_output",
         parameters=job.parameters,
         submitted_by=job.submitted_by,
     )
     return submit_jobs(req, db)
+
+
+class IgnoreSlidesRequest(BaseModel):
+    slide_ids: Optional[List[int]] = None  # JobSlide ids; if omitted, ignore ALL failed
+
+
+@app.post("/jobs/{job_id}/ignore-failed")
+def ignore_failed_slides(job_id: int, data: IgnoreSlidesRequest = IgnoreSlidesRequest(), db: Session = Depends(get_db)):
+    """Mark failed slide(s) as 'ignored' so they no longer block the job.
+
+    Ignored slides count as resolved (not failed), so once every remaining slide
+    is completed/ignored the job flips to 'completed'. Pass slide_ids to ignore
+    specific JobSlides, or omit to ignore all currently-failed slides.
+    """
+    job = db.query(AnalysisJob).options(joinedload(AnalysisJob.slides)).filter_by(id=job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    wanted = set(data.slide_ids) if data.slide_ids else None
+    ignored = 0
+    for js in job.slides:
+        if js.status == "failed" and (wanted is None or js.id in wanted):
+            js.status = "ignored"
+            ignored += 1
+    if ignored:
+        _recompute_job_status(job)
+        db.commit()
+    return {"ignored": ignored, "job_status": job.status}
 
 
 @app.get("/jobs/{job_id}/log")

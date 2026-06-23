@@ -477,98 +477,109 @@ class JobStatusPoller:
                     for js in group:
                         js.log_tail = info["log_tail"]
 
-                # Sharded jobs: detect completion per-slide via the analysis's
-                # done_glob, independently of siblings — even while the session
-                # is still alive (the warm worker finishes slides one at a time).
+                # ── Unified per-slide detection (batch + sharded) ──
+                # A slide is *done* when its output file appears (matched by the
+                # analysis's done_glob, else by filename stem). Live status/% come
+                # from the optional <stem>.progress JSON the analysis writes. This
+                # gives slide-by-slide progress without parsing the analysis log.
                 job = (
                     db.query(AnalysisJob)
                     .options(joinedload(AnalysisJob.analysis))
                     .filter_by(id=representative.job_id)
                     .first()
                 )
-                is_sharded = bool(job and job.analysis and job.analysis.execution_mode == "sharded")
-                if is_sharded:
-                    done_glob = job.analysis.done_glob if job.analysis else None
-                    output_dir = representative.remote_output_path
-                    present: set[str] = set()
-                    if output_dir:
-                        listing, _, _ = self.cluster.run_command(f"ls {output_dir}/ 2>/dev/null")
-                        present = {p for p in listing.split("\n") if p.strip()}
+                done_glob = job.analysis.done_glob if (job and job.analysis) else None
+                alive = info["alive"]
+                log_error = self._detect_log_error(info.get("log_tail", ""))
+                output_dir = representative.remote_output_path
 
-                    for js in group:
-                        if js.status == "completed":
-                            continue
-                        stem = Path(js.filename).stem if js.filename else None
-                        done = False
-                        if stem and present:
-                            if done_glob:
-                                expected = done_glob.replace("{stem}", stem)
-                                done = expected in present
-                            else:
-                                done = any(stem in p for p in present)
-                        if done:
-                            js.status = "completed"
-                            js.completed_at = datetime.utcnow()
+                # Recursive file listing (handles nested outputs, e.g. UNI) +
+                # the top-level *.progress JSON files, in two SSH calls.
+                present: set[str] = set()
+                progress_map: dict[str, dict] = {}
+                if output_dir:
+                    listing, _, _ = self.cluster.run_command(f"find {output_dir} -type f 2>/dev/null")
+                    present = {ln.rsplit('/', 1)[-1] for ln in listing.splitlines() if ln.strip()}
+                    if any(p.endswith(".progress") for p in present):
+                        praw, _, _ = self.cluster.run_command(f"cat {output_dir}/*.progress 2>/dev/null")
+                        for ln in praw.splitlines():
+                            ln = ln.strip()
+                            if not ln:
+                                continue
+                            try:
+                                d = json.loads(ln)
+                                st = d.get("stem")
+                                if st:
+                                    progress_map[st] = d
+                            except Exception:
+                                continue
+                has_progress = bool(progress_map)
+
+                def _is_done(stem: Optional[str]) -> bool:
+                    if not stem or not present:
+                        return False
+                    if done_glob:
+                        return done_glob.replace("{stem}", stem) in present
+                    return any(stem in p and not p.endswith((".progress", ".progress.tmp")) for p in present)
+
+                for js in group:
+                    if js.status == "completed":
+                        continue
+                    stem = Path(js.filename).stem if js.filename else None
+                    prog = progress_map.get(stem) if stem else None
+
+                    if _is_done(stem):
+                        js.status = "completed"
+                        js.progress_pct = 100
+                        js.completed_at = datetime.utcnow()
+                        updated += 1
+                        affected_job_ids.add(js.job_id)
+                        continue
+
+                    # Explicit per-slide failure reported in the progress file
+                    if prog and prog.get("stage") == "failed":
+                        js.status = "failed"
+                        js.error_message = (prog.get("message") or "analysis reported failure")[:1000]
+                        js.completed_at = datetime.utcnow()
+                        updated += 1
+                        affected_job_ids.add(js.job_id)
+                        continue
+
+                    if alive:
+                        if prog:
+                            # this slide is in flight — record live %/stage
+                            if js.status != "running":
+                                js.status = "running"
+                                if not js.started_at:
+                                    js.started_at = datetime.utcnow()
+                            pct = prog.get("percent")
+                            js.progress_pct = int(pct) if isinstance(pct, (int, float)) else js.progress_pct
+                            js.progress_stage = prog.get("stage")
                             updated += 1
                             affected_job_ids.add(js.job_id)
-                        elif info["alive"]:
+                        elif has_progress:
+                            # progress is being reported, just not for this slide yet → waiting
+                            if js.status != "queued":
+                                js.status = "queued"
+                                js.progress_pct = None
+                                js.progress_stage = None
+                                updated += 1
+                                affected_job_ids.add(js.job_id)
+                        else:
+                            # Analysis writes no progress files (legacy) → treat the
+                            # live session as 'running' for every unfinished slide.
                             if js.status != "running":
                                 js.status = "running"
                                 if not js.started_at:
                                     js.started_at = datetime.utcnow()
                                 updated += 1
                                 affected_job_ids.add(js.job_id)
-                        else:
-                            # Shard session ended and this slide has no output → failed
-                            js.status = "failed"
-                            js.error_message = (
-                                self._detect_log_error(info.get("log_tail", ""))
-                                or "shard ended without output for this slide"
-                            )
-                            js.completed_at = datetime.utcnow()
-                            updated += 1
-                            affected_job_ids.add(js.job_id)
-                    continue  # handled this (sharded) session group
-
-                if info["alive"]:
-                    for js in group:
-                        if js.status != "running":
-                            js.status = "running"
-                            if not js.started_at:
-                                js.started_at = datetime.utcnow()
-                            updated += 1
-                            affected_job_ids.add(js.job_id)
-                else:
-                    log_tail = info.get("log_tail", "")
-                    log_error = self._detect_log_error(log_tail)
-
-                    if log_error:
-                        for js in group:
-                            js.status = "failed"
-                            js.error_message = log_error
-                            js.completed_at = datetime.utcnow()
                     else:
-                        output_dir = representative.remote_output_path
-                        has_output = False
-                        if output_dir:
-                            stdout, _, _ = self.cluster.run_command(
-                                f"ls {output_dir}/ 2>/dev/null | head -20"
-                            )
-                            has_output = bool(stdout.strip())
-
-                        if has_output:
-                            for js in group:
-                                js.status = "completed"
-                                js.completed_at = datetime.utcnow()
-                            print(f"[Poller] Session {session_name}: cluster job done, awaiting manual transfer")
-                        else:
-                            for js in group:
-                                js.status = "failed"
-                                js.error_message = "tmux session ended without output files"
-                                js.completed_at = datetime.utcnow()
-
-                    updated += len(group)
-                    for js in group:
+                        # Session ended and this slide has no output → failed
+                        js.status = "failed"
+                        js.error_message = log_error or "session ended without output for this slide"
+                        js.completed_at = datetime.utcnow()
+                        updated += 1
                         affected_job_ids.add(js.job_id)
 
             # --- Part 2: Recover orphaned slides (stuck 'transferring', no cluster_job_id) ---
@@ -608,22 +619,27 @@ class JobStatusPoller:
             # slide was corrected after the job was last recomputed (e.g. NFS error
             # marked slide failed, output check then flipped it to completed, but the
             # job status was never updated again).
+            # Include 'completed' — a job wrongly marked completed (e.g. the batch
+            # poller flipped all slides to completed on session end, then transfer
+            # marked one failed) must be correctable back to failed.
             stale_jobs = (
                 db.query(AnalysisJob)
                 .options(joinedload(AnalysisJob.slides))
-                .filter(AnalysisJob.status.in_(["failed", "running"]))
+                .filter(AnalysisJob.status.in_(["failed", "running", "completed"]))
                 .all()
             )
             for job in stale_jobs:
                 if not job.slides:
                     continue
                 statuses = [js.status for js in job.slides]
-                if any(s in ("running", "transferring", "pending") for s in statuses):
+                if any(s in ("running", "transferring", "queued", "pending") for s in statuses):
                     continue  # still genuinely active, skip
+                # Terminal: completed | failed | ignored. 'completed' only if no
+                # unresolved failures (ignored counts as resolved).
                 expected = None
-                if all(s == "completed" for s in statuses):
+                if all(s in ("completed", "ignored") for s in statuses):
                     expected = "completed"
-                elif all(s in ("completed", "failed") for s in statuses):
+                elif all(s in ("completed", "failed", "ignored") for s in statuses):
                     expected = "failed" if any(s == "failed" for s in statuses) else "completed"
                 if expected and job.status != expected:
                     job.status = expected
@@ -749,7 +765,8 @@ class JobStatusPoller:
                 local_dir = self.analyses_path / slide.slide_hash / analysis_name
                 local_dir.mkdir(parents=True, exist_ok=True)
                 for f in staging_dir.iterdir():
-                    if f.name not in ("run.log", "progress.log") and f.is_file():
+                    if (f.name not in ("run.log", "progress.log") and f.is_file()
+                            and not f.name.endswith((".progress", ".progress.tmp"))):
                         shutil.move(str(f), str(local_dir / f.name))
                 js.status = "completed"
                 js.local_output_path = str(local_dir)
@@ -768,6 +785,7 @@ class JobStatusPoller:
                 if p.is_file()
                 and p.name.startswith(stem)
                 and p.name not in ("run.log", "progress.log")
+                and not p.name.endswith((".progress", ".progress.tmp"))
             ]
             # Top-level directories named with this stem (models that create per-slide subdirs)
             matched_top_dirs = [
@@ -855,6 +873,13 @@ class JobStatusPoller:
                     # "Processing WSI:" marker). Keep the tail of the whole run.log so
                     # the failure is still debuggable after the cluster dir is cleaned up.
                     js.log_tail = full_log_tail
+
+        # Recompute parent job status now that per-slide outcomes are final
+        # (transfer just set some slides completed/failed from progress.log) —
+        # otherwise a job the poller marked 'completed' stays green even though
+        # a slide failed.
+        if job:
+            self._recompute_job_status(job)
 
         # Cleanup: remove staging dir and cluster output dir
         shutil.rmtree(staging_dir, ignore_errors=True)
@@ -1004,19 +1029,24 @@ class JobStatusPoller:
 
     @staticmethod
     def _recompute_job_status(job: AnalysisJob):
-        """Derive parent job status from its child JobSlides."""
+        """Derive parent job status from its child JobSlides.
+
+        'completed' only when every slide is resolved (completed/ignored) and
+        none failed; any unresolved failed slide → 'failed'.
+        """
         if not job.slides:
             return
         statuses = [js.status for js in job.slides]
-        if any(s in ("running", "transferring") for s in statuses):
+        active = ("running", "transferring", "queued", "pending")
+        if any(s in ("running", "transferring", "queued") for s in statuses):
             job.status = "running"
             if not job.started_at:
                 job.started_at = datetime.utcnow()
-        elif all(s == "completed" for s in statuses):
+        elif all(s in ("completed", "ignored") for s in statuses):
             job.status = "completed"
             if not job.completed_at:
                 job.completed_at = datetime.utcnow()
-        elif any(s == "failed" for s in statuses) and not any(s in ("running", "transferring", "pending") for s in statuses):
+        elif any(s == "failed" for s in statuses) and not any(s in active for s in statuses):
             job.status = "failed"
             if not job.completed_at:
                 job.completed_at = datetime.utcnow()

@@ -18,6 +18,8 @@ interface DetailSlide {
   status: string
   error_message?: string | null
   log_tail?: string | null
+  progress_pct?: number | null
+  progress_stage?: string | null
 }
 type JobDetail = Omit<AnalysisJob, 'slides'> & {
   throughput_per_min?: number | null
@@ -48,6 +50,7 @@ const CELL: Record<string, string> = {
   completed: 'bg-emerald-600', running: 'bg-amber-500 animate-pulse',
   failed: 'bg-red-600', transferring: 'bg-blue-500 animate-pulse',
   queued: 'bg-gray-300', pending: 'bg-gray-300',
+  ignored: 'bg-gray-400',
 }
 
 // Stable-ish color swatch per model name (purely cosmetic)
@@ -139,6 +142,8 @@ export function AnalysisInstrument() {
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [retrying, setRetrying] = useState(false)
   const [expandedFails, setExpandedFails] = useState<Set<number>>(new Set())
+  const [gpus, setGpus] = useState<{ index: number; name: string; memory_used_mb?: number; memory_total_mb?: number }[]>([])
+  const [retryGpu, setRetryGpu] = useState<number | null>(null)
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const toggleFail = (id: number) => setExpandedFails(prev => {
@@ -172,6 +177,16 @@ export function AnalysisInstrument() {
   }, [jobs, selectedId])
 
   useEffect(() => { if (selectedId != null) fetchDetail(selectedId) }, [selectedId])
+
+  // When the selected job has failures, load the GPU list (for the retry picker)
+  // and default the retry GPU to the one the job originally ran on.
+  useEffect(() => {
+    if (!detail) return
+    setRetryGpu(detail.gpu_index ?? null)
+    if ((detail.failed_count ?? 0) > 0) {
+      fetch(`${getApiBase()}/cluster/gpus`).then(r => r.ok ? r.json() : []).then(setGpus).catch(() => {})
+    }
+  }, [detail?.id, detail?.failed_count])
 
   // Poll while any job is active
   useEffect(() => {
@@ -207,10 +222,14 @@ export function AnalysisInstrument() {
       if (selectedId === id) await fetchDetail(id)
     } catch (e) { console.error('Cancel failed:', e) }
   }
-  const handleRetry = async (id: number) => {
+  const handleRetry = async (id: number, gpuIndex: number | null) => {
     setRetrying(true)
     try {
-      const res = await fetch(`${getApiBase()}/jobs/${id}/retry-failed`, { method: 'POST' })
+      const res = await fetch(`${getApiBase()}/jobs/${id}/retry-failed`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(gpuIndex != null ? { gpu_index: gpuIndex } : {}),
+      })
       if (res.status === 503) { signalClusterDisconnected(); return }
       if (res.ok) {
         const data = await res.json()
@@ -220,6 +239,18 @@ export function AnalysisInstrument() {
       }
     } catch (e) { console.error('Retry failed:', e) }
     finally { setRetrying(false) }
+  }
+
+  // Mark failed slide(s) as ignored so they stop blocking the job.
+  const handleIgnore = async (id: number, slideIds?: number[]) => {
+    try {
+      const res = await fetch(`${getApiBase()}/jobs/${id}/ignore-failed`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(slideIds ? { slide_ids: slideIds } : {}),
+      })
+      if (res.ok) { await fetchJobs(); await fetchDetail(id) }
+    } catch (e) { console.error('Ignore failed:', e) }
   }
 
   // ── Derived ──────────────────────────────────────────────────────────
@@ -375,7 +406,7 @@ export function AnalysisInstrument() {
                       </button>
                     )}
                     {detail.failed_count > 0 && !isActive(detail) && (
-                      <button onClick={() => handleRetry(detail.id)} disabled={retrying}
+                      <button onClick={() => handleRetry(detail.id, retryGpu)} disabled={retrying}
                         className="inline-flex items-center gap-1.5 h-8 px-3 text-xs font-semibold rounded border hover:bg-muted">
                         {retrying ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RotateCw className="h-3.5 w-3.5" />}
                         Retry failed
@@ -415,17 +446,31 @@ export function AnalysisInstrument() {
                     <Legend cls="bg-emerald-600" label={`Done ${detail.completed_count}`} />
                     <Legend cls="bg-amber-500" label={`Running ${(detail.slides || []).filter(s => s.status === 'running').length}`} />
                     <Legend cls="bg-red-600" label={`Failed ${detail.failed_count}`} />
+                    {(detail.slides || []).some(s => s.status === 'ignored') && (
+                      <Legend cls="bg-gray-400" label={`Ignored ${(detail.slides || []).filter(s => s.status === 'ignored').length}`} />
+                    )}
                     <Legend cls="bg-gray-300" label={`Queued ${(detail.slides || []).filter(s => ['queued', 'pending', 'transferring'].includes(s.status)).length}`} />
                   </span>
                 </div>
                 <div className="flex flex-wrap gap-1">
-                  {(detail.slides || []).map(s => (
-                    <span
-                      key={s.id}
-                      className={`h-[13px] w-[13px] rounded-sm ${CELL[s.status] || 'bg-gray-300'}`}
-                      title={`${s.slide_id || s.accession_number || ''}${s.block_id ? ` · ${s.block_id}` : ''} — ${s.status}${s.gpu_index != null ? ` (gpu-${s.gpu_index})` : ''}${s.error_message ? `: ${s.error_message}` : ''}`}
-                    />
-                  ))}
+                  {(detail.slides || []).map(s => {
+                    const running = s.status === 'running'
+                    const pct = typeof s.progress_pct === 'number' ? s.progress_pct : null
+                    const tip = `${s.slide_id || s.accession_number || ''}${s.block_id ? ` · ${s.block_id}` : ''} — ${s.status}`
+                      + (running && pct != null ? ` ${pct}%` : '')
+                      + (s.progress_stage ? ` (${s.progress_stage})` : '')
+                      + (s.gpu_index != null ? ` · gpu-${s.gpu_index}` : '')
+                      + (s.error_message ? `: ${s.error_message}` : '')
+                    // Running slides with a known % partial-fill (amber) over a gray base.
+                    if (running && pct != null) {
+                      return (
+                        <span key={s.id} title={tip} className="relative h-[13px] w-[13px] rounded-sm bg-gray-300 overflow-hidden">
+                          <span className="absolute bottom-0 left-0 w-full bg-amber-500" style={{ height: `${Math.max(0, Math.min(100, pct))}%` }} />
+                        </span>
+                      )
+                    }
+                    return <span key={s.id} title={tip} className={`h-[13px] w-[13px] rounded-sm ${CELL[s.status] || 'bg-gray-300'}`} />
+                  })}
                 </div>
               </div>
 
@@ -436,11 +481,32 @@ export function AnalysisInstrument() {
                     <AlertTriangle className="h-4 w-4" />
                     {failedSlides.length} slide{failedSlides.length !== 1 ? 's' : ''} failed
                     {!isActive(detail) && (
-                      <button onClick={() => handleRetry(detail.id)} disabled={retrying}
-                        className="ml-auto inline-flex items-center gap-1.5 h-6 px-2.5 text-[11px] font-semibold rounded border border-red-300 bg-white text-red-600 hover:bg-red-50">
-                        {retrying ? <Loader2 className="h-3 w-3 animate-spin" /> : <RotateCw className="h-3 w-3" />}
-                        Retry failed slides
-                      </button>
+                      <div className="ml-auto flex items-center gap-2">
+                        {/* GPU picker for retry — original GPU may be busy */}
+                        {gpus.length > 0 && (
+                          <select
+                            value={retryGpu ?? ''}
+                            onChange={e => setRetryGpu(e.target.value === '' ? null : Number(e.target.value))}
+                            className="h-6 rounded border border-red-300 bg-white text-[11px] px-1 text-red-700"
+                            title="GPU to retry on"
+                          >
+                            {gpus.map(g => (
+                              <option key={g.index} value={g.index}>
+                                GPU {g.index}{g.memory_total_mb ? ` (${Math.round((g.memory_used_mb || 0) / 1024)}/${Math.round(g.memory_total_mb / 1024)}GB)` : ''}
+                              </option>
+                            ))}
+                          </select>
+                        )}
+                        <button onClick={() => handleIgnore(detail.id)}
+                          className="inline-flex items-center gap-1.5 h-6 px-2.5 text-[11px] font-semibold rounded border bg-white text-muted-foreground hover:bg-muted">
+                          Ignore all
+                        </button>
+                        <button onClick={() => handleRetry(detail.id, retryGpu)} disabled={retrying}
+                          className="inline-flex items-center gap-1.5 h-6 px-2.5 text-[11px] font-semibold rounded border border-red-300 bg-white text-red-600 hover:bg-red-50">
+                          {retrying ? <Loader2 className="h-3 w-3 animate-spin" /> : <RotateCw className="h-3 w-3" />}
+                          Retry failed slides
+                        </button>
+                      </div>
                     )}
                   </div>
                   {failedSlides.map(s => {
@@ -461,6 +527,17 @@ export function AnalysisInstrument() {
                             {s.accession_number || '—'}{s.block_id ? ` · ${s.block_id}` : ''}
                           </span>
                           <span className="text-muted-foreground truncate ml-auto text-right">{s.error_message || 'failed'}</span>
+                          {!isActive(detail) && (
+                            <span
+                              role="button"
+                              tabIndex={0}
+                              onClick={(e) => { e.stopPropagation(); handleIgnore(detail.id, [s.id]) }}
+                              className="shrink-0 text-[11px] px-1.5 py-0.5 rounded border bg-white text-muted-foreground hover:bg-muted"
+                              title="Ignore this slide (won't block the job)"
+                            >
+                              Ignore
+                            </span>
+                          )}
                         </button>
                         {open && (
                           <div className="px-4 pb-3 pt-1 space-y-2">
