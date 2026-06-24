@@ -3885,13 +3885,13 @@ def submit_jobs(data: JobSubmitRequest, db: Session = Depends(get_db)):
                 parameters=params,
             )
 
-            started_at = datetime.utcnow()
             for js_id in transfer_ok:
                 js = bg_db.query(JobSlide).filter_by(id=js_id).first()
                 if js:
                     js.cluster_job_id = session_name
-                    js.status = "running"
-                    js.started_at = started_at
+                    # Queued, not running: the script processes serially, so the
+                    # poller promotes the actually-in-flight slide(s) to running.
+                    js.status = "queued"
             bg_db.commit()
             print(f"[Job {job_id}] Started tmux session '{session_name}' for {len(transfer_ok)} slides")
 
@@ -4030,13 +4030,12 @@ def submit_jobs(data: JobSubmitRequest, db: Session = Depends(get_db)):
                     parameters=params,
                     session_suffix=f"_g{gpu}",
                 )
-                started = datetime.utcnow()
                 for js_id in ok_ids:
                     js = bg_db.query(JobSlide).filter_by(id=js_id).first()
                     if js:
                         js.cluster_job_id = session_name
-                        js.status = "running"
-                        js.started_at = started
+                        # Queued: poller promotes the in-flight slide(s) to running.
+                        js.status = "queued"
                 bg_db.commit()
                 print(f"[Job {job_id}] Shard {shard} on GPU {gpu}: session '{session_name}', {len(ok_ids)} slides")
             except Exception as e:
@@ -4718,13 +4717,11 @@ def retry_job(job_id: int, db: Session = Depends(get_db)):
                 parameters=params,
             )
 
-            started_at = datetime.utcnow()
             for js_id in transfer_ok:
                 js = bg_db.query(JobSlide).filter_by(id=js_id).first()
                 if js:
                     js.cluster_job_id = session_name
-                    js.status = "running"
-                    js.started_at = started_at
+                    js.status = "queued"  # poller promotes the in-flight slide(s)
             bg_db.commit()
             print(f"[Job {job_id}/Retry] Started tmux session '{session_name}'")
 

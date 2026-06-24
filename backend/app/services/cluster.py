@@ -522,6 +522,11 @@ class JobStatusPoller:
                         return done_glob.replace("{stem}", stem) in present
                     return any(stem in p and not p.endswith((".progress", ".progress.tmp")) for p in present)
 
+                # Legacy analyses (no .progress): the script processes serially,
+                # so show ONE in-flight slide per session (the first unfinished),
+                # the rest queued — instead of lighting them all up as running.
+                legacy_running_used = False
+
                 for js in group:
                     if js.status == "completed":
                         continue
@@ -566,14 +571,21 @@ class JobStatusPoller:
                                 updated += 1
                                 affected_job_ids.add(js.job_id)
                         else:
-                            # Analysis writes no progress files (legacy) → treat the
-                            # live session as 'running' for every unfinished slide.
-                            if js.status != "running":
-                                js.status = "running"
-                                if not js.started_at:
-                                    js.started_at = datetime.utcnow()
-                                updated += 1
-                                affected_job_ids.add(js.job_id)
+                            # Legacy (no .progress): first unfinished slide in this
+                            # session = running, the rest = queued.
+                            if not legacy_running_used:
+                                legacy_running_used = True
+                                if js.status != "running":
+                                    js.status = "running"
+                                    if not js.started_at:
+                                        js.started_at = datetime.utcnow()
+                                    updated += 1
+                                    affected_job_ids.add(js.job_id)
+                            else:
+                                if js.status != "queued":
+                                    js.status = "queued"
+                                    updated += 1
+                                    affected_job_ids.add(js.job_id)
                     else:
                         # Session ended and this slide has no output → failed
                         js.status = "failed"
