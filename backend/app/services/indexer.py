@@ -422,19 +422,46 @@ class SlideIndexer:
                 
                 count += 1
 
-        # Also scan studies/ directory for research/external slides
-        studies_dir = self.root / 'studies'
-        if studies_dir.is_dir():
-            valid_exts = {'.svs', '.tif', '.tiff', '.ndpi', '.mrxs'}
-            for filepath in studies_dir.rglob('*'):
-                if not filepath.is_file() or filepath.suffix.lower() not in valid_exts:
-                    continue
-                slide_hash = self.hasher.hash_slide_stem(filepath.stem)
-                if slide_hash not in self.slide_hash_to_path:
-                    self.slide_hash_to_path[slide_hash] = filepath
-                    count += 1
+        # Also scan external/ directory for non-clinical (outside-hospital) slides.
+        # These have no parseable accession; they're registered manually and keyed
+        # by filename stem, same hashing as clinical slides.
+        count += self._scan_external_paths()
 
         return count
+
+    EXTERNAL_EXTS = {'.svs', '.tif', '.tiff', '.ndpi', '.mrxs'}
+
+    def _scan_external_paths(self) -> int:
+        """Add external-folder files to the path cache. Returns count added."""
+        external_dir = self.root / 'external'
+        if not external_dir.is_dir():
+            return 0
+        added = 0
+        for filepath in external_dir.rglob('*'):
+            if not filepath.is_file() or filepath.suffix.lower() not in self.EXTERNAL_EXTS:
+                continue
+            slide_hash = self.hasher.hash_slide_stem(filepath.stem)
+            if slide_hash not in self.slide_hash_to_path:
+                self.slide_hash_to_path[slide_hash] = filepath
+                added += 1
+        return added
+
+    def list_external_files(self) -> list[dict]:
+        """List files in the external/ folder with their slide_hash (for registration)."""
+        external_dir = self.root / 'external'
+        out: list[dict] = []
+        if not external_dir.is_dir():
+            return out
+        for filepath in sorted(external_dir.rglob('*')):
+            if not filepath.is_file() or filepath.suffix.lower() not in self.EXTERNAL_EXTS:
+                continue
+            out.append({
+                "filename": filepath.name,
+                "stem": filepath.stem,
+                "slide_hash": self.hasher.hash_slide_stem(filepath.stem),
+                "file_size_bytes": filepath.stat().st_size,
+            })
+        return out
     
     def get_filepath(self, slide_hash: str) -> Optional[Path]:
         """Get the actual filesystem path for a slide hash."""

@@ -27,6 +27,7 @@ export interface Slide {
   status?: 'available' | 'in-analysis' | 'archived'
   completed_analyses?: string[]
   request_sheets?: { sheet_id: number; sheet_name: string | null; case_status: string }[]
+  is_external?: boolean       // non-clinical / outside-hospital slide
 }
 
 export interface SearchFilters {

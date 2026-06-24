@@ -10,7 +10,6 @@ import {
   PanelLeft,
   X,
   Circle,
-  FlaskRound,
   RefreshCw,
   Database,
   Download,
@@ -40,7 +39,6 @@ import { CohortDashboard } from '@/components/CohortDashboard'
 import { AnalysisDashboard } from '@/components/AnalysisDashboard'
 import { RequestTracker } from '@/components/RequestTracker'
 import { SlidePull } from '@/components/SlidePull'
-import { StudyManager } from '@/components/StudyManager'
 import { LauncherScreen } from '@/components/LauncherScreen'
 import { LoginScreen } from '@/components/LoginScreen'
 import { ParserSettingsDialog } from '@/components/ParserSettingsDialog'
@@ -59,7 +57,7 @@ interface SortStatus {
   errors: string[]
 }
 
-type View = 'dashboard' | 'slides' | 'cohorts' | 'studies' | 'requests' | 'pull' | 'analysis'
+type View = 'dashboard' | 'slides' | 'cohorts' | 'requests' | 'pull' | 'analysis'
 
 // Re-export for backward compat
 export { getApiBase as getAPI } from '@/api'
@@ -271,7 +269,6 @@ export default function App() {
     { id: 'dashboard' as View, label: 'Dashboard', icon: LayoutDashboard },
     { id: 'slides' as View, label: 'Slide Library', icon: Microscope },
     { id: 'cohorts' as View, label: 'Cohorts', icon: Users },
-    { id: 'studies' as View, label: 'Studies', icon: FlaskRound },
     { id: 'requests' as View, label: 'Requests', icon: ClipboardList },
     { id: 'pull' as View, label: 'WSI Pull', icon: Package },
     { id: 'analysis' as View, label: 'Analysis', icon: FlaskConical },
@@ -587,9 +584,6 @@ export default function App() {
                 </div>
                 <div className={viewClass('cohorts')}>
                   <CohortDashboard />
-                </div>
-                <div className={viewClass('studies')}>
-                  <StudyManager />
                 </div>
                 <div className={`${viewClass('requests')} h-full`}>
                   <RequestTracker />

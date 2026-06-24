@@ -53,6 +53,12 @@ const CELL: Record<string, string> = {
   ignored: 'bg-gray-400',
 }
 
+// Order the per-slide heatmap so it fills left→right like a progress bar:
+// done, then in-flight, then waiting, then resolved-aside (ignored), then failed.
+const CELL_ORDER: Record<string, number> = {
+  completed: 0, running: 1, transferring: 2, queued: 3, pending: 4, ignored: 5, failed: 6,
+}
+
 // Stable-ish color swatch per model name (purely cosmetic)
 const SWATCHES = ['#2c8a7d', '#bf9020', '#7a52b3', '#c0568f', '#b4452f', '#36577a']
 const swatchFor = (s: string) => {
@@ -453,7 +459,9 @@ export function AnalysisInstrument() {
                   </span>
                 </div>
                 <div className="flex flex-wrap gap-1">
-                  {(detail.slides || []).map(s => {
+                  {[...(detail.slides || [])]
+                    .sort((a, b) => (CELL_ORDER[a.status] ?? 9) - (CELL_ORDER[b.status] ?? 9) || a.id - b.id)
+                    .map(s => {
                     const running = s.status === 'running'
                     const pct = typeof s.progress_pct === 'number' ? s.progress_pct : null
                     const tip = `${s.slide_id || s.accession_number || ''}${s.block_id ? ` · ${s.block_id}` : ''} — ${s.status}`

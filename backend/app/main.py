@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 from datetime import datetime
 from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import text as sa_text, func
+from sqlalchemy import text as sa_text, func, or_
 
 from .config import settings
 from .db import init_db, get_db, get_session, Case, Slide, Tag, Project, Cohort, CohortFlag, CohortPatient, CohortPatientCase, Analysis, AnalysisJob, JobSlide, SlideQC, RequestSheet, RequestRow, Study, StudyGroup, init_lock, get_lock, Patient, ExternalMapping, generate_slidecap_id
@@ -636,6 +636,7 @@ def search_slides(
     year: Optional[int] = Query(None, description="Filter by year"),
     stain: Optional[str] = Query(None, description="Filter by stain type: HE (exact), IHC (prefix match), Special (not HE or IHC)"),
     tag: Optional[str] = Query(None, description="Filter by tag name"),
+    external: str = Query("exclude", description="exclude | include | only — whether to include external (non-clinical) slides"),
     limit: int = Query(500, le=500, description="Maximum results")
 ):
     """
@@ -643,6 +644,8 @@ def search_slides(
 
     Supports partial matching (e.g., "S24-123" will match "S24-12345").
     If no query is provided, returns all slides matching the filters (up to limit).
+    External (non-clinical) slides are excluded by default; pass external=include
+    to mix them in, or external=only for just externals.
     """
     if not indexer:
         raise HTTPException(status_code=503, detail="Indexer not initialized")
@@ -650,11 +653,8 @@ def search_slides(
     # Use empty string if no query provided - indexer will return all slides
     search_query = q or ""
 
-    # Pass the tag INTO the search so it drives candidate selection from the DB
-    # (direct or via case), restricted to live slides. Post-filtering here would
-    # apply the tag only AFTER the result set was already truncated to `limit`,
-    # silently dropping tagged slides past the cap.
-    results = indexer.search(
+    # Clinical slides (filename-parse driven). Skipped entirely for external=only.
+    results = [] if external == "only" else indexer.search(
         db=db,
         query=search_query,
         year=year,
@@ -662,6 +662,12 @@ def search_slides(
         tags=[tag] if tag else None,
         limit=limit
     )
+
+    # External (non-clinical) slides come from the DB (no parseable filename).
+    if external in ("include", "only") and len(results) < limit:
+        results = results + _search_external_slides(
+            db, q, year, stain, tag, limit - len(results)
+        )
 
     # Enrich results with request sheet info
     if results:
@@ -692,6 +698,176 @@ def search_slides(
         "truncated": len(results) == limit,
         "results": results
     }
+
+
+def _external_slide_to_result(s: Slide) -> dict:
+    """Build a search-result dict for an external slide from STORED fields
+    (externals have no parseable filename)."""
+    return {
+        "slide_hash": s.slide_hash,
+        "slide_id": s.slidecap_id,
+        "case_id": s.case.slidecap_id if s.case else None,
+        "patient_id": None,
+        "accession_number": s.display_name,   # the operator-given name
+        "block_id": s.block_id,
+        "slide_number": s.slide_number,
+        "year": s.case.year if s.case else None,
+        "stain_type": s.stain_type,
+        "random_id": s.random_id,
+        "case_hash": s.case.accession_hash if s.case else None,
+        "slide_tags": [t.name for t in s.tags],
+        "case_tags": [t.name for t in s.case.tags] if s.case else [],
+        "projects": [],
+        "file_size_bytes": s.file_size_bytes,
+        "is_external": True,
+        "completed_analyses": list({
+            js.job.model_name for js in s.job_slides
+            if js.status == "completed" and js.job
+        }),
+    }
+
+
+def _search_external_slides(db, q, year, stain, tag, limit):
+    """Query external (non-clinical) slides matching the filters."""
+    if limit <= 0:
+        return []
+    query = db.query(Slide).options(
+        joinedload(Slide.case).joinedload(Case.tags),
+        joinedload(Slide.tags),
+        joinedload(Slide.job_slides).joinedload(JobSlide.job),
+    ).filter(Slide.is_external == True)  # noqa: E712
+
+    if q:
+        like = f"%{q.strip()}%"
+        query = query.filter(or_(
+            Slide.display_name.ilike(like),
+            Slide.block_id.ilike(like),
+            Slide.slidecap_id.ilike(like),
+        ))
+    if year:
+        query = query.join(Case, Slide.case_id == Case.id).filter(Case.year == year)
+    if stain:
+        sl = stain.lower()
+        if sl == "he":
+            query = query.filter(func.lower(Slide.stain_type) == "he")
+        elif sl == "ihc":
+            query = query.filter(Slide.stain_type.ilike("ihc%"))
+        elif sl != "special":
+            query = query.filter(func.lower(Slide.stain_type) == sl)
+    if tag:
+        query = query.filter(Slide.tags.any(func.lower(Tag.name) == tag.lower()))
+
+    rows = query.limit(limit).all()
+    # 'special' stain = not HE and not IHC — filter in Python
+    if stain and stain.lower() == "special":
+        rows = [s for s in rows if s.stain_type and s.stain_type.lower() != "he"
+                and not s.stain_type.lower().startswith("ihc")]
+    return [_external_slide_to_result(s) for s in rows]
+
+
+# ============================================================
+# External (non-clinical) slide registration
+# ============================================================
+
+class ExternalSlideCreate(BaseModel):
+    filename: str               # a file present in the external/ folder
+    name: str                   # display name (accession-equivalent)
+    block_id: Optional[str] = None
+    stain_type: Optional[str] = None
+    slide_number: Optional[str] = None
+    year: Optional[int] = None
+    source: Optional[str] = None   # outside hospital / origin — stored as a tag
+
+
+def _register_external_slide(db: Session, data: ExternalSlideCreate) -> Slide:
+    """Create/update an external Slide backed by a synthetic Case keyed on name."""
+    if not data.name.strip():
+        raise HTTPException(status_code=400, detail="name is required")
+    if not data.filename.strip():
+        raise HTTPException(status_code=400, detail="filename is required")
+
+    year = data.year or datetime.utcnow().year
+    # Synthetic case, one per external name (so blocks/stains group like a case).
+    case_hash = indexer.hasher.hash_accession(f"EXT::{data.name.strip()}")
+    case = db.query(Case).filter_by(accession_hash=case_hash).first()
+    if not case:
+        case = Case(accession_hash=case_hash, year=year,
+                    slidecap_id=generate_slidecap_id(db, "CS"))
+        db.add(case)
+        db.flush()
+
+    stem = Path(data.filename).stem
+    slide_hash = indexer.hasher.hash_slide_stem(stem)
+    fp = indexer.get_filepath(slide_hash)
+    size = fp.stat().st_size if fp and fp.exists() else None
+
+    slide = db.query(Slide).filter_by(slide_hash=slide_hash).first()
+    if slide is None:
+        slide = Slide(
+            case_id=case.id, slide_hash=slide_hash,
+            slidecap_id=generate_slidecap_id(db, "SL"),
+            is_external=True, file_size_bytes=size,
+        )
+        db.add(slide)
+    slide.case_id = case.id
+    slide.is_external = True
+    slide.display_name = data.name.strip()
+    slide.block_id = data.block_id
+    slide.stain_type = data.stain_type
+    slide.slide_number = data.slide_number
+
+    # Optional 'source' tag (outside hospital), so it's filterable.
+    if data.source and data.source.strip():
+        tname = data.source.strip()
+        tag = db.query(Tag).filter_by(name=tname).first()
+        if not tag:
+            tag = Tag(name=tname, color="#6b7280")
+            db.add(tag)
+        if tag not in slide.tags:
+            slide.tags.append(tag)
+
+    db.flush()
+    return slide
+
+
+@app.get("/external/unregistered")
+def list_unregistered_external(db: Session = Depends(get_db)):
+    """Files in the external/ folder that aren't registered as slides yet."""
+    if not indexer:
+        raise HTTPException(status_code=503, detail="Indexer not initialized")
+    files = indexer.list_external_files()
+    known = {h for (h,) in db.query(Slide.slide_hash).filter(Slide.is_external == True).all()}  # noqa: E712
+    return [f for f in files if f["slide_hash"] not in known]
+
+
+@app.post("/external/slides")
+def register_external_slide(data: ExternalSlideCreate, db: Session = Depends(get_db)):
+    """Register a single external slide."""
+    indexer._scan_external_paths()  # make sure the file's path is cached
+    slide = _register_external_slide(db, data)
+    db.commit()
+    return {"slide_hash": slide.slide_hash, "slide_id": slide.slidecap_id, "name": slide.display_name}
+
+
+class ExternalCSVImport(BaseModel):
+    rows: List[ExternalSlideCreate]
+
+
+@app.post("/external/slides/import")
+def import_external_slides(data: ExternalCSVImport, db: Session = Depends(get_db)):
+    """Bulk-register external slides from parsed CSV rows."""
+    indexer._scan_external_paths()
+    created, errors = 0, []
+    for row in data.rows:
+        try:
+            _register_external_slide(db, row)
+            created += 1
+        except HTTPException as e:
+            errors.append(f"{row.filename}: {e.detail}")
+        except Exception as e:
+            errors.append(f"{row.filename}: {e}")
+    db.commit()
+    return {"created": created, "errors": errors}
 
 
 # ============================================================
@@ -1948,14 +2124,19 @@ def get_cohort(cohort_id: int, db: Session = Depends(get_db)):
 
     slides_data = []
     for s in cohort.slides:
-        accession_number = None
-        slide_number = None
-        filepath = indexer.get_filepath(s.slide_hash) if indexer else None
-        if filepath:
-            parsed = indexer.parser.parse(filepath.name)
-            if parsed:
-                accession_number = parsed.accession
-                slide_number = parsed.slide_number
+        # External slides carry stored attributes; clinical ones parse the filename.
+        if s.is_external:
+            accession_number = s.display_name
+            slide_number = s.slide_number
+        else:
+            accession_number = None
+            slide_number = None
+            filepath = indexer.get_filepath(s.slide_hash) if indexer else None
+            if filepath:
+                parsed = indexer.parser.parse(filepath.name)
+                if parsed:
+                    accession_number = parsed.accession
+                    slide_number = parsed.slide_number
 
         slides_data.append({
             "slide_hash": s.slide_hash,
@@ -1968,6 +2149,7 @@ def get_cohort(cohort_id: int, db: Session = Depends(get_db)):
             "case_hash": s.case.accession_hash if s.case else None,
             "tags": [t.name for t in s.tags],
             "file_size_bytes": s.file_size_bytes,
+            "is_external": s.is_external,
         })
 
     return {

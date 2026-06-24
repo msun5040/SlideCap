@@ -8,6 +8,7 @@ import { TagInput } from '@/components/TagInput'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
 import { TagChip } from '@/components/ui/TagChip'
+import { ExternalSlideDialog } from '@/components/ExternalSlideDialog'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
   Select,
@@ -97,6 +98,9 @@ export function SlideLibrary() {
   const [isDeletingTag, setIsDeletingTag] = useState<number | null>(null)
   const [expandedSlideTags, setExpandedSlideTags] = useState<Set<string>>(new Set())
   const [colorPickerForTag, setColorPickerForTag] = useState<number | null>(null)
+  // External (non-clinical) slides: exclude (default) | include | only
+  const [externalFilter, setExternalFilter] = useState<'exclude' | 'include' | 'only'>('exclude')
+  const [isExternalDialogOpen, setIsExternalDialogOpen] = useState(false)
   // Slides whose QC verdict is 'fail' (manual or auto) — shown as a small marker.
   const [qcFailHashes, setQcFailHashes] = useState<Set<string>>(new Set())
 
@@ -282,6 +286,7 @@ export function SlideLibrary() {
         if (yearFilter !== 'all') params.append('year', yearFilter)
         if (stainFilter !== 'all') params.append('stain', stainFilter)
         if (tagFilter !== 'all') params.append('tag', tagFilter)
+        params.append('external', externalFilter)
 
         const response = await fetch(`${getApiBase()}/search?${params.toString()}`)
         if (response.ok) {
@@ -300,6 +305,7 @@ export function SlideLibrary() {
           if (yearFilter !== 'all') params.append('year', yearFilter)
           if (stainFilter !== 'all') params.append('stain', stainFilter)
           if (tagFilter !== 'all') params.append('tag', tagFilter)
+          params.append('external', externalFilter)
 
           const response = await fetch(`${getApiBase()}/search?${params.toString()}`)
           if (response.ok) {
@@ -953,8 +959,24 @@ export function SlideLibrary() {
             </SelectContent>
           </Select>
 
+          <Select value={externalFilter} onValueChange={(v) => setExternalFilter(v as 'exclude' | 'include' | 'only')}>
+            <SelectTrigger className="w-40">
+              <SelectValue placeholder="External" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="exclude">Clinical only</SelectItem>
+              <SelectItem value="include">Clinical + external</SelectItem>
+              <SelectItem value="only">External only</SelectItem>
+            </SelectContent>
+          </Select>
+
           <Button onClick={handleSearch} disabled={loading}>
             {loading ? 'Searching...' : 'Search'}
+          </Button>
+
+          <Button variant="outline" onClick={() => setIsExternalDialogOpen(true)}>
+            <Upload className="mr-2 h-4 w-4" />
+            External slides
           </Button>
         </div>
       </div>
@@ -1070,6 +1092,14 @@ export function SlideLibrary() {
                           title="Failed QC"
                         >
                           QC✗
+                        </span>
+                      )}
+                      {slide.is_external && (
+                        <span
+                          className="inline-flex items-center rounded px-1 py-0.5 text-[9px] font-semibold bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-300 whitespace-nowrap"
+                          title="External (non-clinical) slide"
+                        >
+                          EXT
                         </span>
                       )}
                     </div>
@@ -1963,6 +1993,12 @@ export function SlideLibrary() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <ExternalSlideDialog
+        open={isExternalDialogOpen}
+        onClose={() => setIsExternalDialogOpen(false)}
+        onRegistered={() => { if (externalFilter !== 'exclude') handleSearch() }}
+      />
     </div>
   )
 }

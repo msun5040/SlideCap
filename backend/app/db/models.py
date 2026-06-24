@@ -231,7 +231,17 @@ class Slide(Base):
     block_id = Column(String(20))       # A1, B2, etc.
     stain_type = Column(String(50))     # HE, IHC-CD3, etc.
     random_id = Column(String(20))      # 7f3a2b (the de-id friendly part)
-    
+
+    # ── External (non-clinical) slides ──
+    # Outside-hospital scans etc. have no parseable accession. They're registered
+    # manually: is_external=True and the operator-supplied fields below are STORED
+    # (clinical slides leave these null and derive accession/slide_number from the
+    # filename at runtime). They still belong to a (synthetic) Case so they reuse
+    # all cohort/analysis plumbing.
+    is_external = Column(Boolean, default=False, server_default='0', index=True)
+    display_name = Column(String(200))  # operator-given name (accession-equivalent)
+    slide_number = Column(String(20))   # stored for externals; parsed for clinical
+
     # Metadata
     indexed_at = Column(DateTime, default=datetime.utcnow)
     file_exists = Column(Integer, default=1)  # 1 = exists, 0 = missing
@@ -972,6 +982,24 @@ def _migrate_analysis_jobs(engine):
                 conn.commit()
     except Exception as e:
         print(f"[DB Migration] Skipping job_slides column migration: {e}")
+
+    # Migrate slides table (external/non-clinical slide support)
+    try:
+        if insp.has_table('slides'):
+            existing_cols = {col['name'] for col in insp.get_columns('slides')}
+            slide_migrations = {
+                'is_external': "ALTER TABLE slides ADD COLUMN is_external BOOLEAN DEFAULT 0",
+                'display_name': "ALTER TABLE slides ADD COLUMN display_name VARCHAR(200)",
+                'slide_number': "ALTER TABLE slides ADD COLUMN slide_number VARCHAR(20)",
+            }
+            with engine.connect() as conn:
+                for col_name, ddl in slide_migrations.items():
+                    if col_name not in existing_cols:
+                        print(f"[DB Migration] Adding column: slides.{col_name}")
+                        conn.execute(text(ddl))
+                conn.commit()
+    except Exception as e:
+        print(f"[DB Migration] Skipping slides column migration: {e}")
 
     # Migrate existing AnalysisJob rows → JobSlide (one-time migration)
     try:

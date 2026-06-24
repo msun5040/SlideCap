@@ -107,6 +107,11 @@ class Settings(BaseSettings):
         return Path(self.NETWORK_ROOT) / "slides" / "studies"
 
     @property
+    def external_path(self) -> Path:
+        # Non-clinical / outside-hospital scans (no accession). Registered manually.
+        return Path(self.NETWORK_ROOT) / "slides" / "external"
+
+    @property
     def analyses_path(self) -> Path:
         return Path(self.NETWORK_ROOT) / "analyses"
 
