@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     # Linux example: "/mnt/network/slides"
 
     # NETWORK_ROOT: str = '/Volumes/DFCI-LIGONLAB/Ligon Lab/test_directory'
-    NETWORK_ROOT: str = '/Volumes/DFCI-LIGONLAB/Ligon Lab/test_directory_pt_slides'
+    NETWORK_ROOT: str = r'L:\Ligon Lab\test_directory_pt_slides'
 
     # App data directory on NETWORK (for shared assets like salt)
     APP_DATA_DIR: str = ".slidecap"
