@@ -1,5 +1,6 @@
 import { useState, useCallback } from 'react'
 import { Copy, Check } from 'lucide-react'
+import { copyToClipboard } from '@/lib/clipboard'
 
 interface CopyableTextProps {
   /** The text displayed */
@@ -18,7 +19,8 @@ export function CopyableText({ text, copyValue, className = '', mono = true }: C
   const handleCopy = useCallback(
     (e: React.MouseEvent) => {
       e.stopPropagation()
-      navigator.clipboard.writeText(copyValue ?? text).then(() => {
+      copyToClipboard(copyValue ?? text).then((ok) => {
+        if (!ok) return
         setCopied(true)
         setTimeout(() => setCopied(false), 1500)
       })

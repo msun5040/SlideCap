@@ -55,6 +55,7 @@ import {
 import { SortableHeader } from '@/components/SortableHeader'
 import { useSortable } from '@/hooks/useSortable'
 import { getApiBase, normalizeAccession, isDemo } from '@/api'
+import { copyToClipboard } from '@/lib/clipboard'
 import type { RequestSheet, RequestRow, RequestSheetDetail, Cohort, RequestStatus } from '@/types/slide'
 
 // ── Status options ──────────────────────────────────────────────
@@ -468,9 +469,11 @@ function CopyCommaList({ text }: { text: string }) {
     .join(', ')
 
   const handleCopy = () => {
-    navigator.clipboard.writeText(commaSeparated).then(() => {
-      setCopied(true)
-      setTimeout(() => setCopied(false), 2000)
+    copyToClipboard(commaSeparated).then((ok) => {
+      if (ok) {
+        setCopied(true)
+        setTimeout(() => setCopied(false), 2000)
+      }
     })
   }
 
@@ -1589,10 +1592,13 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
               {filteredRows.map(row => {
                 const isSelected = row.id === selectedRowId
                 return (
-                  <button
+                  <div
                     key={row.id}
+                    role="button"
+                    tabIndex={0}
                     onClick={() => setSelectedRowId(row.id)}
-                    className={`w-full text-left px-3 py-2.5 border-b border-gray-200 transition-colors ${
+                    onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setSelectedRowId(row.id) } }}
+                    className={`w-full text-left px-3 py-2.5 border-b border-gray-200 transition-colors cursor-pointer ${
                       isSelected
                         ? 'bg-primary/10 border-l-[3px] border-l-primary'
                         : 'hover:bg-muted/40 border-l-[3px] border-l-transparent'
@@ -1604,10 +1610,11 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
                           {isDemo() ? `REQ-${row.id}` : row.accession_number}
                         </span>
                         <button
+                          type="button"
                           className="opacity-0 group-hover/acc:opacity-60 hover:!opacity-100 transition-opacity shrink-0"
                           onClick={(e) => {
                             e.stopPropagation()
-                            navigator.clipboard.writeText(isDemo() ? `REQ-${row.id}` : row.accession_number)
+                            copyToClipboard(isDemo() ? `REQ-${row.id}` : row.accession_number)
                             setSelectedRowId(row.id)
                           }}
                           title={isDemo() ? 'Copy request ID' : 'Copy accession number'}
@@ -1638,7 +1645,7 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
                     {row.notes && (
                       <p className="text-[11px] text-muted-foreground mt-1 truncate">{row.notes}</p>
                     )}
-                  </button>
+                  </div>
                 )
               })}
             </div>

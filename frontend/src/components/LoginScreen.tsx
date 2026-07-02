@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { Microscope, Shield, Loader2, CheckCircle, XCircle, Copy } from 'lucide-react'
 import { getApiBase, setAuthToken } from '@/api'
+import { copyToClipboard } from '@/lib/clipboard'
 
 interface LoginScreenProps {
   onAuthenticated: () => void
@@ -61,9 +62,11 @@ export function LoginScreen({ onAuthenticated }: LoginScreenProps) {
   }
 
   const handleCopyPath = () => {
-    navigator.clipboard.writeText(filePath)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 2000)
+    copyToClipboard(filePath).then((ok) => {
+      if (!ok) return
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    })
   }
 
   const handleKeyDown = (e: React.KeyboardEvent) => {

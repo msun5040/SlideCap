@@ -37,6 +37,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { getApiBase, normalizeAccession } from '@/api'
+import { copyToClipboard } from '@/lib/clipboard'
 import type { Slide, Cohort, CohortDetail, RequestSheet, RequestSheetDetail } from '@/types/slide'
 
 // ── Types ───────────────────────────────────────────────────────
@@ -400,7 +401,8 @@ export function SlidePull() {
   }
 
   const copyPullList = () => {
-    navigator.clipboard.writeText(generatePullList()).then(() => {
+    copyToClipboard(generatePullList()).then((ok) => {
+      if (!ok) return
       setCopied(true)
       setTimeout(() => setCopied(false), 2000)
     })

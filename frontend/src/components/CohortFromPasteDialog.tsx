@@ -14,6 +14,7 @@ import {
 import type { Slide } from '@/types/slide'
 import { getApiBase, normalizeAccession } from '@/api'
 import { displaySlide } from '@/lib/display'
+import { copyToClipboard } from '@/lib/clipboard'
 
 interface Props {
   open: boolean
@@ -219,7 +220,7 @@ export function CohortFromPasteDialog({ open, onOpenChange, onCreated, targetCoh
   // ── Copy unresolved → clipboard ─────────────────────────────────
   const copyUnresolved = async () => {
     if (!resolved?.notFound?.length) return
-    try { await navigator.clipboard.writeText(resolved.notFound.join('\n')) } catch {}
+    await copyToClipboard(resolved.notFound.join('\n'))
   }
 
   // ── Commit: add to existing cohort, or create cohort + add slides ──
