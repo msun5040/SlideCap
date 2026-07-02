@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import text as sa_text, func, or_
 
 from .config import settings
-from .db import init_db, get_db, get_session, Case, Slide, Tag, Project, Cohort, CohortFlag, CohortPatient, CohortPatientCase, Analysis, AnalysisJob, JobSlide, SlideQC, RequestSheet, RequestRow, Study, StudyGroup, init_lock, get_lock, Patient, ExternalMapping, generate_slidecap_id
+from .db import init_db, get_db, get_session, Case, Slide, Tag, Project, Cohort, CohortFlag, CohortPatient, CohortPatientCase, Analysis, AnalysisJob, JobSlide, SlideQC, RequestSheet, RequestRow, RequestStatus, Study, StudyGroup, init_lock, get_lock, Patient, ExternalMapping, generate_slidecap_id
 from .services import SlideHasher, SlideIndexer, ClusterService, JobStatusPoller
 from .auth import AuthMiddleware, create_challenge, verify_challenge, create_token, verify_token, cleanup_expired_challenges
 from . import demo as demo_mod
@@ -410,15 +410,22 @@ def get_thumbnail_stats():
 # ============================================================
 
 def reconcile_auto_cohorts(db: Session, cohort_id: Optional[int] = None) -> int:
-    """Ensure every "case-following" cohort contains all slides of the cases it
-    tracks (the cases that already have at least one slide in the cohort).
+    """Ensure every case-following cohort contains all slides of the cases it tracks.
 
-    Called after indexing so newly-onboarded slides auto-join, and when the
-    auto_add_cases flag is turned on so existing siblings back-fill immediately.
-    Returns the number of slides added. If cohort_id is given, only that cohort
-    is processed.
+    A cohort tracks a case in two ways:
+      • auto_add_cases (cohort-wide): follow every case already represented in the
+        cohort — any of its slides being present means all of them belong.
+      • followed_cases (per-case): a case explicitly linked to the cohort, whose
+        slides are kept even if none were manually added.
+
+    Called after indexing so newly-onboarded slides auto-join, and when a case is
+    followed / auto_add_cases is turned on so existing siblings back-fill
+    immediately. Returns the number of slides added. If cohort_id is given, only
+    that cohort is processed.
     """
-    q = db.query(Cohort).filter(Cohort.auto_add_cases == True)  # noqa: E712
+    q = db.query(Cohort).filter(
+        or_(Cohort.auto_add_cases == True, Cohort.followed_cases.any())  # noqa: E712
+    )
     if cohort_id is not None:
         q = q.filter(Cohort.id == cohort_id)
     cohorts = q.all()
@@ -426,7 +433,10 @@ def reconcile_auto_cohorts(db: Session, cohort_id: Optional[int] = None) -> int:
     total_added = 0
     for cohort in cohorts:
         member_slide_ids = {s.id for s in cohort.slides}
-        case_ids = {s.case_id for s in cohort.slides if s.case_id is not None}
+        case_ids: set[int] = set()
+        if cohort.auto_add_cases:
+            case_ids |= {s.case_id for s in cohort.slides if s.case_id is not None}
+        case_ids |= {c.id for c in cohort.followed_cases}
         if not case_ids:
             continue
         siblings = db.query(Slide).filter(Slide.case_id.in_(case_ids)).all()
@@ -2028,6 +2038,10 @@ class CohortAddSlides(BaseModel):
     slide_hashes: List[str]
 
 
+class CohortFollowCases(BaseModel):
+    case_hashes: List[str]
+
+
 class CohortFlagCreate(BaseModel):
     name: str
     case_hashes: List[str] = []
@@ -2164,6 +2178,7 @@ def get_cohort(cohort_id: int, db: Session = Depends(get_db)):
         "slide_count": cohort.slide_count,
         "case_count": cohort.case_count,
         "auto_add_cases": cohort.auto_add_cases,
+        "followed_case_hashes": [c.accession_hash for c in cohort.followed_cases],
         "slides": slides_data
     }
 
@@ -2272,6 +2287,67 @@ def remove_slides_from_cohort(cohort_id: int, data: CohortAddSlides, db: Session
         "removed_hashes": removed,
         "total_slides": cohort.slide_count,
         "total_cases": cohort.case_count
+    }
+
+
+@app.post("/cohorts/{cohort_id}/followed-cases")
+def follow_cases(cohort_id: int, data: CohortFollowCases, db: Session = Depends(get_db)):
+    """Follow whole cases: link them to the cohort so every slide of each case is
+    kept — existing slides are back-filled now and future onboarded slides
+    auto-join (see reconcile_auto_cohorts).
+    """
+    cohort = db.query(Cohort).filter_by(id=cohort_id).first()
+    if not cohort:
+        raise HTTPException(status_code=404, detail="Cohort not found")
+
+    requested = list(dict.fromkeys(data.case_hashes))  # dedupe, preserve order
+    cases_by_hash = {
+        c.accession_hash: c
+        for c in db.query(Case).filter(Case.accession_hash.in_(requested)).all()
+    }
+    not_found = [h for h in requested if h not in cases_by_hash]
+
+    with get_lock().write_lock():
+        already = {c.id for c in cohort.followed_cases}
+        for h in requested:
+            case = cases_by_hash.get(h)
+            if case and case.id not in already:
+                cohort.followed_cases.append(case)
+        db.commit()
+
+    # Back-fill this cohort's newly-tracked slides immediately.
+    added = reconcile_auto_cohorts(db, cohort_id=cohort_id)
+    db.refresh(cohort)
+    return {
+        "status": "ok",
+        "followed_case_hashes": [c.accession_hash for c in cohort.followed_cases],
+        "not_found": not_found,
+        "slides_added": added,
+        "total_slides": cohort.slide_count,
+        "total_cases": cohort.case_count,
+    }
+
+
+@app.delete("/cohorts/{cohort_id}/followed-cases")
+def unfollow_cases(cohort_id: int, data: CohortFollowCases, db: Session = Depends(get_db)):
+    """Stop following the given cases. Slides already in the cohort are left in
+    place — unfollowing only halts future auto-add for those cases.
+    """
+    cohort = db.query(Cohort).filter_by(id=cohort_id).first()
+    if not cohort:
+        raise HTTPException(status_code=404, detail="Cohort not found")
+
+    remove = set(data.case_hashes)
+    with get_lock().write_lock():
+        cohort.followed_cases = [
+            c for c in cohort.followed_cases if c.accession_hash not in remove
+        ]
+        db.commit()
+
+    db.refresh(cohort)
+    return {
+        "status": "ok",
+        "followed_case_hashes": [c.accession_hash for c in cohort.followed_cases],
     }
 
 
@@ -6804,6 +6880,97 @@ def _serialize_request_row(r: RequestRow) -> dict:
         "created_at": r.created_at.isoformat() if r.created_at else None,
         "updated_at": r.updated_at.isoformat() if r.updated_at else None,
     }
+
+
+# ── Custom case statuses (global, user-defined name + color) ──────────────
+
+class RequestStatusCreate(BaseModel):
+    name: str
+    color: Optional[str] = '#6B7280'
+    sort_order: Optional[int] = None
+
+
+class RequestStatusUpdate(BaseModel):
+    name: Optional[str] = None
+    color: Optional[str] = None
+    sort_order: Optional[int] = None
+
+
+def _serialize_request_status(s: RequestStatus) -> dict:
+    return {"id": s.id, "name": s.name, "color": s.color, "sort_order": s.sort_order}
+
+
+@app.get("/request-statuses")
+def list_request_statuses(db: Session = Depends(get_db)):
+    """List the user-defined case statuses (drives the Request Tracker dropdown)."""
+    statuses = db.query(RequestStatus).order_by(
+        RequestStatus.sort_order, RequestStatus.name
+    ).all()
+    return [_serialize_request_status(s) for s in statuses]
+
+
+@app.post("/request-statuses")
+def create_request_status(data: RequestStatusCreate, db: Session = Depends(get_db)):
+    """Add a new case status option."""
+    name = (data.name or '').strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Status name is required")
+    existing = db.query(RequestStatus).filter(RequestStatus.name == name).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="A status with that name already exists")
+    with get_lock().write_lock():
+        if data.sort_order is not None:
+            order = data.sort_order
+        else:
+            max_order = db.query(func.max(RequestStatus.sort_order)).scalar()
+            order = (max_order + 1) if max_order is not None else 0
+        status = RequestStatus(name=name, color=data.color or '#6B7280', sort_order=order)
+        db.add(status)
+        db.commit()
+    return _serialize_request_status(status)
+
+
+@app.patch("/request-statuses/{status_id}")
+def update_request_status(status_id: int, data: RequestStatusUpdate, db: Session = Depends(get_db)):
+    """Update a status. Renaming cascades to every row currently using the old name."""
+    status = db.query(RequestStatus).filter_by(id=status_id).first()
+    if not status:
+        raise HTTPException(status_code=404, detail="Status not found")
+    with get_lock().write_lock():
+        if data.name is not None:
+            new_name = data.name.strip()
+            if not new_name:
+                raise HTTPException(status_code=400, detail="Status name cannot be empty")
+            clash = db.query(RequestStatus).filter(
+                RequestStatus.name == new_name, RequestStatus.id != status_id
+            ).first()
+            if clash:
+                raise HTTPException(status_code=409, detail="A status with that name already exists")
+            if new_name != status.name:
+                # Keep historical rows consistent with the rename.
+                db.query(RequestRow).filter(RequestRow.case_status == status.name).update(
+                    {RequestRow.case_status: new_name}, synchronize_session=False
+                )
+                status.name = new_name
+        if data.color is not None:
+            status.color = data.color
+        if data.sort_order is not None:
+            status.sort_order = data.sort_order
+        db.commit()
+    return _serialize_request_status(status)
+
+
+@app.delete("/request-statuses/{status_id}")
+def delete_request_status(status_id: int, db: Session = Depends(get_db)):
+    """Remove a status option. Rows already set to it keep their value (they just
+    fall back to the neutral badge until re-set)."""
+    status = db.query(RequestStatus).filter_by(id=status_id).first()
+    if not status:
+        raise HTTPException(status_code=404, detail="Status not found")
+    with get_lock().write_lock():
+        db.delete(status)
+        db.commit()
+    return {"status": "ok"}
 
 
 @app.get("/request-sheets")

@@ -3,7 +3,7 @@ import {
   ArrowLeft, Search, Filter, X, Plus, ChevronDown, ChevronRight,
   Check, Download, FolderArchive, AlertTriangle, Users, FileText,
   CheckCircle2, Clock, XCircle, Loader2, Flag, BarChart2, Trash2, Stethoscope,
-  Microscope, ClipboardList,
+  Microscope, ClipboardList, Link2,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -160,6 +160,18 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
     if (!cohort) return new Set<string>()
     return new Set(cohort.slides.map(s => s.slide_hash))
   }, [cohort])
+
+  // Cases explicitly followed by this cohort. When the cohort-wide auto-add is
+  // on, every case is followed implicitly, so treat all as followed.
+  const followedCaseHashes = useMemo(
+    () => new Set(cohort?.followed_case_hashes ?? []),
+    [cohort],
+  )
+  const isCaseFollowed = useCallback(
+    (caseHash: string | null | undefined) =>
+      !!cohort?.auto_add_cases || (!!caseHash && followedCaseHashes.has(caseHash)),
+    [cohort, followedCaseHashes],
+  )
 
   const caseGroups = useMemo((): CaseGroup[] => {
     if (!cohort) return []
@@ -679,6 +691,36 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
     }
   }
 
+  // Follow/unfollow a single case. Following links the whole case: existing
+  // slides back-fill server-side (we refetch to show them) and future onboarded
+  // slides auto-join. Unfollowing only stops future auto-add; present slides stay.
+  const toggleFollowCase = async (caseHash: string, next: boolean) => {
+    if (!cohort || !caseHash) return
+    const prevFollowed = cohort.followed_case_hashes ?? []
+    const optimistic = next
+      ? Array.from(new Set([...prevFollowed, caseHash]))
+      : prevFollowed.filter(h => h !== caseHash)
+    setCohort({ ...cohort, followed_case_hashes: optimistic })
+    try {
+      const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/followed-cases`, {
+        method: next ? 'POST' : 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ case_hashes: [caseHash] }),
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json()
+      // Sync followed set from server; pull in back-filled slides if any.
+      setCohort(c => c ? { ...c, followed_case_hashes: data.followed_case_hashes } : c)
+      if (next && data.slides_added > 0) {
+        fetchCohort()
+        fetchAnalysisStatus()
+      }
+    } catch (e) {
+      console.error('Failed to update case-follow setting:', e)
+      setCohort(c => c ? { ...c, followed_case_hashes: prevFollowed } : c)  // revert
+    }
+  }
+
   const removeSlide = async (slideHash: string) => {
     if (!cohort) return
     const prev = cohort
@@ -702,6 +744,12 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
 
   const removeCase = async (caseSlides: CohortSlide[]) => {
     if (!cohort || caseSlides.length === 0) return
+    // If this case is explicitly followed, unfollow first so its slides don't
+    // get re-added on the next index. (Cohort-wide auto-add is left untouched.)
+    const caseHash = caseSlides[0].case_hash
+    if (caseHash && followedCaseHashes.has(caseHash)) {
+      await toggleFollowCase(caseHash, false)
+    }
     const hashes = caseSlides.map(s => s.slide_hash)
     const hashSet = new Set(hashes)
     const prev = cohort
@@ -801,13 +849,14 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
           </p>
           <label
             className="mt-1.5 inline-flex items-center gap-2 text-xs text-muted-foreground cursor-pointer"
-            title="When on, any newly-onboarded slide whose case is already in this cohort is added automatically — no need to add new slides by hand. Turning it on also pulls in existing slides for those cases."
+            title="When on, ALL cases in this cohort are followed: any newly-onboarded slide whose case is already here is added automatically, and existing siblings are pulled in now. To follow only specific cases instead, leave this off and use the link icon on each case."
           >
             <Checkbox
               checked={!!cohort.auto_add_cases}
               onCheckedChange={(c) => toggleAutoAddCases(!!c)}
             />
-            <span>Auto-add new slides for these cases</span>
+            <span>Auto-add new slides for all cases</span>
+            <Link2 className="h-3 w-3 opacity-60" />
           </label>
         </div>
         <div className="flex items-center gap-2 shrink-0 mt-0.5">
@@ -1004,6 +1053,10 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                           const isSelected = selectedCaseHashes.has(group.case_hash)
                           const allSlidesFlagged = group.slides.length > 0 && group.slides.every(s => isSlideFlagged(s))
                           const anySlidesFlagged = group.slides.some(s => isSlideFlagged(s))
+                          const followed = isCaseFollowed(group.case_hash)
+                          // Cohort-wide auto-add makes every case followed implicitly; the
+                          // per-case toggle is disabled in that mode (nothing to opt out of).
+                          const followLockedByCohort = !!cohort.auto_add_cases
 
                           // Group slides by stain for the dot summary
                           const stainCounts: Record<string, number> = {}
@@ -1076,6 +1129,30 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                                     ))}
                                   </div>
                                 )}
+
+                                {/* Follow-case toggle — link the whole case so future
+                                    onboarded slides auto-join the cohort */}
+                                <button
+                                  className={`shrink-0 inline-flex items-center justify-center h-6 w-6 rounded-full transition-colors ${
+                                    followed
+                                      ? 'text-blue-600'
+                                      : 'text-muted-foreground/40 hover:text-blue-500'
+                                  } ${followLockedByCohort ? 'cursor-default' : ''}`}
+                                  onClick={e => {
+                                    e.stopPropagation()
+                                    if (followLockedByCohort) return
+                                    toggleFollowCase(group.case_hash, !followed)
+                                  }}
+                                  title={
+                                    followLockedByCohort
+                                      ? 'All cases are followed (cohort-wide auto-add is on)'
+                                      : followed
+                                        ? 'Following — future slides for this case auto-join. Click to unfollow.'
+                                        : 'Follow case — auto-add future slides for this case'
+                                  }
+                                >
+                                  <Link2 className={`h-3 w-3 ${followed ? 'stroke-[2.5]' : ''}`} />
+                                </button>
 
                                 {/* Flag button */}
                                 <button

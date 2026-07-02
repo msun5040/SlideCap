@@ -77,6 +77,9 @@ export interface CohortDetail {
   slide_count: number
   case_count: number
   auto_add_cases?: boolean
+  // Case accession_hashes explicitly "followed" by this cohort — every slide of
+  // a followed case is kept, and future onboarded slides for it auto-join.
+  followed_case_hashes?: string[]
   created_by?: string
   created_at?: string
   updated_at?: string
@@ -234,6 +237,14 @@ export interface RequestRow {
 export interface RequestSheetDetail extends RequestSheet {
   rows: RequestRow[]
   auto_tags?: { id: number; name: string; color?: string }[]
+}
+
+// User-defined case status option (name + hex color) for the Request Tracker.
+export interface RequestStatus {
+  id: number
+  name: string
+  color: string
+  sort_order?: number
 }
 
 export interface GpuInfo {

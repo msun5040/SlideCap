@@ -166,6 +166,14 @@ export function SlideLibrary() {
     fetchStats()
   }, [])
 
+  // Load slides on first mount so the table isn't empty ("Showing 0 slides")
+  // while the header reports a full collection. Runs once; later searches are
+  // triggered by the user via the Search button / Enter.
+  useEffect(() => {
+    handleSearch()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   // Fetch bulk tag autocomplete suggestions
   useEffect(() => {
     if (bulkTagInput.length < 1) {

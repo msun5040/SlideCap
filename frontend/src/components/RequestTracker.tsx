@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import {
   Plus,
   Trash2,
@@ -20,6 +20,9 @@ import {
   Microscope,
   Settings,
   Tag as TagIcon,
+  Palette,
+  ArrowUp,
+  ArrowDown,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -52,7 +55,7 @@ import {
 import { SortableHeader } from '@/components/SortableHeader'
 import { useSortable } from '@/hooks/useSortable'
 import { getApiBase, normalizeAccession, isDemo } from '@/api'
-import type { RequestSheet, RequestRow, RequestSheetDetail, Cohort } from '@/types/slide'
+import type { RequestSheet, RequestRow, RequestSheetDetail, Cohort, RequestStatus } from '@/types/slide'
 
 // ── Status options ──────────────────────────────────────────────
 const CASE_STATUSES = [
@@ -114,6 +117,33 @@ function scanColor(val: string): string {
   if (val === 'No') return 'bg-danger-soft text-danger-ink border-transparent'
   if (val === 'Partial') return 'bg-warning-soft text-warning-ink border-transparent'
   return 'bg-[var(--neutral-st-soft)] text-[var(--neutral-st-ink)] border-transparent'
+}
+
+// Status chip that honors a user-defined color when one exists for the status,
+// otherwise falls back to the tone-based soft-tint classes (legacy/unknown values).
+function StatusBadge({
+  status,
+  colorMap,
+  sizeCls = 'text-[12px]',
+  className = '',
+}: {
+  status?: string | null
+  colorMap: Record<string, string>
+  sizeCls?: string
+  className?: string
+}) {
+  const label = status || 'Not Started'
+  const hex = colorMap[label]
+  const style = hex ? { backgroundColor: `${hex}20`, color: hex } : undefined
+  const toneCls = hex ? 'border-transparent' : statusColor(label)
+  return (
+    <span
+      className={`inline-flex items-center rounded-sm px-1.5 py-0.5 font-medium border ${sizeCls} ${toneCls} ${className}`}
+      style={style}
+    >
+      {label}
+    </span>
+  )
 }
 
 // ── Section definitions for detail panel ─────────────────────────
@@ -707,6 +737,33 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
   const [savingSettings, setSavingSettings] = useState(false)
   const [settingsMessage, setSettingsMessage] = useState<string | null>(null)
 
+  // Custom case statuses (global, user-defined name + color)
+  const [customStatuses, setCustomStatuses] = useState<RequestStatus[]>([])
+  const [isStatusMgrOpen, setIsStatusMgrOpen] = useState(false)
+  const [newStatusName, setNewStatusName] = useState('')
+  const [newStatusColor, setNewStatusColor] = useState('#6B7280')
+  const [statusMgrError, setStatusMgrError] = useState<string | null>(null)
+
+  const fetchStatuses = useCallback(async () => {
+    try {
+      const res = await fetch(`${getApiBase()}/request-statuses`)
+      if (res.ok) setCustomStatuses(await res.json())
+    } catch (e) {
+      console.error('Failed to fetch request statuses:', e)
+    }
+  }, [])
+  useEffect(() => { fetchStatuses() }, [fetchStatuses])
+
+  // name → hex, for badge coloring; and the ordered option names for dropdowns.
+  const statusColorMap = useMemo(
+    () => Object.fromEntries(customStatuses.map(s => [s.name, s.color])),
+    [customStatuses],
+  )
+  const statusNames = useMemo(
+    () => (customStatuses.length ? customStatuses.map(s => s.name) : [...CASE_STATUSES]),
+    [customStatuses],
+  )
+
   const fetchCoverage = useCallback(async () => {
     try {
       const res = await fetch(`${getApiBase()}/request-sheets/${sheetId}/coverage`)
@@ -803,6 +860,89 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
       setSavingSettings(false)
     }
   }, [sheetId, settingsTagIds, fetchSheet])
+
+  // ── Custom status management ──────────────────────────────────────
+  const addStatus = useCallback(async () => {
+    const name = newStatusName.trim()
+    if (!name) return
+    setStatusMgrError(null)
+    try {
+      const res = await fetch(`${getApiBase()}/request-statuses`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, color: newStatusColor }),
+      })
+      if (res.status === 409) { setStatusMgrError('A status with that name already exists.'); return }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      setNewStatusName('')
+      setNewStatusColor('#6B7280')
+      await fetchStatuses()
+    } catch (e: any) {
+      setStatusMgrError(`Failed to add status: ${e.message || 'error'}`)
+    }
+  }, [newStatusName, newStatusColor, fetchStatuses])
+
+  const patchStatus = useCallback(async (id: number, patch: Partial<Pick<RequestStatus, 'name' | 'color' | 'sort_order'>>) => {
+    setStatusMgrError(null)
+    // Optimistic local update for snappy color/name edits.
+    setCustomStatuses(prev => prev.map(s => (s.id === id ? { ...s, ...patch } : s)))
+    try {
+      const res = await fetch(`${getApiBase()}/request-statuses/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      })
+      if (res.status === 409) { setStatusMgrError('A status with that name already exists.'); await fetchStatuses(); return }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      // Renames cascade to rows server-side — refresh the sheet so chips update.
+      if (patch.name !== undefined) await fetchSheet()
+    } catch (e: any) {
+      setStatusMgrError(`Failed to update status: ${e.message || 'error'}`)
+      await fetchStatuses()
+    }
+  }, [fetchStatuses, fetchSheet])
+
+  const deleteStatus = useCallback(async (id: number) => {
+    setStatusMgrError(null)
+    try {
+      const res = await fetch(`${getApiBase()}/request-statuses/${id}`, { method: 'DELETE' })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      await fetchStatuses()
+    } catch (e: any) {
+      setStatusMgrError(`Failed to delete status: ${e.message || 'error'}`)
+    }
+  }, [fetchStatuses])
+
+  // Move a status up/down by swapping sort_order with its neighbor.
+  const moveStatus = useCallback(async (index: number, dir: -1 | 1) => {
+    const a = customStatuses[index]
+    const b = customStatuses[index + dir]
+    if (!a || !b) return
+    const aOrder = a.sort_order ?? index
+    const bOrder = b.sort_order ?? index + dir
+    setCustomStatuses(prev => {
+      const next = [...prev]
+      next[index] = { ...b, sort_order: aOrder }
+      next[index + dir] = { ...a, sort_order: bOrder }
+      return next
+    })
+    try {
+      await Promise.all([
+        fetch(`${getApiBase()}/request-statuses/${a.id}`, {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sort_order: bOrder }),
+        }),
+        fetch(`${getApiBase()}/request-statuses/${b.id}`, {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sort_order: aOrder }),
+        }),
+      ])
+      await fetchStatuses()
+    } catch (e) {
+      console.error('Failed to reorder statuses:', e)
+      await fetchStatuses()
+    }
+  }, [customStatuses, fetchStatuses])
 
   // Fetch warnings + scanned slide data when selected row changes
   useEffect(() => {
@@ -1192,14 +1332,12 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
       return (
         <Select value={String(value || 'Not Started')} onValueChange={(v) => updateField(row.id, field.key, v)}>
           <SelectTrigger className="h-8 text-[13px]">
-            <span className={`inline-flex items-center rounded-sm px-1.5 py-0.5 text-[12px] font-medium border ${statusColor(String(value || 'Not Started'))}`}>
-              {String(value || 'Not Started')}
-            </span>
+            <StatusBadge status={String(value || 'Not Started')} colorMap={statusColorMap} />
           </SelectTrigger>
           <SelectContent>
-            {CASE_STATUSES.map(s => (
+            {statusNames.map(s => (
               <SelectItem key={s} value={s} className="text-[13px]">
-                <span className={`inline-flex items-center rounded-sm px-1.5 py-0.5 text-[12px] font-medium border ${statusColor(s)}`}>{s}</span>
+                <StatusBadge status={s} colorMap={statusColorMap} />
               </SelectItem>
             ))}
           </SelectContent>
@@ -1345,6 +1483,15 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
           <Button size="sm" variant="outline" className="h-7 text-[12px]" onClick={handleExport}>
             <Download className="h-3 w-3 mr-1" />CSV
           </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-7 text-[12px]"
+            onClick={() => { setStatusMgrError(null); setIsStatusMgrOpen(true) }}
+            title="Manage case statuses (names & colors)"
+          >
+            <Palette className="h-3 w-3 mr-1" />Statuses
+          </Button>
           <Button size="sm" variant="outline" className="h-7 text-[12px]" onClick={openSettings} title="Sheet settings">
             <Settings className="h-3 w-3 mr-1" />Settings
             {sheet.auto_tags && sheet.auto_tags.length > 0 && (
@@ -1468,12 +1615,13 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
                           <Copy className="h-3 w-3" />
                         </button>
                       </div>
-                      <Circle className={`h-2 w-2 shrink-0 mt-1.5 fill-current ${statusDot(row.case_status)}`} />
+                      <Circle
+                        className={`h-2 w-2 shrink-0 mt-1.5 fill-current ${statusColorMap[row.case_status] ? '' : statusDot(row.case_status)}`}
+                        style={statusColorMap[row.case_status] ? { color: statusColorMap[row.case_status] } : undefined}
+                      />
                     </div>
                     <div className="flex items-center gap-1.5 mt-1">
-                      <span className={`inline-flex items-center rounded-sm px-1.5 py-0.5 text-[10px] font-medium border ${statusColor(row.case_status || 'Not Started')}`}>
-                        {row.case_status || 'Not Started'}
-                      </span>
+                      <StatusBadge status={row.case_status} colorMap={statusColorMap} sizeCls="text-[10px]" />
                       {row.is_consult && (
                         <span className="inline-flex items-center rounded-sm px-1.5 py-0.5 text-[10px] font-medium border border-orange-300 bg-orange-50 text-orange-700">
                           Consult
@@ -1639,6 +1787,97 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
           </div>
         </div>
       )}
+
+      {/* Status manager dialog — custom case statuses (name + color) */}
+      <Dialog open={isStatusMgrOpen} onOpenChange={setIsStatusMgrOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Case Statuses</DialogTitle>
+            <DialogDescription>
+              Define the statuses available in the dropdown and their colors. These apply to every request sheet. Renaming a status updates all cases already set to it.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-2 py-2 max-h-[50vh] overflow-y-auto">
+            {customStatuses.length === 0 ? (
+              <p className="text-[12px] text-muted-foreground">No statuses yet — add one below.</p>
+            ) : (
+              customStatuses.map((s, i) => (
+                <div key={s.id} className="flex items-center gap-2">
+                  <input
+                    type="color"
+                    value={s.color}
+                    onChange={(e) => patchStatus(s.id, { color: e.target.value })}
+                    className="h-7 w-9 shrink-0 cursor-pointer rounded border border-input bg-transparent p-0.5"
+                    title="Pick color"
+                  />
+                  <Input
+                    value={s.name}
+                    onChange={(e) => setCustomStatuses(prev => prev.map(x => x.id === s.id ? { ...x, name: e.target.value } : x))}
+                    onBlur={(e) => { const v = e.target.value.trim(); if (v && v !== s.name) patchStatus(s.id, { name: v }) }}
+                    onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
+                    className="h-7 text-[13px]"
+                  />
+                  <StatusBadge status={s.name} colorMap={statusColorMap} sizeCls="text-[11px]" className="shrink-0" />
+                  <div className="flex items-center shrink-0">
+                    <button
+                      type="button"
+                      className="p-1 text-muted-foreground hover:text-foreground disabled:opacity-30"
+                      onClick={() => moveStatus(i, -1)}
+                      disabled={i === 0}
+                      title="Move up"
+                    >
+                      <ArrowUp className="h-3.5 w-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      className="p-1 text-muted-foreground hover:text-foreground disabled:opacity-30"
+                      onClick={() => moveStatus(i, 1)}
+                      disabled={i === customStatuses.length - 1}
+                      title="Move down"
+                    >
+                      <ArrowDown className="h-3.5 w-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      className="p-1 text-muted-foreground hover:text-destructive"
+                      onClick={() => deleteStatus(s.id)}
+                      title="Delete status"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+
+          <div className="flex items-center gap-2 border-t border-gray-200 pt-3">
+            <input
+              type="color"
+              value={newStatusColor}
+              onChange={(e) => setNewStatusColor(e.target.value)}
+              className="h-7 w-9 shrink-0 cursor-pointer rounded border border-input bg-transparent p-0.5"
+              title="New status color"
+            />
+            <Input
+              value={newStatusName}
+              onChange={(e) => { setNewStatusName(e.target.value); setStatusMgrError(null) }}
+              onKeyDown={(e) => { if (e.key === 'Enter') addStatus() }}
+              placeholder="New status name…"
+              className="h-7 text-[13px]"
+            />
+            <Button size="sm" className="h-7 shrink-0" onClick={addStatus} disabled={!newStatusName.trim()}>
+              <Plus className="h-3 w-3 mr-1" />Add
+            </Button>
+          </div>
+          {statusMgrError && <p className="text-[12px] text-destructive mt-1">{statusMgrError}</p>}
+
+          <DialogFooter>
+            <Button variant="outline" size="sm" onClick={() => setIsStatusMgrOpen(false)}>Close</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* Settings dialog — auto-tags */}
       <Dialog open={isSettingsOpen} onOpenChange={setIsSettingsOpen}>
@@ -1929,14 +2168,12 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
                       <label className="text-[11px] font-medium text-muted-foreground mb-1 block">Status</label>
                       <Select value={batchStatus} onValueChange={setBatchStatus}>
                         <SelectTrigger className="h-8 text-[13px]">
-                          <span className={`inline-flex items-center rounded-sm px-1.5 py-0.5 text-[12px] font-medium border ${statusColor(batchStatus)}`}>
-                            {batchStatus}
-                          </span>
+                          <StatusBadge status={batchStatus} colorMap={statusColorMap} />
                         </SelectTrigger>
                         <SelectContent>
-                          {CASE_STATUSES.map(s => (
+                          {statusNames.map(s => (
                             <SelectItem key={s} value={s} className="text-[13px]">
-                              <span className={`inline-flex items-center rounded-sm px-1.5 py-0.5 text-[12px] font-medium border ${statusColor(s)}`}>{s}</span>
+                              <StatusBadge status={s} colorMap={statusColorMap} />
                             </SelectItem>
                           ))}
                         </SelectContent>
@@ -1986,7 +2223,7 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
                   {batchRowIds.length} cases updated successfully
                 </div>
                 <p className="text-[12px] text-muted-foreground">
-                  All set to <span className={`inline-flex items-center rounded-sm px-1 py-0.5 text-[11px] font-medium border ${statusColor(batchStatus)}`}>{batchStatus}</span>
+                  All set to <StatusBadge status={batchStatus} colorMap={statusColorMap} sizeCls="text-[11px]" />
                   {batchOrderId && <> · Order ID: <span className="font-mono font-medium">{batchOrderId}</span></>}
                   {batchIsConsult && <> · Consult</>}
                 </p>

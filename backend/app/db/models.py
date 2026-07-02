@@ -179,6 +179,18 @@ cohort_slides = Table(
     Column('added_at', DateTime, default=datetime.utcnow)
 )
 
+# Cases a cohort explicitly "follows": every slide of a followed case is kept in
+# the cohort — existing slides are back-filled when the case is followed, and any
+# slide onboarded later for that case auto-joins (see reconcile_auto_cohorts).
+# This is the per-case counterpart to Cohort.auto_add_cases (which follows every
+# case already represented in the cohort).
+cohort_followed_cases = Table(
+    'cohort_followed_cases', Base.metadata,
+    Column('cohort_id', Integer, ForeignKey('cohorts.id', ondelete='CASCADE'), primary_key=True),
+    Column('case_id', Integer, ForeignKey('cases.id', ondelete='CASCADE'), primary_key=True),
+    Column('added_at', DateTime, default=datetime.utcnow)
+)
+
 
 # ============================================================
 # Core Models
@@ -339,6 +351,9 @@ class Cohort(Base):
 
     # Relationships
     slides = relationship('Slide', secondary=cohort_slides, backref='cohorts')
+    # Cases explicitly followed by this cohort (per-case auto-add). Independent of
+    # auto_add_cases, which follows every case already represented in the cohort.
+    followed_cases = relationship('Case', secondary=cohort_followed_cases)
     patients = relationship('CohortPatient', back_populates='cohort', cascade='all, delete-orphan')
     flags = relationship('CohortFlag', back_populates='cohort', cascade='all, delete-orphan')
 
@@ -722,6 +737,41 @@ class RequestRow(Base):
     __table_args__ = (
         UniqueConstraint('sheet_id', 'accession_number', name='uq_sheet_accession'),
     )
+
+
+class RequestStatus(Base):
+    """
+    A user-defined case-status option for request sheets (name + color).
+
+    Global across all sheets — drives the status dropdown and badge color in the
+    Request Tracker. Rows store the status as a plain string (RequestRow.case_status),
+    so deleting an option leaves historical rows intact and renaming one cascades
+    to matching rows in the API. Seeded with sensible defaults on first init.
+    """
+    __tablename__ = 'request_statuses'
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), nullable=False, unique=True)
+    color = Column(String(7), nullable=False, default='#6B7280')  # hex, e.g. "#3B82F6"
+    sort_order = Column(Integer, nullable=False, default=0)  # display order (lower = first)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<RequestStatus(name={self.name}, color={self.color})>"
+
+
+# Default case statuses seeded on first init — colors mirror the existing tone
+# system (neutral/info/warning/success/danger/violet). (label, hex).
+DEFAULT_REQUEST_STATUSES = [
+    ('Not Started', '#6B7280'),
+    ('Slides Requested', '#3B82F6'),
+    ('Partial', '#F59E0B'),
+    ('Slides Received', '#10B981'),
+    ('Missing', '#EF4444'),
+    ('No Blocks/Slides', '#EF4444'),
+    ('Recut Blocks Requested', '#3B82F6'),
+    ('Scanned', '#8B5CF6'),
+]
 
 
 # ============================================================
@@ -1238,6 +1288,29 @@ def _migrate_cohorts(engine):
         print(f"[DB Migration] Skipping cohorts migration: {e}")
 
 
+def _seed_request_statuses(engine):
+    """Populate request_statuses with defaults on first init (table empty)."""
+    from sqlalchemy import text
+    try:
+        insp = inspect(engine)
+        if not insp.has_table('request_statuses'):
+            return
+        with engine.connect() as conn:
+            count = conn.execute(text("SELECT COUNT(*) FROM request_statuses")).scalar()
+            if count and count > 0:
+                return
+            print("[DB Seed] Seeding default request statuses")
+            for i, (name, color) in enumerate(DEFAULT_REQUEST_STATUSES):
+                conn.execute(
+                    text("INSERT INTO request_statuses (name, color, sort_order) "
+                         "VALUES (:n, :c, :o)"),
+                    {"n": name, "c": color, "o": i},
+                )
+            conn.commit()
+    except Exception as e:
+        print(f"[DB Seed] Skipping request-status seed: {e}")
+
+
 def init_db(db_path: Path):
     """
     Initialize database schema and session factory.
@@ -1258,6 +1331,7 @@ def init_db(db_path: Path):
     _migrate_analyses(_engine)         # Adds transforms column to analyses
     _migrate_cohort_patients(_engine)  # Adds display_order to cohort_patients
     _migrate_cohorts(_engine)          # Adds auto_add_cases to cohorts
+    _seed_request_statuses(_engine)    # Seeds default case statuses (request_statuses)
     _SessionLocal = sessionmaker(bind=_engine)
 
 
