@@ -691,21 +691,23 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
     }
   }
 
-  // Follow/unfollow a single case. Following links the whole case: existing
+  // Follow/unfollow one or more whole cases. Following links each case: existing
   // slides back-fill server-side (we refetch to show them) and future onboarded
   // slides auto-join. Unfollowing only stops future auto-add; present slides stay.
-  const toggleFollowCase = async (caseHash: string, next: boolean) => {
-    if (!cohort || !caseHash) return
+  const followCases = async (caseHashes: string[], next: boolean) => {
+    if (!cohort) return
+    const hashes = caseHashes.filter(Boolean)
+    if (hashes.length === 0) return
     const prevFollowed = cohort.followed_case_hashes ?? []
     const optimistic = next
-      ? Array.from(new Set([...prevFollowed, caseHash]))
-      : prevFollowed.filter(h => h !== caseHash)
+      ? Array.from(new Set([...prevFollowed, ...hashes]))
+      : prevFollowed.filter(h => !hashes.includes(h))
     setCohort({ ...cohort, followed_case_hashes: optimistic })
     try {
       const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/followed-cases`, {
         method: next ? 'POST' : 'DELETE',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ case_hashes: [caseHash] }),
+        body: JSON.stringify({ case_hashes: hashes }),
       })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
@@ -720,6 +722,8 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
       setCohort(c => c ? { ...c, followed_case_hashes: prevFollowed } : c)  // revert
     }
   }
+
+  const toggleFollowCase = (caseHash: string, next: boolean) => followCases([caseHash], next)
 
   const removeSlide = async (slideHash: string) => {
     if (!cohort) return
@@ -954,6 +958,25 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
 
                         {flagToolbarMode === 'idle' && (
                           <>
+                            {!cohort.auto_add_cases && (() => {
+                              const selected = Array.from(selectedCaseHashes)
+                              const allFollowed = selected.length > 0 &&
+                                selected.every(h => followedCaseHashes.has(h))
+                              return (
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  className="h-6 px-2 text-xs"
+                                  onClick={() => followCases(selected, !allFollowed)}
+                                  title={allFollowed
+                                    ? 'Stop auto-adding future slides for the selected cases'
+                                    : 'Follow the selected cases — back-fill their slides now and auto-add future ones'}
+                                >
+                                  <Link2 className="h-3 w-3 mr-1" />
+                                  {allFollowed ? 'Unfollow' : 'Follow'}
+                                </Button>
+                              )
+                            })()}
                             {cohortFlags.length > 0 && (
                               <Button
                                 size="sm"
