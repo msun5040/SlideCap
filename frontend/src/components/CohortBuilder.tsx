@@ -9,6 +9,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
 import { Checkbox } from '@/components/ui/checkbox'
+import { Switch } from '@/components/ui/switch'
 import {
   Select,
   SelectContent,
@@ -41,6 +42,10 @@ import { SortableHeader } from '@/components/SortableHeader'
 import { useSlideDetails } from '@/components/SlideDetailsContext'
 import { useSortable } from '@/hooks/useSortable'
 const SLIDE_FLAG_TAG = 'flagged'
+
+// Above this slide count, the per-slide stain dots are replaced by a compact
+// fixed-width proportional stacked bar so long cases don't overflow the row.
+const STAIN_DOT_LIMIT = 12
 
 // Visual hierarchy: patient accent colors (left border + header tint)
 const PATIENT_COLORS = [
@@ -119,6 +124,9 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
   const [yearFilter, setYearFilter] = useState<string>('all')
   const [stainFilter, setStainFilter] = useState<string>('all')
   const [tagFilter, setTagFilter] = useState<string>('all')
+  // Include external (non-clinical) slides by default so they can be added to
+  // cohorts too. exclude = clinical only, only = external only.
+  const [externalFilter, setExternalFilter] = useState<'exclude' | 'include' | 'only'>('include')
   const [availableTags, setAvailableTags] = useState<{ id: number; name: string; color?: string; slide_count?: number }[]>([])
   const [resultsTruncated, setResultsTruncated] = useState(false)
   const [selectedHashes, setSelectedHashes] = useState<Set<string>>(new Set())
@@ -154,6 +162,11 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
   // ── Export dialog ────────────────────────────────────────────────────
   const [isExportDialogOpen, setIsExportDialogOpen] = useState(false)
   const [isExporting, setIsExporting] = useState(false)
+
+  // ── Auto-add result summary (what turning the toggle on pulled in) ─────
+  const [autoAddSummary, setAutoAddSummary] = useState<
+    { totalSlides: number; cases: { label: string; count: number }[] } | null
+  >(null)
 
   // ── Derived state ────────────────────────────────────────────────────
   const cohortHashSet = useMemo(() => {
@@ -615,6 +628,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
       if (yearFilter !== 'all') params.append('year', yearFilter)
       if (stainFilter !== 'all') params.append('stain', stainFilter)
       if (tagFilter !== 'all') params.append('tag', tagFilter)
+      params.append('external', externalFilter)
       const res = await fetch(`${getApiBase()}/search?${params}`)
       if (res.ok) {
         const data = await res.json()
@@ -669,10 +683,13 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
   }
 
   // Toggle the "follow cases" setting. Turning it on back-fills existing
-  // sibling slides server-side; we refetch to show them.
+  // sibling slides server-side; we refetch to show them and report exactly which
+  // cases/slides were pulled in (diffed against the pre-toggle slide set).
   const toggleAutoAddCases = async (next: boolean) => {
     if (!cohort) return
+    const beforeHashes = new Set(cohort.slides.map(s => s.slide_hash))
     setCohort({ ...cohort, auto_add_cases: next })  // optimistic
+    if (!next) setAutoAddSummary(null)              // clear summary when turning off
     try {
       const res = await fetch(`${getApiBase()}/cohorts/${cohortId}`, {
         method: 'PATCH',
@@ -682,12 +699,34 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
       if (next && data.slides_added > 0) {
-        fetchCohort()          // pull in the newly back-filled slides
+        // Refetch the full cohort, then diff to find the newly-added slides.
+        const freshRes = await fetch(`${getApiBase()}/cohorts/${cohortId}`)
+        if (freshRes.ok) {
+          const fresh: CohortDetail = await freshRes.json()
+          setCohort(fresh)
+          const added = fresh.slides.filter(s => !beforeHashes.has(s.slide_hash))
+          // Group by case, keeping a redaction-safe display label (demo → case ID).
+          const byCase = new Map<string, { label: string; count: number }>()
+          for (const s of added) {
+            const key = s.case_hash || s.slide_hash
+            const label = displayCase({ accession_number: s.accession_number, case_hash: s.case_hash })
+            const entry = byCase.get(key)
+            if (entry) entry.count += 1
+            else byCase.set(key, { label, count: 1 })
+          }
+          setAutoAddSummary({
+            totalSlides: added.length,
+            cases: Array.from(byCase.values()).sort((a, b) => b.count - a.count),
+          })
+        }
         fetchAnalysisStatus()
+      } else if (next) {
+        setAutoAddSummary({ totalSlides: 0, cases: [] })
       }
     } catch (e) {
       console.error('Failed to update auto-add setting:', e)
       setCohort(c => c ? { ...c, auto_add_cases: !next } : c)  // revert
+      setAutoAddSummary(null)
     }
   }
 
@@ -851,17 +890,60 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
               <span key={s}> · {s}: {n}</span>
             ))}
           </p>
-          <label
-            className="mt-1.5 inline-flex items-center gap-2 text-xs text-muted-foreground cursor-pointer"
-            title="When on, ALL cases in this cohort are followed: any newly-onboarded slide whose case is already here is added automatically, and existing siblings are pulled in now. To follow only specific cases instead, leave this off and use the link icon on each case."
-          >
-            <Checkbox
-              checked={!!cohort.auto_add_cases}
-              onCheckedChange={(c) => toggleAutoAddCases(!!c)}
-            />
-            <span>Auto-add new slides for all cases</span>
-            <Link2 className="h-3 w-3 opacity-60" />
-          </label>
+          <div className="mt-1.5">
+            <div
+              className="inline-flex items-center gap-2 text-xs text-muted-foreground"
+              title="When on, ALL cases in this cohort are followed: any newly-onboarded slide whose case is already here is added automatically, and existing siblings are pulled in now. To follow only specific cases instead, leave this off and use the link icon on each case."
+            >
+              <Switch
+                checked={!!cohort.auto_add_cases}
+                onCheckedChange={(c) => toggleAutoAddCases(c)}
+                aria-label="Auto-add new slides for all cases"
+              />
+              <span
+                className="cursor-pointer select-none"
+                onClick={() => toggleAutoAddCases(!cohort.auto_add_cases)}
+              >
+                Auto-add new slides for all cases
+              </span>
+              <Link2 className="h-3 w-3 opacity-60" />
+            </div>
+
+            {autoAddSummary && (
+              <div className="mt-1.5 flex items-start gap-2 rounded-md border border-blue-200 bg-blue-50/70 px-2.5 py-1.5 text-xs text-blue-900 max-w-xl">
+                <Link2 className="h-3.5 w-3.5 mt-0.5 shrink-0 text-blue-500" />
+                <div className="min-w-0">
+                  {autoAddSummary.totalSlides > 0 ? (
+                    <>
+                      <span className="font-medium">
+                        Pulled in {autoAddSummary.totalSlides} slide{autoAddSummary.totalSlides !== 1 ? 's' : ''} across {autoAddSummary.cases.length} case{autoAddSummary.cases.length !== 1 ? 's' : ''}
+                      </span>
+                      <div className="mt-1 flex flex-wrap gap-1">
+                        {autoAddSummary.cases.map(c => (
+                          <span
+                            key={c.label}
+                            className="inline-flex items-center gap-1 rounded bg-white/70 border border-blue-200 px-1.5 py-0.5"
+                          >
+                            <span className="font-mono">{c.label}</span>
+                            <span className="text-blue-500">+{c.count}</span>
+                          </span>
+                        ))}
+                      </div>
+                    </>
+                  ) : (
+                    <span>Auto-add on — no additional slides to pull in right now.</span>
+                  )}
+                </div>
+                <button
+                  className="ml-auto shrink-0 text-blue-400 hover:text-blue-700"
+                  onClick={() => setAutoAddSummary(null)}
+                  title="Dismiss"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            )}
+          </div>
         </div>
         <div className="flex items-center gap-2 shrink-0 mt-0.5">
           <Button
@@ -1081,12 +1163,18 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                           // per-case toggle is disabled in that mode (nothing to opt out of).
                           const followLockedByCohort = !!cohort.auto_add_cases
 
-                          // Group slides by stain for the dot summary
+                          // Group slides by stain for the dot / bar summary
                           const stainCounts: Record<string, number> = {}
                           for (const s of group.slides) {
                             const key = s.stain_type === 'HE' ? 'HE' : s.stain_type.startsWith('IHC') ? 'IHC' : s.stain_type
                             stainCounts[key] = (stainCounts[key] || 0) + 1
                           }
+                          // Stable category order for the stacked bar (HE, IHC, Special, then rest).
+                          const stainRank = (k: string) => (k === 'HE' ? 0 : k === 'IHC' ? 1 : k === 'Special' ? 2 : 3)
+                          const orderedStains = Object.entries(stainCounts)
+                            .sort((a, b) => stainRank(a[0]) - stainRank(b[0]) || a[0].localeCompare(b[0]))
+                          const stainTitle = orderedStains.map(([s, n]) => `${s}: ${n}`).join(', ')
+                          const useStainBar = group.slides.length > STAIN_DOT_LIMIT
 
                           return (
                             <div
@@ -1127,17 +1215,33 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                                   )}
                                 </button>
 
-                                {/* Stain composition dots — at-a-glance view */}
-                                <div className="flex items-center gap-1 shrink-0" title={Object.entries(stainCounts).map(([s, n]) => `${s}: ${n}`).join(', ')}>
-                                  {group.slides.map((s, i) => (
-                                    <span
-                                      key={i}
-                                      className="inline-block h-2 w-2 rounded-full shrink-0"
-                                      style={{ backgroundColor: getStainDotColor(s.stain_type) }}
-                                      title={`${s.block_id} · ${s.stain_type}`}
-                                    />
-                                  ))}
-                                </div>
+                                {/* Stain composition — dots for small cases, a compact
+                                    proportional stacked bar for long ones (fixed width). */}
+                                {useStainBar ? (
+                                  <div
+                                    className="flex h-2.5 w-24 rounded-full overflow-hidden shrink-0 ring-1 ring-black/5"
+                                    title={stainTitle}
+                                  >
+                                    {orderedStains.map(([cat, n]) => (
+                                      <div
+                                        key={cat}
+                                        style={{ width: `${(n / group.slides.length) * 100}%`, backgroundColor: getStainDotColor(cat) }}
+                                        title={`${cat}: ${n}`}
+                                      />
+                                    ))}
+                                  </div>
+                                ) : (
+                                  <div className="flex items-center gap-1 shrink-0" title={stainTitle}>
+                                    {group.slides.map((s, i) => (
+                                      <span
+                                        key={i}
+                                        className="inline-block h-2 w-2 rounded-full shrink-0"
+                                        style={{ backgroundColor: getStainDotColor(s.stain_type) }}
+                                        title={`${s.block_id} · ${s.stain_type}`}
+                                      />
+                                    ))}
+                                  </div>
+                                )}
 
                                 {/* Slide count */}
                                 <span className="text-[11px] text-muted-foreground shrink-0 tabular-nums">
@@ -1517,6 +1621,16 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                       ))}
                     </SelectContent>
                   </Select>
+                  <Select value={externalFilter} onValueChange={(v) => setExternalFilter(v as 'exclude' | 'include' | 'only')}>
+                    <SelectTrigger className="w-36 h-8 text-xs">
+                      <SelectValue placeholder="Slide type" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="include">Clinical + external</SelectItem>
+                      <SelectItem value="exclude">Clinical only</SelectItem>
+                      <SelectItem value="only">External only</SelectItem>
+                    </SelectContent>
+                  </Select>
                 </div>
               </div>
 
@@ -1584,7 +1698,16 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                                 onCheckedChange={() => toggleSlideSelection(slide.slide_hash)}
                               />
                             </TableCell>
-                            <TableCell className="text-sm font-medium">{displaySlide(slide)}</TableCell>
+                            <TableCell className="text-sm font-medium">
+                              <span className="inline-flex items-center gap-1.5">
+                                {displaySlide(slide)}
+                                {slide.is_external && (
+                                  <Badge variant="outline" className="text-[10px] h-4 px-1 font-medium text-amber-700 border-amber-300 bg-amber-50">
+                                    Ext
+                                  </Badge>
+                                )}
+                              </span>
+                            </TableCell>
                             <TableCell className="text-sm text-muted-foreground">{slide.block_id}</TableCell>
                             <TableCell>
                               {inCohort ? (
