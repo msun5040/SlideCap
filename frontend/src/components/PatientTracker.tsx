@@ -77,8 +77,10 @@ export function PatientTracker({ cohortId, caseGroups, placeholders = [], onPati
 
   // ── Fetch ────────────────────────────────────────────────────────────────
 
-  const fetchPatients = useCallback(async () => {
-    setLoading(true)
+  // silent=true skips the full-panel "Loading…" swap — used for refetches after
+  // a mutation (reorder/add) so expanded patients don't flash/collapse.
+  const fetchPatients = useCallback(async (opts?: { silent?: boolean }) => {
+    if (!opts?.silent) setLoading(true)
     try {
       const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/patients`)
       if (res.ok) {
@@ -88,7 +90,7 @@ export function PatientTracker({ cohortId, caseGroups, placeholders = [], onPati
         // (createPatient / assignCase still auto-expand a just-added patient.)
       }
     } catch { /* ignore */ }
-    setLoading(false)
+    if (!opts?.silent) setLoading(false)
   }, [cohortId])
 
   useEffect(() => { fetchPatients() }, [fetchPatients])
@@ -358,11 +360,11 @@ export function PatientTracker({ cohortId, caseGroups, placeholders = [], onPati
         body: JSON.stringify({ items }),
       })
       if (res.ok) {
-        fetchPatients()            // refresh surgery order (own state)
-        onPatientsChanged?.()      // re-sort the Cases tab
-        onPlaceholdersChanged?.()  // refresh placeholder order (prop)
-      } else fetchPatients()
-    } catch { fetchPatients() }
+        fetchPatients({ silent: true })  // refresh surgery order without a flash
+        onPatientsChanged?.()            // re-sort the Cases tab
+        onPlaceholdersChanged?.()        // refresh placeholder order (prop)
+      } else fetchPatients({ silent: true })
+    } catch { fetchPatients({ silent: true }) }
   }
 
   const submitAddPlaceholder = async () => {

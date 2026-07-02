@@ -962,7 +962,10 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
   const stainTypes = ['HE', 'IHC', 'Special']
 
   // ── Guards ───────────────────────────────────────────────────────────
-  if (cohortLoading) {
+  // Only show the full-screen loader on the FIRST load (no cohort yet).
+  // Background refetches (e.g. after a placeholder move/create) keep the view
+  // mounted so child state — like which patient is expanded — is preserved.
+  if (cohortLoading && !cohort) {
     return (
       <div className="flex items-center justify-center h-64">
         <p className="text-muted-foreground">Loading cohort...</p>
