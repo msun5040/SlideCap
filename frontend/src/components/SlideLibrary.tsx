@@ -873,8 +873,8 @@ export function SlideLibrary() {
         </p>
       </div>
 
-      <div className="flex flex-col gap-4 lg:flex-row">
-        <div className="relative flex-1">
+      <div className="flex flex-col gap-4 xl:flex-row">
+        <div className="relative w-full xl:flex-1 xl:min-w-[240px]">
           <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
           <Input
             placeholder="Search by accession number, slide ID, patient ID..."
