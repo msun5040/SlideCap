@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import text as sa_text, func, or_
 
 from .config import settings
-from .db import init_db, get_db, get_session, Case, Slide, Tag, Project, Cohort, CohortFlag, CohortPatient, CohortPatientCase, Analysis, AnalysisJob, JobSlide, SlideQC, RequestSheet, RequestRow, RequestStatus, Study, StudyGroup, init_lock, get_lock, Patient, ExternalMapping, generate_slidecap_id
+from .db import init_db, get_db, get_session, Case, Slide, Tag, Project, Cohort, CohortFlag, CohortPatient, CohortPatientCase, CohortPlaceholder, Analysis, AnalysisJob, JobSlide, SlideQC, RequestSheet, RequestRow, RequestStatus, Study, StudyGroup, init_lock, get_lock, Patient, ExternalMapping, generate_slidecap_id
 from .services import SlideHasher, SlideIndexer, ClusterService, JobStatusPoller
 from .auth import AuthMiddleware, create_challenge, verify_challenge, create_token, verify_token, cleanup_expired_challenges
 from . import demo as demo_mod
@@ -409,6 +409,23 @@ def get_thumbnail_stats():
 # Indexing Endpoints
 # ============================================================
 
+def apply_cohort_auto_tags(db: Session, cohort: Cohort, slides=None) -> int:
+    """Apply the cohort's auto-tags to its slides (or a given subset). Returns the
+    number of (slide, tag) assignments added. Caller commits."""
+    tags = list(cohort.auto_tags)
+    if not tags:
+        return 0
+    target = slides if slides is not None else list(cohort.slides)
+    applied = 0
+    for s in target:
+        existing = {t.id for t in s.tags}
+        for t in tags:
+            if t.id not in existing:
+                s.tags.append(t)
+                applied += 1
+    return applied
+
+
 def reconcile_auto_cohorts(db: Session, cohort_id: Optional[int] = None) -> int:
     """Ensure every case-following cohort contains all slides of the cases it tracks.
 
@@ -444,6 +461,8 @@ def reconcile_auto_cohorts(db: Session, cohort_id: Optional[int] = None) -> int:
         if to_add:
             cohort.slides.extend(to_add)
             total_added += len(to_add)
+            # Keep the cohort's auto-tags applied to the freshly pulled-in slides.
+            apply_cohort_auto_tags(db, cohort, slides=to_add)
             print(f"[AutoCohort] '{cohort.name}': added {len(to_add)} slide(s) for tracked cases")
     if total_added:
         db.commit()
@@ -2179,6 +2198,17 @@ def get_cohort(cohort_id: int, db: Session = Depends(get_db)):
         "case_count": cohort.case_count,
         "auto_add_cases": cohort.auto_add_cases,
         "followed_case_hashes": [c.accession_hash for c in cohort.followed_cases],
+        "auto_tags": [{"id": t.id, "name": t.name, "color": t.color} for t in cohort.auto_tags],
+        "placeholders": [
+            {
+                "id": p.id,
+                "label": p.label,
+                "note": p.note,
+                "expected_slides": p.expected_slides,
+                "created_at": p.created_at.isoformat() if p.created_at else None,
+            }
+            for p in sorted(cohort.placeholders, key=lambda x: x.id)
+        ],
         "slides": slides_data
     }
 
@@ -2239,6 +2269,9 @@ def add_slides_to_cohort(cohort_id: int, data: CohortAddSlides, db: Session = De
                 {"cid": cohort_id, "sid": slide.id},
             )
             added.append(slide.slide_hash)
+        # Keep the cohort's auto-tags applied to the newly added slides.
+        if to_add:
+            apply_cohort_auto_tags(db, cohort, slides=to_add)
         db.commit()
 
     db.refresh(cohort)
@@ -2351,6 +2384,85 @@ def unfollow_cases(cohort_id: int, data: CohortFollowCases, db: Session = Depend
     }
 
 
+# ── Cohort placeholders (outstanding "to find & scan" reminders) ──────────
+
+class CohortPlaceholderCreate(BaseModel):
+    label: str
+    note: Optional[str] = None
+    expected_slides: Optional[int] = None
+
+
+def _serialize_placeholder(p: CohortPlaceholder) -> dict:
+    return {
+        "id": p.id,
+        "label": p.label,
+        "note": p.note,
+        "expected_slides": p.expected_slides,
+        "created_at": p.created_at.isoformat() if p.created_at else None,
+    }
+
+
+@app.post("/cohorts/{cohort_id}/placeholders")
+def add_cohort_placeholder(cohort_id: int, data: CohortPlaceholderCreate, db: Session = Depends(get_db)):
+    """Add a placeholder reminder for slides that still need to be found/scanned."""
+    cohort = db.query(Cohort).filter_by(id=cohort_id).first()
+    if not cohort:
+        raise HTTPException(status_code=404, detail="Cohort not found")
+    label = (data.label or "").strip()
+    if not label:
+        raise HTTPException(status_code=400, detail="Placeholder label is required")
+    with get_lock().write_lock():
+        placeholder = CohortPlaceholder(
+            cohort_id=cohort_id,
+            label=label,
+            note=(data.note or None),
+            expected_slides=data.expected_slides,
+        )
+        db.add(placeholder)
+        db.commit()
+        db.refresh(placeholder)
+    return _serialize_placeholder(placeholder)
+
+
+@app.delete("/cohorts/{cohort_id}/placeholders/{placeholder_id}")
+def delete_cohort_placeholder(cohort_id: int, placeholder_id: int, db: Session = Depends(get_db)):
+    """Remove a placeholder (e.g. once its slides have been found and added)."""
+    placeholder = db.query(CohortPlaceholder).filter_by(id=placeholder_id, cohort_id=cohort_id).first()
+    if not placeholder:
+        raise HTTPException(status_code=404, detail="Placeholder not found")
+    with get_lock().write_lock():
+        db.delete(placeholder)
+        db.commit()
+    return {"status": "ok"}
+
+
+# ── Cohort auto-tags (tag every slide in the cohort, now and as it grows) ──
+
+class CohortAutoTags(BaseModel):
+    tag_ids: List[int]
+
+
+@app.put("/cohorts/{cohort_id}/auto-tags")
+def set_cohort_auto_tags(cohort_id: int, data: CohortAutoTags, db: Session = Depends(get_db)):
+    """Set the cohort's auto-tags and apply them to every slide currently in it.
+
+    The tags are also re-applied whenever slides are added or auto-added, so
+    'tag everything in this cohort' stays true as the cohort grows.
+    """
+    cohort = db.query(Cohort).options(joinedload(Cohort.slides)).filter_by(id=cohort_id).first()
+    if not cohort:
+        raise HTTPException(status_code=404, detail="Cohort not found")
+    with get_lock().write_lock():
+        tags = db.query(Tag).filter(Tag.id.in_(data.tag_ids)).all() if data.tag_ids else []
+        cohort.auto_tags = tags
+        applied = apply_cohort_auto_tags(db, cohort)
+        db.commit()
+    return {
+        "auto_tags": [{"id": t.id, "name": t.name, "color": t.color} for t in cohort.auto_tags],
+        "applied": applied,
+    }
+
+
 class _ZipStreamWriter:
     """File-like object that feeds zip data to a queue in ~1 MB chunks."""
 
@@ -2439,9 +2551,22 @@ def _enrich_surgery(
     }
 
 
+def _natural_label_key(label: str):
+    """Case-insensitive, digit-aware sort key so 'P2' sorts before 'P10' and
+    'Autopsy' before 'autopsy2'."""
+    s = (label or "").lower()
+    return [int(t) if t.isdigit() else t for t in re.split(r'(\d+)', s)]
+
+
 @app.get("/cohorts/{cohort_id}/patients")
 def list_cohort_patients(cohort_id: int, db: Session = Depends(get_db)):
-    """List all patients (and their surgery assignments) for a cohort."""
+    """List all patients (and their surgery assignments) for a cohort.
+
+    Default order is alphabetical (natural) by label. Once the user manually
+    reorders, the cohort's patients_manual_order flag flips on and we honor the
+    stored display_order instead. Both the Patients tab and the Cases-tab
+    grouping consume this order, so they stay in sync.
+    """
     cohort = (
         db.query(Cohort)
         .options(joinedload(Cohort.slides))
@@ -2457,9 +2582,13 @@ def list_cohort_patients(cohort_id: int, db: Session = Depends(get_db)):
         db.query(CohortPatient)
         .options(joinedload(CohortPatient.surgeries).joinedload(CohortPatientCase.case).joinedload(Case.slides))
         .filter_by(cohort_id=cohort_id)
-        .order_by(CohortPatient.display_order, CohortPatient.label)
         .all()
     )
+    if cohort.patients_manual_order:
+        patients.sort(key=lambda p: (p.display_order, _natural_label_key(p.label)))
+    else:
+        patients.sort(key=lambda p: _natural_label_key(p.label))
+
     return [
         {
             "id": p.id,
@@ -2501,7 +2630,8 @@ def reorder_cohort_patients(cohort_id: int, data: PatientReorder, db: Session = 
     position. Registered before /patients/{patient_id} so "reorder" isn't parsed
     as a patient id.
     """
-    if not db.query(Cohort).filter_by(id=cohort_id).first():
+    cohort = db.query(Cohort).filter_by(id=cohort_id).first()
+    if not cohort:
         raise HTTPException(status_code=404, detail="Cohort not found")
     with get_lock().write_lock():
         patients = db.query(CohortPatient).filter_by(cohort_id=cohort_id).all()
@@ -2517,6 +2647,20 @@ def reorder_cohort_patients(cohort_id: int, data: PatientReorder, db: Session = 
             if p.id not in set(data.patient_ids):
                 p.display_order = order
                 order += 1
+        # A manual reorder switches this cohort off alphabetical mode.
+        cohort.patients_manual_order = True
+        db.commit()
+    return {"status": "ok"}
+
+
+@app.post("/cohorts/{cohort_id}/patients/reset-order")
+def reset_cohort_patient_order(cohort_id: int, db: Session = Depends(get_db)):
+    """Return the Patients tab to the default alphabetical (natural) ordering."""
+    cohort = db.query(Cohort).filter_by(id=cohort_id).first()
+    if not cohort:
+        raise HTTPException(status_code=404, detail="Cohort not found")
+    with get_lock().write_lock():
+        cohort.patients_manual_order = False
         db.commit()
     return {"status": "ok"}
 

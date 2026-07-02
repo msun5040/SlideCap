@@ -6,6 +6,7 @@ import {
   ChevronRight,
   ArrowUp,
   ArrowDown,
+  ArrowDownAZ,
   UserCircle2,
   Stethoscope,
 } from 'lucide-react'
@@ -277,6 +278,19 @@ export function PatientTracker({ cohortId, caseGroups, onPatientsChanged }: Pati
     } catch { fetchPatients() }
   }
 
+  // Return to the default alphabetical (A–Z) ordering, clearing the manual order.
+  const resetOrder = async () => {
+    try {
+      const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/patients/reset-order`, {
+        method: 'POST',
+      })
+      if (res.ok) {
+        await fetchPatients()   // re-pull in alphabetical order
+        onPatientsChanged?.()   // re-sort the Cases tab too
+      }
+    } catch { fetchPatients() }
+  }
+
   // ── Render ───────────────────────────────────────────────────────────────
 
   if (loading)
@@ -293,15 +307,29 @@ export function PatientTracker({ cohortId, caseGroups, onPatientsChanged }: Pati
             {assignedCaseHashes.size > 0 && ` · ${assignedCaseHashes.size} assigned`}
           </span>
         </div>
-        <Button
-          size="sm"
-          variant="outline"
-          className="h-7 text-xs"
-          onClick={() => { setShowNewPatient(true); setNewPatientLabel('') }}
-        >
-          <Plus className="h-3.5 w-3.5 mr-1" />
-          New Patient
-        </Button>
+        <div className="flex items-center gap-1.5">
+          {patients.length > 1 && (
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-7 text-xs text-muted-foreground"
+              onClick={resetOrder}
+              title="Reset to alphabetical order (A–Z). Use the up/down arrows on a patient to set a custom order."
+            >
+              <ArrowDownAZ className="h-3.5 w-3.5 mr-1" />
+              Sort A–Z
+            </Button>
+          )}
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-7 text-xs"
+            onClick={() => { setShowNewPatient(true); setNewPatientLabel('') }}
+          >
+            <Plus className="h-3.5 w-3.5 mr-1" />
+            New Patient
+          </Button>
+        </div>
       </div>
 
       <div className="flex-1 overflow-auto divide-y">

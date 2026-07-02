@@ -3,7 +3,7 @@ import {
   ArrowLeft, Search, Filter, X, Plus, ChevronDown, ChevronRight,
   Check, Download, FolderArchive, AlertTriangle, Users, FileText,
   CheckCircle2, Clock, XCircle, Loader2, Flag, BarChart2, Trash2, Stethoscope,
-  Microscope, ClipboardList, Link2,
+  Microscope, ClipboardList, Link2, CircleDashed, Settings, Tag as TagIcon,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -29,10 +29,11 @@ import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import type { Slide, CohortSlide, CohortDetail, CaseGroup, CohortFlag, CohortPatient } from '@/types/slide'
+import type { Slide, CohortSlide, CohortDetail, CaseGroup, CohortFlag, CohortPatient, CohortPlaceholder } from '@/types/slide'
 import { PatientTracker } from '@/components/PatientTracker'
 import { CohortFromPasteDialog } from '@/components/CohortFromPasteDialog'
 
@@ -113,7 +114,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
   const [cohortLoading, setCohortLoading] = useState(true)
 
   // ── Tab state ────────────────────────────────────────────────────────
-  const [activeTab, setActiveTab] = useState<'cases' | 'patients'>('cases')
+  const [activeTab, setActiveTab] = useState<'cases' | 'patients' | 'settings'>('cases')
 
   // ── Add Slides drawer ────────────────────────────────────────────────
   const [showAddSlides, setShowAddSlides] = useState(false)
@@ -167,6 +168,18 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
   const [autoAddSummary, setAutoAddSummary] = useState<
     { totalSlides: number; cases: { label: string; count: number }[] } | null
   >(null)
+
+  // ── "To find & scan" placeholder dialog ──────────────────────────────
+  const [isPlaceholderOpen, setIsPlaceholderOpen] = useState(false)
+  const [placeholderLabel, setPlaceholderLabel] = useState('')
+  const [placeholderNote, setPlaceholderNote] = useState('')
+  const [placeholderCount, setPlaceholderCount] = useState('')
+  const [savingPlaceholder, setSavingPlaceholder] = useState(false)
+
+  // ── Settings tab: cohort auto-tags ───────────────────────────────────
+  const [autoTagIds, setAutoTagIds] = useState<Set<number>>(new Set())
+  const [savingAutoTags, setSavingAutoTags] = useState(false)
+  const [autoTagsMessage, setAutoTagsMessage] = useState<string | null>(null)
 
   // ── Derived state ────────────────────────────────────────────────────
   const cohortHashSet = useMemo(() => {
@@ -436,6 +449,15 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
     }
     fetchTags()
   }, [])
+
+  // Sync the auto-tag selection from the cohort whenever its saved set changes
+  // (initial load + after save). Keyed on the tag-id list so in-progress edits
+  // aren't clobbered by unrelated cohort updates (e.g. slide add/remove).
+  const savedAutoTagKey = (cohort?.auto_tags ?? []).map(t => t.id).join(',')
+  useEffect(() => {
+    setAutoTagIds(new Set((cohort?.auto_tags ?? []).map(t => t.id)))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cohortId, savedAutoTagKey])
 
   // ── Flag operations ──────────────────────────────────────────────────
   const applyFlagToSelected = async (flagId: number) => {
@@ -764,6 +786,87 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
 
   const toggleFollowCase = (caseHash: string, next: boolean) => followCases([caseHash], next)
 
+  // ── Placeholders (outstanding "to find & scan" reminders) ────────────
+  const addPlaceholder = async () => {
+    if (!cohort) return
+    const label = placeholderLabel.trim()
+    if (!label) return
+    setSavingPlaceholder(true)
+    try {
+      const parsedCount = parseInt(placeholderCount, 10)
+      const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/placeholders`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          label,
+          note: placeholderNote.trim() || null,
+          expected_slides: Number.isFinite(parsedCount) && parsedCount > 0 ? parsedCount : null,
+        }),
+      })
+      if (res.ok) {
+        const created: CohortPlaceholder = await res.json()
+        setCohort(c => c ? { ...c, placeholders: [...(c.placeholders ?? []), created] } : c)
+        setPlaceholderLabel(''); setPlaceholderNote(''); setPlaceholderCount('')
+        setIsPlaceholderOpen(false)
+      }
+    } catch (e) {
+      console.error('Failed to add placeholder:', e)
+    } finally {
+      setSavingPlaceholder(false)
+    }
+  }
+
+  const deletePlaceholder = async (id: number) => {
+    if (!cohort) return
+    const prev = cohort.placeholders ?? []
+    setCohort(c => c ? { ...c, placeholders: prev.filter(p => p.id !== id) } : c)  // optimistic
+    try {
+      const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/placeholders/${id}`, { method: 'DELETE' })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    } catch (e) {
+      console.error('Failed to delete placeholder:', e)
+      setCohort(c => c ? { ...c, placeholders: prev } : c)  // revert
+    }
+  }
+
+  // ── Cohort auto-tags ─────────────────────────────────────────────────
+  const toggleAutoTag = (id: number) => {
+    setAutoTagsMessage(null)
+    setAutoTagIds(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id); else next.add(id)
+      return next
+    })
+  }
+
+  const saveAutoTags = async () => {
+    if (!cohort) return
+    setSavingAutoTags(true)
+    setAutoTagsMessage(null)
+    try {
+      const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/auto-tags`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tag_ids: Array.from(autoTagIds) }),
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json()
+      setAutoTagsMessage(
+        autoTagIds.size === 0
+          ? 'Auto-tags cleared.'
+          : data.applied > 0
+            ? `Applied to ${data.applied} slide${data.applied === 1 ? '' : 's'}.`
+            : 'Saved. All slides already had these tags.'
+      )
+      fetchCohort()  // reflect newly-applied tags on the slides
+    } catch (e) {
+      console.error('Failed to save auto-tags:', e)
+      setAutoTagsMessage('Failed to save auto-tags.')
+    } finally {
+      setSavingAutoTags(false)
+    }
+  }
+
   const removeSlide = async (slideHash: string) => {
     if (!cohort) return
     const prev = cohort
@@ -954,6 +1057,15 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
             <Plus className="mr-1.5 h-4 w-4" />
             Add Slides
           </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setIsPlaceholderOpen(true)}
+            title="Add a reminder for slides you still need to find and scan"
+          >
+            <CircleDashed className="mr-1.5 h-4 w-4" />
+            Placeholder
+          </Button>
           {stats.slides > 0 && (
             <>
               <a
@@ -980,6 +1092,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
           [
             { key: 'cases', label: 'Cases', icon: <FileText className="h-3.5 w-3.5" />, count: stats.cases },
             { key: 'patients', label: 'Patients', icon: <Users className="h-3.5 w-3.5" />, count: null },
+            { key: 'settings', label: 'Settings', icon: <Settings className="h-3.5 w-3.5" />, count: null },
           ] as const
         ).map(({ key, label, icon, count }) => (
           <button
@@ -1010,16 +1123,61 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
           {/* ── Cases tab ── */}
           {activeTab === 'cases' && (
             <div className="flex-1 overflow-hidden flex flex-col">
+              {/* Outstanding placeholders — slides still to be found & scanned */}
+              {(cohort.placeholders ?? []).length > 0 && (
+                <div className="shrink-0 border-b border-amber-200 bg-amber-50/40 px-2 py-2 space-y-1 max-h-44 overflow-auto">
+                  <div className="flex items-center gap-1.5 px-1 text-[11px] font-medium text-amber-700">
+                    <CircleDashed className="h-3.5 w-3.5" />
+                    Outstanding — to find &amp; scan ({(cohort.placeholders ?? []).length})
+                  </div>
+                  {(cohort.placeholders ?? []).map(p => (
+                    <div
+                      key={p.id}
+                      className="flex items-center gap-2 rounded-md border border-dashed border-amber-300 bg-white/70 px-2.5 py-1.5 group/ph"
+                    >
+                      <CircleDashed className="h-3.5 w-3.5 text-amber-500 shrink-0" />
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm font-medium font-mono truncate">{p.label}</span>
+                          {p.expected_slides ? (
+                            <span className="text-[11px] text-amber-700 bg-amber-100 rounded px-1.5 py-0.5 shrink-0">
+                              ~{p.expected_slides} slide{p.expected_slides !== 1 ? 's' : ''}
+                            </span>
+                          ) : null}
+                        </div>
+                        {p.note && <p className="text-[11px] text-muted-foreground truncate">{p.note}</p>}
+                      </div>
+                      <span className="text-[10px] uppercase tracking-wide text-amber-600 shrink-0 hidden sm:inline">Needs scanning</span>
+                      <button
+                        className="shrink-0 text-muted-foreground/50 hover:text-destructive transition-colors"
+                        onClick={() => deletePlaceholder(p.id)}
+                        title="Resolve — remove this placeholder (e.g. once the slides are added)"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
               {caseGroups.length === 0 ? (
-                <div className="flex flex-col items-center justify-center h-full gap-3 text-center p-8">
-                  <FileText className="h-10 w-10 text-muted-foreground/40" />
-                  <div>
-                    <p className="text-sm font-medium">No slides in this cohort</p>
-                    <p className="text-xs text-muted-foreground mt-1">
-                      Click "Add Slides" above to search and add slides.
+                (cohort.placeholders ?? []).length > 0 ? (
+                  <div className="flex-1 flex items-center justify-center text-center p-8">
+                    <p className="text-xs text-muted-foreground">
+                      No slides added yet — the items above are still outstanding.
                     </p>
                   </div>
-                </div>
+                ) : (
+                  <div className="flex flex-col items-center justify-center h-full gap-3 text-center p-8">
+                    <FileText className="h-10 w-10 text-muted-foreground/40" />
+                    <div>
+                      <p className="text-sm font-medium">No slides in this cohort</p>
+                      <p className="text-xs text-muted-foreground mt-1">
+                        Click "Add Slides" above to search and add slides.
+                      </p>
+                    </div>
+                  </div>
+                )
               ) : (
                 <>
                   {/* Select-all + bulk flag toolbar */}
@@ -1548,6 +1706,73 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
             </div>
           )}
 
+          {/* ── Settings tab ── */}
+          {activeTab === 'settings' && (
+            <div className="flex-1 overflow-auto p-4">
+              <div className="max-w-xl space-y-6">
+                {/* Auto-tagging */}
+                <section>
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h3 className="text-sm font-semibold flex items-center gap-1.5">
+                        <TagIcon className="h-4 w-4" />
+                        Auto-tag everything
+                      </h3>
+                      <p className="text-xs text-muted-foreground mt-0.5">
+                        Apply these tags to every slide in the cohort. New slides added later (including via case-following) are tagged automatically.
+                      </p>
+                    </div>
+                    {autoTagIds.size > 0 && (
+                      <button
+                        type="button"
+                        className="text-[11px] text-muted-foreground underline hover:text-foreground shrink-0"
+                        onClick={() => { setAutoTagIds(new Set()); setAutoTagsMessage(null) }}
+                      >
+                        Clear
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="mt-3 flex flex-wrap gap-1.5">
+                    {availableTags.length === 0 ? (
+                      <p className="text-xs text-muted-foreground">No tags exist yet. Create one in the Slide Library.</p>
+                    ) : (
+                      availableTags.map(t => {
+                        const selected = autoTagIds.has(t.id)
+                        return (
+                          <button
+                            key={t.id}
+                            type="button"
+                            onClick={() => toggleAutoTag(t.id)}
+                            className={`inline-flex items-center gap-1 rounded-sm px-2 py-1 text-[12px] transition-colors ${
+                              selected
+                                ? 'bg-selected-bg text-selected-foreground font-semibold border border-[var(--selected-accent)]'
+                                : 'border border-input hover:bg-muted'
+                            }`}
+                            style={!selected && t.color ? { borderColor: t.color, color: t.color } : undefined}
+                          >
+                            {t.color && <span className="h-2 w-2 rounded-[2px]" style={{ backgroundColor: t.color }} />}
+                            <span className={selected ? 'text-foreground font-medium' : ''}>{t.name}</span>
+                            {selected && <Check className="h-3 w-3" />}
+                          </button>
+                        )
+                      })
+                    )}
+                  </div>
+
+                  <div className="mt-3 flex items-center gap-3">
+                    <Button size="sm" onClick={saveAutoTags} disabled={savingAutoTags}>
+                      {savingAutoTags ? 'Applying…' : 'Apply auto-tags'}
+                    </Button>
+                    {autoTagsMessage && (
+                      <span className="text-xs text-muted-foreground">{autoTagsMessage}</span>
+                    )}
+                  </div>
+                </section>
+              </div>
+            </div>
+          )}
+
         </div>
 
         {/* ── Right panel: Cohort Overview OR Add Slides ── */}
@@ -1883,6 +2108,60 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
       </div>
 
       {/* ── Export Dialog ── */}
+      {/* Add placeholder dialog */}
+      <Dialog open={isPlaceholderOpen} onOpenChange={setIsPlaceholderOpen}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <CircleDashed className="h-5 w-5 text-amber-500" />
+              Add placeholder
+            </DialogTitle>
+            <DialogDescription>
+              Track slides you still need to find and scan. This is a reminder, not a real slide — remove it once the slides are located and added.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3 py-1">
+            <div>
+              <label className="text-xs font-medium text-muted-foreground mb-1 block">Accession / description</label>
+              <Input
+                autoFocus
+                placeholder="e.g. S24-12345 or 'recuts for case A'"
+                value={placeholderLabel}
+                onChange={e => setPlaceholderLabel(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') addPlaceholder() }}
+              />
+            </div>
+            <div>
+              <label className="text-xs font-medium text-muted-foreground mb-1 block">Note (optional)</label>
+              <Input
+                placeholder="e.g. pull from archive, needs re-scan"
+                value={placeholderNote}
+                onChange={e => setPlaceholderNote(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') addPlaceholder() }}
+              />
+            </div>
+            <div>
+              <label className="text-xs font-medium text-muted-foreground mb-1 block">Expected # of slides (optional)</label>
+              <Input
+                type="number"
+                min="1"
+                placeholder="e.g. 3"
+                value={placeholderCount}
+                onChange={e => setPlaceholderCount(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') addPlaceholder() }}
+                className="w-32"
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" size="sm" onClick={() => setIsPlaceholderOpen(false)}>Cancel</Button>
+            <Button size="sm" onClick={addPlaceholder} disabled={!placeholderLabel.trim() || savingPlaceholder}>
+              {savingPlaceholder ? 'Adding…' : 'Add placeholder'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <Dialog open={isExportDialogOpen} onOpenChange={setIsExportDialogOpen}>
         <DialogContent className="max-w-md">
           <DialogHeader>

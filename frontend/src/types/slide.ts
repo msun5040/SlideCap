@@ -80,10 +80,24 @@ export interface CohortDetail {
   // Case accession_hashes explicitly "followed" by this cohort — every slide of
   // a followed case is kept, and future onboarded slides for it auto-join.
   followed_case_hashes?: string[]
+  // Manual "to find & scan" reminders tracked alongside real slides.
+  placeholders?: CohortPlaceholder[]
+  // Tags auto-applied to every slide in the cohort (now and as it grows).
+  auto_tags?: { id: number; name: string; color?: string }[]
   created_by?: string
   created_at?: string
   updated_at?: string
   slides: CohortSlide[]
+}
+
+// A placeholder for slides that still need to be found/scanned — lets users
+// track outstanding work inside a cohort. Not a real slide.
+export interface CohortPlaceholder {
+  id: number
+  label: string
+  note?: string | null
+  expected_slides?: number | null
+  created_at?: string | null
 }
 
 export interface CaseGroup {

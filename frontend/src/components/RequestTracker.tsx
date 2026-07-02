@@ -18,7 +18,6 @@ import {
   Microscope,
   Settings,
   Tag as TagIcon,
-  Palette,
   ArrowUp,
   ArrowDown,
 } from 'lucide-react'
@@ -734,7 +733,6 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
 
   // Custom case statuses (global, user-defined name + color)
   const [customStatuses, setCustomStatuses] = useState<RequestStatus[]>([])
-  const [isStatusMgrOpen, setIsStatusMgrOpen] = useState(false)
   const [newStatusName, setNewStatusName] = useState('')
   const [newStatusColor, setNewStatusColor] = useState('#6B7280')
   const [statusMgrError, setStatusMgrError] = useState<string | null>(null)
@@ -1478,15 +1476,6 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
           <Button size="sm" variant="outline" className="h-7 text-[12px]" onClick={handleExport}>
             <Download className="h-3 w-3 mr-1" />CSV
           </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            className="h-7 text-[12px]"
-            onClick={() => { setStatusMgrError(null); setIsStatusMgrOpen(true) }}
-            title="Manage case statuses (names & colors)"
-          >
-            <Palette className="h-3 w-3 mr-1" />Statuses
-          </Button>
           <Button size="sm" variant="outline" className="h-7 text-[12px]" onClick={openSettings} title="Sheet settings">
             <Settings className="h-3 w-3 mr-1" />Settings
             {sheet.auto_tags && sheet.auto_tags.length > 0 && (
@@ -1782,104 +1771,13 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
         </div>
       )}
 
-      {/* Status manager dialog — custom case statuses (name + color) */}
-      <Dialog open={isStatusMgrOpen} onOpenChange={setIsStatusMgrOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Case Statuses</DialogTitle>
-            <DialogDescription>
-              Define the statuses available in the dropdown and their colors. These apply to every request sheet. Renaming a status updates all cases already set to it.
-            </DialogDescription>
-          </DialogHeader>
-
-          <div className="space-y-2 py-2 max-h-[50vh] overflow-y-auto">
-            {customStatuses.length === 0 ? (
-              <p className="text-[12px] text-muted-foreground">No statuses yet — add one below.</p>
-            ) : (
-              customStatuses.map((s, i) => (
-                <div key={s.id} className="flex items-center gap-2">
-                  <input
-                    type="color"
-                    value={s.color}
-                    onChange={(e) => patchStatus(s.id, { color: e.target.value })}
-                    className="h-7 w-9 shrink-0 cursor-pointer rounded border border-input bg-transparent p-0.5"
-                    title="Pick color"
-                  />
-                  <Input
-                    value={s.name}
-                    onChange={(e) => setCustomStatuses(prev => prev.map(x => x.id === s.id ? { ...x, name: e.target.value } : x))}
-                    onBlur={(e) => { const v = e.target.value.trim(); if (v && v !== s.name) patchStatus(s.id, { name: v }) }}
-                    onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
-                    className="h-7 text-[13px]"
-                  />
-                  <StatusBadge status={s.name} colorMap={statusColorMap} sizeCls="text-[11px]" className="shrink-0" />
-                  <div className="flex items-center shrink-0">
-                    <button
-                      type="button"
-                      className="p-1 text-muted-foreground hover:text-foreground disabled:opacity-30"
-                      onClick={() => moveStatus(i, -1)}
-                      disabled={i === 0}
-                      title="Move up"
-                    >
-                      <ArrowUp className="h-3.5 w-3.5" />
-                    </button>
-                    <button
-                      type="button"
-                      className="p-1 text-muted-foreground hover:text-foreground disabled:opacity-30"
-                      onClick={() => moveStatus(i, 1)}
-                      disabled={i === customStatuses.length - 1}
-                      title="Move down"
-                    >
-                      <ArrowDown className="h-3.5 w-3.5" />
-                    </button>
-                    <button
-                      type="button"
-                      className="p-1 text-muted-foreground hover:text-destructive"
-                      onClick={() => deleteStatus(s.id)}
-                      title="Delete status"
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
-                  </div>
-                </div>
-              ))
-            )}
-          </div>
-
-          <div className="flex items-center gap-2 border-t border-gray-200 pt-3">
-            <input
-              type="color"
-              value={newStatusColor}
-              onChange={(e) => setNewStatusColor(e.target.value)}
-              className="h-7 w-9 shrink-0 cursor-pointer rounded border border-input bg-transparent p-0.5"
-              title="New status color"
-            />
-            <Input
-              value={newStatusName}
-              onChange={(e) => { setNewStatusName(e.target.value); setStatusMgrError(null) }}
-              onKeyDown={(e) => { if (e.key === 'Enter') addStatus() }}
-              placeholder="New status name…"
-              className="h-7 text-[13px]"
-            />
-            <Button size="sm" className="h-7 shrink-0" onClick={addStatus} disabled={!newStatusName.trim()}>
-              <Plus className="h-3 w-3 mr-1" />Add
-            </Button>
-          </div>
-          {statusMgrError && <p className="text-[12px] text-destructive mt-1">{statusMgrError}</p>}
-
-          <DialogFooter>
-            <Button variant="outline" size="sm" onClick={() => setIsStatusMgrOpen(false)}>Close</Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      {/* Settings dialog — auto-tags */}
+      {/* Settings dialog — auto-tags + case statuses */}
       <Dialog open={isSettingsOpen} onOpenChange={setIsSettingsOpen}>
-        <DialogContent>
+        <DialogContent className="max-h-[85vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>Sheet Settings</DialogTitle>
             <DialogDescription>
-              Pick one or more tags to auto-apply to every case in this sheet. Tags are also applied to cases added later. Click a chip to toggle it.
+              Auto-tag every case in this sheet, and manage the case statuses used across all sheets.
             </DialogDescription>
           </DialogHeader>
 
@@ -1928,6 +1826,89 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
             {settingsMessage && (
               <p className="text-[12px] text-muted-foreground">{settingsMessage}</p>
             )}
+          </div>
+
+          {/* ── Case statuses (global, shared across all sheets) ── */}
+          <div className="space-y-2 pt-4 mt-2 border-t border-gray-200">
+            <div>
+              <label className="text-sm font-medium">Case statuses</label>
+              <p className="text-[11px] text-muted-foreground mt-0.5">
+                The status options + colors used in the dropdown. Shared across all sheets; renaming updates existing cases.
+              </p>
+            </div>
+            <div className="space-y-2 max-h-[40vh] overflow-y-auto">
+              {customStatuses.length === 0 ? (
+                <p className="text-[12px] text-muted-foreground">No statuses yet — add one below.</p>
+              ) : (
+                customStatuses.map((s, i) => (
+                  <div key={s.id} className="flex items-center gap-2">
+                    <input
+                      type="color"
+                      value={s.color}
+                      onChange={(e) => patchStatus(s.id, { color: e.target.value })}
+                      className="h-7 w-9 shrink-0 cursor-pointer rounded border border-input bg-transparent p-0.5"
+                      title="Pick color"
+                    />
+                    <Input
+                      value={s.name}
+                      onChange={(e) => setCustomStatuses(prev => prev.map(x => x.id === s.id ? { ...x, name: e.target.value } : x))}
+                      onBlur={(e) => { const v = e.target.value.trim(); if (v && v !== s.name) patchStatus(s.id, { name: v }) }}
+                      onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
+                      className="h-7 text-[13px]"
+                    />
+                    <StatusBadge status={s.name} colorMap={statusColorMap} sizeCls="text-[11px]" className="shrink-0" />
+                    <div className="flex items-center shrink-0">
+                      <button
+                        type="button"
+                        className="p-1 text-muted-foreground hover:text-foreground disabled:opacity-30"
+                        onClick={() => moveStatus(i, -1)}
+                        disabled={i === 0}
+                        title="Move up"
+                      >
+                        <ArrowUp className="h-3.5 w-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        className="p-1 text-muted-foreground hover:text-foreground disabled:opacity-30"
+                        onClick={() => moveStatus(i, 1)}
+                        disabled={i === customStatuses.length - 1}
+                        title="Move down"
+                      >
+                        <ArrowDown className="h-3.5 w-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        className="p-1 text-muted-foreground hover:text-destructive"
+                        onClick={() => deleteStatus(s.id)}
+                        title="Delete status"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+            <div className="flex items-center gap-2 pt-1">
+              <input
+                type="color"
+                value={newStatusColor}
+                onChange={(e) => setNewStatusColor(e.target.value)}
+                className="h-7 w-9 shrink-0 cursor-pointer rounded border border-input bg-transparent p-0.5"
+                title="New status color"
+              />
+              <Input
+                value={newStatusName}
+                onChange={(e) => { setNewStatusName(e.target.value); setStatusMgrError(null) }}
+                onKeyDown={(e) => { if (e.key === 'Enter') addStatus() }}
+                placeholder="New status name…"
+                className="h-7 text-[13px]"
+              />
+              <Button size="sm" className="h-7 shrink-0" onClick={addStatus} disabled={!newStatusName.trim()}>
+                <Plus className="h-3 w-3 mr-1" />Add
+              </Button>
+            </div>
+            {statusMgrError && <p className="text-[12px] text-destructive">{statusMgrError}</p>}
           </div>
 
           <DialogFooter>

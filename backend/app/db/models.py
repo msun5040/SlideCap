@@ -191,6 +191,15 @@ cohort_followed_cases = Table(
     Column('added_at', DateTime, default=datetime.utcnow)
 )
 
+# Tags auto-applied to every slide in a cohort. Applied when the auto-tag set is
+# saved, when slides are added, and when case-following pulls new slides in — so
+# "tag everything in this cohort" stays true as the cohort grows.
+cohort_auto_tags = Table(
+    'cohort_auto_tags', Base.metadata,
+    Column('cohort_id', Integer, ForeignKey('cohorts.id', ondelete='CASCADE'), primary_key=True),
+    Column('tag_id', Integer, ForeignKey('tags.id', ondelete='CASCADE'), primary_key=True),
+)
+
 
 # ============================================================
 # Core Models
@@ -344,6 +353,12 @@ class Cohort(Base):
     # startup and after each index run). See reconcile_auto_cohorts in main.py.
     auto_add_cases = Column(Boolean, nullable=False, default=False)
 
+    # Patients-tab ordering: False = alphabetical by label (default); True = the
+    # manual order captured in CohortPatient.display_order (set when the user
+    # drags/nudges patients). Both the Patients tab and the Cases-tab grouping
+    # read the API order, so this drives both consistently.
+    patients_manual_order = Column(Boolean, nullable=False, default=False)
+
     # Metadata
     created_by = Column(String(100))
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -354,8 +369,11 @@ class Cohort(Base):
     # Cases explicitly followed by this cohort (per-case auto-add). Independent of
     # auto_add_cases, which follows every case already represented in the cohort.
     followed_cases = relationship('Case', secondary=cohort_followed_cases)
+    # Tags auto-applied to every slide in the cohort (kept applied as it grows).
+    auto_tags = relationship('Tag', secondary=cohort_auto_tags)
     patients = relationship('CohortPatient', back_populates='cohort', cascade='all, delete-orphan')
     flags = relationship('CohortFlag', back_populates='cohort', cascade='all, delete-orphan')
+    placeholders = relationship('CohortPlaceholder', back_populates='cohort', cascade='all, delete-orphan')
 
     @property
     def slide_count(self) -> int:
@@ -444,6 +462,26 @@ class CohortFlag(Base):
     def set_case_hashes(self, hashes: list):
         import json
         self.case_hashes_json = json.dumps(list(set(hashes)))
+
+
+class CohortPlaceholder(Base):
+    """
+    A manual reminder in a cohort for slides that still need to be found and
+    scanned. Lets users track outstanding work alongside real slides — it is NOT
+    a real slide (no slide_hash / file), just a free-text label (e.g. an accession
+    or case description), an optional note, and an expected slide count. Delete it
+    once the real slides are located and added to the cohort.
+    """
+    __tablename__ = 'cohort_placeholders'
+
+    id = Column(Integer, primary_key=True)
+    cohort_id = Column(Integer, ForeignKey('cohorts.id', ondelete='CASCADE'), nullable=False, index=True)
+    label = Column(String(200), nullable=False)     # accession or free-text description
+    note = Column(String(1000))
+    expected_slides = Column(Integer)               # optional: how many are expected
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    cohort = relationship('Cohort', back_populates='placeholders')
 
 
 class Analysis(Base):
@@ -1270,20 +1308,23 @@ def _migrate_cohort_patients(engine):
 
 
 def _migrate_cohorts(engine):
-    """Add the auto_add_cases column to cohorts (case-following cohorts)."""
+    """Add newer columns to cohorts (auto_add_cases, patients_manual_order)."""
     from sqlalchemy import text
     try:
         insp = inspect(engine)
         if not insp.has_table('cohorts'):
             return
         existing = {col['name'] for col in insp.get_columns('cohorts')}
-        if 'auto_add_cases' not in existing:
-            print("[DB Migration] Adding column: cohorts.auto_add_cases")
-            with engine.connect() as conn:
-                conn.execute(text(
-                    "ALTER TABLE cohorts ADD COLUMN auto_add_cases BOOLEAN NOT NULL DEFAULT 0"
-                ))
-                conn.commit()
+        adds = {
+            'auto_add_cases': "ALTER TABLE cohorts ADD COLUMN auto_add_cases BOOLEAN NOT NULL DEFAULT 0",
+            'patients_manual_order': "ALTER TABLE cohorts ADD COLUMN patients_manual_order BOOLEAN NOT NULL DEFAULT 0",
+        }
+        with engine.connect() as conn:
+            for col, ddl in adds.items():
+                if col not in existing:
+                    print(f"[DB Migration] Adding column: cohorts.{col}")
+                    conn.execute(text(ddl))
+            conn.commit()
     except Exception as e:
         print(f"[DB Migration] Skipping cohorts migration: {e}")
 
