@@ -14,7 +14,6 @@ import {
   Microscope,
   Circle,
   Copy,
-  ClipboardCheck,
   FolderOutput,
   History,
 } from 'lucide-react'
@@ -1169,7 +1168,7 @@ export function SlidePull() {
               onClick={copyPullList}
               disabled={selectedSlides === 0}
             >
-              {copied ? <ClipboardCheck className="h-3 w-3 mr-1.5 text-emerald-600" /> : <Copy className="h-3 w-3 mr-1.5" />}
+              {copied ? <Check className="h-3 w-3 mr-1.5 text-green-600" /> : <Copy className="h-3 w-3 mr-1.5" />}
               {copied ? 'Copied!' : 'Copy to Clipboard'}
             </Button>
           </div>

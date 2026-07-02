@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Copy, Loader2, Search } from 'lucide-react'
+import { Loader2, Search } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
@@ -14,7 +14,7 @@ import {
 import type { Slide } from '@/types/slide'
 import { getApiBase, normalizeAccession } from '@/api'
 import { displaySlide } from '@/lib/display'
-import { copyToClipboard } from '@/lib/clipboard'
+import { CopyButton } from '@/components/ui/CopyButton'
 
 interface Props {
   open: boolean
@@ -216,12 +216,6 @@ export function CohortFromPasteDialog({ open, onOpenChange, onCreated, targetCoh
     }
     return Array.from(byCase.values()).sort((a, b) => a.label.localeCompare(b.label))
   }, [filteredSlides])
-
-  // ── Copy unresolved → clipboard ─────────────────────────────────
-  const copyUnresolved = async () => {
-    if (!resolved?.notFound?.length) return
-    await copyToClipboard(resolved.notFound.join('\n'))
-  }
 
   // ── Commit: add to existing cohort, or create cohort + add slides ──
   const handleCommit = async () => {
@@ -430,9 +424,12 @@ export function CohortFromPasteDialog({ open, onOpenChange, onCreated, targetCoh
                     <span className="text-xs font-medium text-orange-800 dark:text-orange-300">
                       {resolved.notFound.length} not in system
                     </span>
-                    <Button variant="ghost" size="sm" className="h-6 text-xs" onClick={copyUnresolved}>
-                      <Copy className="h-3 w-3 mr-1" /> Copy
-                    </Button>
+                    <CopyButton
+                      value={resolved.notFound.join('\n')}
+                      iconClassName="h-3 w-3"
+                      className="h-6 rounded-md px-2 text-xs text-orange-800 hover:bg-orange-100 dark:text-orange-300 dark:hover:bg-orange-900"
+                      label="Copy"
+                    />
                   </div>
                   <p className="text-[11px] font-mono text-orange-700 dark:text-orange-400 break-all">
                     {resolved.notFound.slice(0, 12).join(', ')}

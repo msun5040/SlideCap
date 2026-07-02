@@ -14,8 +14,6 @@ import {
   ChevronDown,
   Circle,
   ListPlus,
-  Copy,
-  ClipboardCheck,
   AlertTriangle,
   Microscope,
   Settings,
@@ -55,7 +53,7 @@ import {
 import { SortableHeader } from '@/components/SortableHeader'
 import { useSortable } from '@/hooks/useSortable'
 import { getApiBase, normalizeAccession, isDemo } from '@/api'
-import { copyToClipboard } from '@/lib/clipboard'
+import { CopyButton } from '@/components/ui/CopyButton'
 import type { RequestSheet, RequestRow, RequestSheetDetail, Cohort, RequestStatus } from '@/types/slide'
 
 // ── Status options ──────────────────────────────────────────────
@@ -461,27 +459,21 @@ function BlockChipField({ value, onChange }: { value: string; onChange: (v: stri
 
 // ── Copy as comma-separated list ────────────────────────────────
 function CopyCommaList({ text }: { text: string }) {
-  const [copied, setCopied] = useState(false)
   const commaSeparated = text
     .split(/[\n,;]+/)
     .map(l => normalizeAccession(l))
     .filter(l => l.length > 0)
     .join(', ')
 
-  const handleCopy = () => {
-    copyToClipboard(commaSeparated).then((ok) => {
-      if (ok) {
-        setCopied(true)
-        setTimeout(() => setCopied(false), 2000)
-      }
-    })
-  }
-
   return (
-    <Button variant="ghost" size="sm" className="h-6 text-[11px] text-muted-foreground gap-1 px-2" onClick={handleCopy}>
-      {copied ? <ClipboardCheck className="h-3 w-3 text-emerald-600" /> : <Copy className="h-3 w-3" />}
-      {copied ? 'Copied!' : 'Copy as comma list'}
-    </Button>
+    <CopyButton
+      value={commaSeparated}
+      iconClassName="h-3 w-3"
+      className="h-6 rounded-md px-2 text-[11px] text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+      label="Copy as comma list"
+      duration={2000}
+      stopPropagation={false}
+    />
   )
 }
 
@@ -1609,18 +1601,13 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
                         <span className="font-mono text-[13px] font-semibold tracking-tight text-foreground">
                           {isDemo() ? `REQ-${row.id}` : row.accession_number}
                         </span>
-                        <button
-                          type="button"
-                          className="opacity-0 group-hover/acc:opacity-60 hover:!opacity-100 transition-opacity shrink-0"
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            copyToClipboard(isDemo() ? `REQ-${row.id}` : row.accession_number)
-                            setSelectedRowId(row.id)
-                          }}
+                        <CopyButton
+                          value={isDemo() ? `REQ-${row.id}` : row.accession_number}
+                          iconClassName="h-3 w-3"
+                          className="opacity-0 group-hover/acc:opacity-60 hover:!opacity-100 shrink-0 data-[copied]:opacity-100"
                           title={isDemo() ? 'Copy request ID' : 'Copy accession number'}
-                        >
-                          <Copy className="h-3 w-3" />
-                        </button>
+                          onCopied={() => setSelectedRowId(row.id)}
+                        />
                       </div>
                       <Circle
                         className={`h-2 w-2 shrink-0 mt-1.5 fill-current ${statusColorMap[row.case_status] ? '' : statusDot(row.case_status)}`}
