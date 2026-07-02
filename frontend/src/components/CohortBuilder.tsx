@@ -1123,14 +1123,14 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
           {/* ── Cases tab ── */}
           {activeTab === 'cases' && (
             <div className="flex-1 overflow-hidden flex flex-col">
-              {/* Outstanding placeholders — slides still to be found & scanned */}
-              {(cohort.placeholders ?? []).length > 0 && (
+              {/* Outstanding placeholders — cohort-level (not pinned to a patient) */}
+              {(cohort.placeholders ?? []).filter(p => !p.patient_id).length > 0 && (
                 <div className="shrink-0 border-b border-amber-200 bg-amber-50/40 px-2 py-2 space-y-1 max-h-44 overflow-auto">
                   <div className="flex items-center gap-1.5 px-1 text-[11px] font-medium text-amber-700">
                     <CircleDashed className="h-3.5 w-3.5" />
-                    Outstanding — to find &amp; scan ({(cohort.placeholders ?? []).length})
+                    Outstanding — to find &amp; scan ({(cohort.placeholders ?? []).filter(p => !p.patient_id).length})
                   </div>
-                  {(cohort.placeholders ?? []).map(p => (
+                  {(cohort.placeholders ?? []).filter(p => !p.patient_id).map(p => (
                     <div
                       key={p.id}
                       className="flex items-center gap-2 rounded-md border border-dashed border-amber-300 bg-white/70 px-2.5 py-1.5 group/ph"
@@ -1161,7 +1161,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
               )}
 
               {caseGroups.length === 0 ? (
-                (cohort.placeholders ?? []).length > 0 ? (
+                (cohort.placeholders ?? []).filter(p => !p.patient_id).length > 0 ? (
                   <div className="flex-1 flex items-center justify-center text-center p-8">
                     <p className="text-xs text-muted-foreground">
                       No slides added yet — the items above are still outstanding.
@@ -1702,7 +1702,13 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
           {/* ── Patients tab ── */}
           {activeTab === 'patients' && (
             <div className="flex-1 overflow-hidden flex flex-col">
-              <PatientTracker cohortId={cohortId} caseGroups={caseGroups} onPatientsChanged={fetchCohortPatients} />
+              <PatientTracker
+                cohortId={cohortId}
+                caseGroups={caseGroups}
+                placeholders={cohort.placeholders ?? []}
+                onPatientsChanged={fetchCohortPatients}
+                onPlaceholdersChanged={fetchCohort}
+              />
             </div>
           )}
 

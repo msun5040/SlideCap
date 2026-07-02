@@ -2205,6 +2205,8 @@ def get_cohort(cohort_id: int, db: Session = Depends(get_db)):
                 "label": p.label,
                 "note": p.note,
                 "expected_slides": p.expected_slides,
+                "patient_id": p.patient_id,
+                "surgery_label": p.surgery_label,
                 "created_at": p.created_at.isoformat() if p.created_at else None,
             }
             for p in sorted(cohort.placeholders, key=lambda x: x.id)
@@ -2390,6 +2392,8 @@ class CohortPlaceholderCreate(BaseModel):
     label: str
     note: Optional[str] = None
     expected_slides: Optional[int] = None
+    patient_id: Optional[int] = None
+    surgery_label: Optional[str] = None
 
 
 def _serialize_placeholder(p: CohortPlaceholder) -> dict:
@@ -2398,6 +2402,8 @@ def _serialize_placeholder(p: CohortPlaceholder) -> dict:
         "label": p.label,
         "note": p.note,
         "expected_slides": p.expected_slides,
+        "patient_id": p.patient_id,
+        "surgery_label": p.surgery_label,
         "created_at": p.created_at.isoformat() if p.created_at else None,
     }
 
@@ -2411,12 +2417,19 @@ def add_cohort_placeholder(cohort_id: int, data: CohortPlaceholderCreate, db: Se
     label = (data.label or "").strip()
     if not label:
         raise HTTPException(status_code=400, detail="Placeholder label is required")
+    # Validate the patient belongs to this cohort when pinning to a timepoint.
+    if data.patient_id is not None:
+        patient = db.query(CohortPatient).filter_by(id=data.patient_id, cohort_id=cohort_id).first()
+        if not patient:
+            raise HTTPException(status_code=404, detail="Patient not found in this cohort")
     with get_lock().write_lock():
         placeholder = CohortPlaceholder(
             cohort_id=cohort_id,
             label=label,
             note=(data.note or None),
             expected_slides=data.expected_slides,
+            patient_id=data.patient_id,
+            surgery_label=(data.surgery_label or None),
         )
         db.add(placeholder)
         db.commit()
@@ -2687,6 +2700,9 @@ def delete_cohort_patient(cohort_id: int, patient_id: int, db: Session = Depends
     if not patient:
         raise HTTPException(status_code=404, detail="Patient not found")
     with get_lock().write_lock():
+        # SQLite FK cascade isn't enabled app-wide, so drop this patient's pinned
+        # placeholders explicitly (else they'd orphan with a dangling patient_id).
+        db.query(CohortPlaceholder).filter_by(patient_id=patient_id).delete()
         db.delete(patient)
         db.commit()
     return {"status": "ok"}

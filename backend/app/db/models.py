@@ -479,6 +479,11 @@ class CohortPlaceholder(Base):
     label = Column(String(200), nullable=False)     # accession or free-text description
     note = Column(String(1000))
     expected_slides = Column(Integer)               # optional: how many are expected
+    # Optionally pinned to a specific patient + surgery timepoint (S1, S2, …) in
+    # the Patients tab. NULL patient_id = a cohort-level placeholder shown at the
+    # top of the Cases tab.
+    patient_id = Column(Integer, ForeignKey('cohort_patients.id', ondelete='CASCADE'), nullable=True, index=True)
+    surgery_label = Column(String(20))              # e.g. "S1", "S2"
     created_at = Column(DateTime, default=datetime.utcnow)
 
     cohort = relationship('Cohort', back_populates='placeholders')
@@ -1329,6 +1334,28 @@ def _migrate_cohorts(engine):
         print(f"[DB Migration] Skipping cohorts migration: {e}")
 
 
+def _migrate_cohort_placeholders(engine):
+    """Add patient_id / surgery_label to cohort_placeholders (surgery-pinned placeholders)."""
+    from sqlalchemy import text
+    try:
+        insp = inspect(engine)
+        if not insp.has_table('cohort_placeholders'):
+            return
+        existing = {col['name'] for col in insp.get_columns('cohort_placeholders')}
+        adds = {
+            'patient_id': "ALTER TABLE cohort_placeholders ADD COLUMN patient_id INTEGER REFERENCES cohort_patients(id) ON DELETE CASCADE",
+            'surgery_label': "ALTER TABLE cohort_placeholders ADD COLUMN surgery_label VARCHAR(20)",
+        }
+        with engine.connect() as conn:
+            for col, ddl in adds.items():
+                if col not in existing:
+                    print(f"[DB Migration] Adding column: cohort_placeholders.{col}")
+                    conn.execute(text(ddl))
+            conn.commit()
+    except Exception as e:
+        print(f"[DB Migration] Skipping cohort_placeholders migration: {e}")
+
+
 def _seed_request_statuses(engine):
     """Populate request_statuses with defaults on first init (table empty)."""
     from sqlalchemy import text
@@ -1372,6 +1399,7 @@ def init_db(db_path: Path):
     _migrate_analyses(_engine)         # Adds transforms column to analyses
     _migrate_cohort_patients(_engine)  # Adds display_order to cohort_patients
     _migrate_cohorts(_engine)          # Adds auto_add_cases to cohorts
+    _migrate_cohort_placeholders(_engine)  # Adds patient_id/surgery_label to cohort_placeholders
     _seed_request_statuses(_engine)    # Seeds default case statuses (request_statuses)
     _SessionLocal = sessionmaker(bind=_engine)
 

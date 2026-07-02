@@ -97,6 +97,9 @@ export interface CohortPlaceholder {
   label: string
   note?: string | null
   expected_slides?: number | null
+  // Optional pin to a specific patient + surgery timepoint (Patients tab).
+  patient_id?: number | null
+  surgery_label?: string | null
   created_at?: string | null
 }
 

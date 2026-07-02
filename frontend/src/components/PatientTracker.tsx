@@ -9,6 +9,7 @@ import {
   ArrowDownAZ,
   UserCircle2,
   Stethoscope,
+  CircleDashed,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -20,7 +21,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import type { CaseGroup, CohortPatient, PatientSurgery } from '@/types/slide'
+import type { CaseGroup, CohortPatient, PatientSurgery, CohortPlaceholder } from '@/types/slide'
 
 import { getApiBase } from '@/api'
 import { displayCase } from '@/lib/display'
@@ -28,12 +29,17 @@ import { displayCase } from '@/lib/display'
 interface PatientTrackerProps {
   cohortId: number
   caseGroups: CaseGroup[]
+  /** All cohort placeholders; those pinned to a patient render as pastel-red
+   *  "needs attention" timepoints within that patient. */
+  placeholders?: CohortPlaceholder[]
   /** Fired after any patient/surgery mutation so the parent can refresh the
    *  case→patient grouping shown on the Cases tab. */
   onPatientsChanged?: () => void
+  /** Fired after adding/removing a placeholder so the parent can refetch. */
+  onPlaceholdersChanged?: () => void
 }
 
-export function PatientTracker({ cohortId, caseGroups, onPatientsChanged }: PatientTrackerProps) {
+export function PatientTracker({ cohortId, caseGroups, placeholders = [], onPatientsChanged, onPlaceholdersChanged }: PatientTrackerProps) {
   const [patients, setPatients] = useState<CohortPatient[]>([])
   const [loading, setLoading] = useState(true)
 
@@ -62,6 +68,12 @@ export function PatientTracker({ cohortId, caseGroups, onPatientsChanged }: Pati
   const [addSurgeryPatientId, setAddSurgeryPatientId] = useState<number | null>(null)
   const [addSurgeryCaseHash, setAddSurgeryCaseHash] = useState('')
   const [addSurgeryLabel, setAddSurgeryLabel] = useState('S1')
+
+  // Add-placeholder-timepoint form (per patient)
+  const [addPhPatientId, setAddPhPatientId] = useState<number | null>(null)
+  const [addPhSurgeryLabel, setAddPhSurgeryLabel] = useState('S1')
+  const [addPhLabel, setAddPhLabel] = useState('')
+  const [addPhExpected, setAddPhExpected] = useState('')
 
   // ── Fetch ────────────────────────────────────────────────────────────────
 
@@ -291,6 +303,46 @@ export function PatientTracker({ cohortId, caseGroups, onPatientsChanged }: Pati
     } catch { fetchPatients() }
   }
 
+  // Placeholders pinned to each patient (id → list), for the pastel-red timepoints.
+  const placeholdersByPatient = useMemo(() => {
+    const m = new Map<number, CohortPlaceholder[]>()
+    for (const p of placeholders) {
+      if (p.patient_id == null) continue
+      const arr = m.get(p.patient_id) ?? []
+      arr.push(p)
+      m.set(p.patient_id, arr)
+    }
+    return m
+  }, [placeholders])
+
+  const submitAddPlaceholder = async () => {
+    if (!addPhPatientId || !addPhLabel.trim()) return
+    const parsed = parseInt(addPhExpected, 10)
+    try {
+      const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/placeholders`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          label: addPhLabel.trim(),
+          surgery_label: addPhSurgeryLabel.trim() || null,
+          patient_id: addPhPatientId,
+          expected_slides: Number.isFinite(parsed) && parsed > 0 ? parsed : null,
+        }),
+      })
+      if (res.ok) {
+        setAddPhPatientId(null); setAddPhLabel(''); setAddPhExpected(''); setAddPhSurgeryLabel('S1')
+        onPlaceholdersChanged?.()
+      }
+    } catch (e) { console.error('Failed to add placeholder:', e) }
+  }
+
+  const deletePlaceholder = async (id: number) => {
+    try {
+      const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/placeholders/${id}`, { method: 'DELETE' })
+      if (res.ok) onPlaceholdersChanged?.()
+    } catch (e) { console.error('Failed to delete placeholder:', e) }
+  }
+
   // ── Render ───────────────────────────────────────────────────────────────
 
   if (loading)
@@ -414,6 +466,9 @@ export function PatientTracker({ cohortId, caseGroups, onPatientsChanged }: Pati
 
                 <span className="text-xs text-muted-foreground ml-auto mr-2">
                   {patient.surgeries.length} {patient.surgeries.length === 1 ? 'surgery' : 'surgeries'}
+                  {(placeholdersByPatient.get(patient.id)?.length ?? 0) > 0 && (
+                    <span className="text-red-500"> · {placeholdersByPatient.get(patient.id)!.length} pending</span>
+                  )}
                 </span>
 
                 <div className="flex items-center opacity-0 group-hover/patient:opacity-100 transition-all">
@@ -513,6 +568,87 @@ export function PatientTracker({ cohortId, caseGroups, onPatientsChanged }: Pati
                     )
                   })}
 
+                  {/* Pinned placeholders — pastel red "needs attention" timepoints */}
+                  {(placeholdersByPatient.get(patient.id) ?? []).map((ph) => (
+                    <div
+                      key={`ph-${ph.id}`}
+                      className="flex items-center gap-2 pl-11 pr-4 py-1.5 group/ph bg-red-50/70 hover:bg-red-50 border-l-2 border-red-300"
+                      title={ph.note || 'Slides still to be found & scanned'}
+                    >
+                      <CircleDashed className="h-3 w-3 text-red-400 shrink-0" />
+                      {ph.surgery_label && (
+                        <Badge
+                          variant="secondary"
+                          className="text-xs px-1.5 h-5 shrink-0 bg-red-100 text-red-700 hover:bg-red-100 border border-red-200"
+                        >
+                          {ph.surgery_label}
+                        </Badge>
+                      )}
+                      <span className="text-xs font-mono text-red-700 truncate">{ph.label}</span>
+                      {ph.expected_slides ? (
+                        <span className="text-xs text-red-500 shrink-0">
+                          · ~{ph.expected_slides} slide{ph.expected_slides !== 1 ? 's' : ''}
+                        </span>
+                      ) : null}
+                      <span className="text-[10px] uppercase tracking-wide text-red-500 shrink-0 ml-1">
+                        needs scan
+                      </span>
+                      <button
+                        className="ml-auto opacity-0 group-hover/ph:opacity-100 text-muted-foreground hover:text-destructive transition-all"
+                        onClick={() => deletePlaceholder(ph.id)}
+                        title="Remove placeholder"
+                      >
+                        <X className="h-3 w-3" />
+                      </button>
+                    </div>
+                  ))}
+
+                  {/* Add placeholder inline form */}
+                  {addPhPatientId === patient.id && (
+                    <div className="flex items-center gap-1.5 pl-11 pr-4 py-2 bg-red-50/60 border-t border-red-100 flex-wrap">
+                      <Input
+                        placeholder="S1"
+                        value={addPhSurgeryLabel}
+                        onChange={(e) => setAddPhSurgeryLabel(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === 'Escape') setAddPhPatientId(null) }}
+                        className="h-7 text-xs w-12"
+                        title="Timepoint label"
+                      />
+                      <Input
+                        autoFocus
+                        placeholder="Accession / what to find…"
+                        value={addPhLabel}
+                        onChange={(e) => setAddPhLabel(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') submitAddPlaceholder()
+                          if (e.key === 'Escape') setAddPhPatientId(null)
+                        }}
+                        className="h-7 text-xs flex-1 min-w-28"
+                      />
+                      <Input
+                        type="number"
+                        min="1"
+                        placeholder="#"
+                        value={addPhExpected}
+                        onChange={(e) => setAddPhExpected(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === 'Enter') submitAddPlaceholder() }}
+                        className="h-7 text-xs w-14"
+                        title="Expected # of slides"
+                      />
+                      <Button
+                        size="sm"
+                        className="h-7 text-xs bg-red-600 hover:bg-red-700"
+                        onClick={submitAddPlaceholder}
+                        disabled={!addPhLabel.trim()}
+                      >
+                        Add
+                      </Button>
+                      <button className="text-muted-foreground hover:text-foreground" onClick={() => setAddPhPatientId(null)}>
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  )}
+
                   {/* Add surgery row */}
                   {isAddingSurgery ? (
                     <div className="flex items-center gap-1.5 pl-11 pr-4 py-2 bg-primary/5 border-t flex-wrap">
@@ -559,18 +695,33 @@ export function PatientTracker({ cohortId, caseGroups, onPatientsChanged }: Pati
                         <X className="h-3.5 w-3.5" />
                       </button>
                     </div>
-                  ) : (
-                    <button
-                      className="flex items-center gap-1.5 pl-11 pr-4 py-1.5 text-xs text-muted-foreground hover:text-primary transition-colors w-full"
-                      onClick={() => {
-                        setAddSurgeryPatientId(patient.id)
-                        setAddSurgeryCaseHash('')
-                        setAddSurgeryLabel('S1')
-                      }}
-                    >
-                      <Plus className="h-3 w-3" />
-                      Add surgery
-                    </button>
+                  ) : addPhPatientId === patient.id ? null : (
+                    <div className="flex items-center gap-4 pl-11 pr-4 py-1.5">
+                      <button
+                        className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-primary transition-colors"
+                        onClick={() => {
+                          setAddSurgeryPatientId(patient.id)
+                          setAddSurgeryCaseHash('')
+                          setAddSurgeryLabel('S1')
+                        }}
+                      >
+                        <Plus className="h-3 w-3" />
+                        Add surgery
+                      </button>
+                      <button
+                        className="flex items-center gap-1.5 text-xs text-red-500 hover:text-red-700 transition-colors"
+                        onClick={() => {
+                          setAddPhPatientId(patient.id)
+                          setAddPhLabel('')
+                          setAddPhExpected('')
+                          setAddPhSurgeryLabel(`S${patient.surgeries.length + (placeholdersByPatient.get(patient.id)?.length ?? 0) + 1}`)
+                        }}
+                        title="Add a placeholder timepoint for slides still to be found & scanned"
+                      >
+                        <CircleDashed className="h-3 w-3" />
+                        Add placeholder
+                      </button>
+                    </div>
                   )}
                 </div>
               )}
