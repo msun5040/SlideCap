@@ -303,6 +303,27 @@ export function PatientTracker({ cohortId, caseGroups, placeholders = [], onPati
     } catch { fetchPatients() }
   }
 
+  // Move a surgery up/down within its patient and persist the manual order.
+  const moveSurgery = async (patientId: number, index: number, dir: -1 | 1) => {
+    const patient = patients.find((p) => p.id === patientId)
+    if (!patient) return
+    const target = index + dir
+    if (target < 0 || target >= patient.surgeries.length) return
+    const reordered = [...patient.surgeries]
+    const [moved] = reordered.splice(index, 1)
+    reordered.splice(target, 0, moved)
+    setPatients((prev) => prev.map((p) => p.id === patientId ? { ...p, surgeries: reordered } : p))  // optimistic
+    try {
+      const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/patients/${patientId}/surgeries/reorder`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ case_hashes: reordered.map((s) => s.case_hash) }),
+      })
+      if (res.ok) onPatientsChanged?.()
+      else fetchPatients()
+    } catch { fetchPatients() }
+  }
+
   // Placeholders pinned to each patient (id → list), for the pastel-red timepoints.
   const placeholdersByPatient = useMemo(() => {
     const m = new Map<number, CohortPlaceholder[]>()
@@ -506,7 +527,7 @@ export function PatientTracker({ cohortId, caseGroups, placeholders = [], onPati
                     <p className="text-xs text-muted-foreground pl-12 py-1.5 italic">No surgeries yet</p>
                   )}
 
-                  {patient.surgeries.map((surgery) => {
+                  {patient.surgeries.map((surgery, surgeryIndex) => {
                     const isEditingSurg =
                       editingSurgery?.patientId === patient.id &&
                       editingSurgery?.caseHash === surgery.case_hash
@@ -557,13 +578,31 @@ export function PatientTracker({ cohortId, caseGroups, placeholders = [], onPati
                           · {surgery.slide_count} slide{surgery.slide_count !== 1 ? 's' : ''}
                         </span>
 
-                        <button
-                          className="ml-auto opacity-0 group-hover/surgery:opacity-100 text-muted-foreground hover:text-destructive transition-all"
-                          onClick={() => removeSurgery(patient.id, surgery.case_hash)}
-                          title="Remove surgery"
-                        >
-                          <X className="h-3 w-3" />
-                        </button>
+                        <div className="ml-auto flex items-center opacity-0 group-hover/surgery:opacity-100 transition-all">
+                          <button
+                            className="text-muted-foreground hover:text-foreground disabled:opacity-25 disabled:hover:text-muted-foreground"
+                            onClick={() => moveSurgery(patient.id, surgeryIndex, -1)}
+                            disabled={surgeryIndex === 0}
+                            title="Move up"
+                          >
+                            <ArrowUp className="h-3 w-3" />
+                          </button>
+                          <button
+                            className="text-muted-foreground hover:text-foreground disabled:opacity-25 disabled:hover:text-muted-foreground"
+                            onClick={() => moveSurgery(patient.id, surgeryIndex, 1)}
+                            disabled={surgeryIndex === patient.surgeries.length - 1}
+                            title="Move down"
+                          >
+                            <ArrowDown className="h-3 w-3" />
+                          </button>
+                          <button
+                            className="text-muted-foreground hover:text-destructive transition-colors ml-0.5"
+                            onClick={() => removeSurgery(patient.id, surgery.case_hash)}
+                            title="Remove surgery"
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        </div>
                       </div>
                     )
                   })}

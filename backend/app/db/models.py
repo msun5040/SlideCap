@@ -425,6 +425,10 @@ class CohortPatientCase(Base):
     case_id = Column(Integer, ForeignKey('cases.id', ondelete='CASCADE'), nullable=False)
     surgery_label = Column(String(20), nullable=False)   # "S1", "S2", "S3"
     note = Column(String(500))
+    # Manual order of this surgery within its patient. 0 = unordered (falls back
+    # to alphabetical by surgery_label, and sorts after any manually-ordered ones);
+    # the reorder endpoint assigns 1..N. New surgeries stay 0 (append at end).
+    display_order = Column(Integer, nullable=False, default=0, server_default='0')
 
     patient = relationship('CohortPatient', back_populates='surgeries')
     case = relationship('Case')
@@ -1312,6 +1316,25 @@ def _migrate_cohort_patients(engine):
         print(f"[DB Migration] Skipping cohort_patients migration: {e}")
 
 
+def _migrate_cohort_patient_cases(engine):
+    """Add display_order to cohort_patient_cases (manual surgery ordering)."""
+    from sqlalchemy import text
+    try:
+        insp = inspect(engine)
+        if not insp.has_table('cohort_patient_cases'):
+            return
+        existing = {col['name'] for col in insp.get_columns('cohort_patient_cases')}
+        if 'display_order' not in existing:
+            print("[DB Migration] Adding column: cohort_patient_cases.display_order")
+            with engine.connect() as conn:
+                conn.execute(text(
+                    "ALTER TABLE cohort_patient_cases ADD COLUMN display_order INTEGER NOT NULL DEFAULT 0"
+                ))
+                conn.commit()
+    except Exception as e:
+        print(f"[DB Migration] Skipping cohort_patient_cases migration: {e}")
+
+
 def _migrate_cohorts(engine):
     """Add newer columns to cohorts (auto_add_cases, patients_manual_order)."""
     from sqlalchemy import text
@@ -1398,6 +1421,7 @@ def init_db(db_path: Path):
     _migrate_request_sheets(_engine)   # Adds auto_tag_id to request_sheets
     _migrate_analyses(_engine)         # Adds transforms column to analyses
     _migrate_cohort_patients(_engine)  # Adds display_order to cohort_patients
+    _migrate_cohort_patient_cases(_engine)  # Adds display_order to cohort_patient_cases
     _migrate_cohorts(_engine)          # Adds auto_add_cases to cohorts
     _migrate_cohort_placeholders(_engine)  # Adds patient_id/surgery_label to cohort_placeholders
     _seed_request_statuses(_engine)    # Seeds default case statuses (request_statuses)

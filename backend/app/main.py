@@ -2529,6 +2529,19 @@ class PatientReorder(BaseModel):
     patient_ids: list[int]
 
 
+class SurgeryReorder(BaseModel):
+    # Case hashes (accession_hashes) in the desired order within the patient.
+    case_hashes: list[str]
+
+
+def _surgery_sort_key(s: "CohortPatientCase"):
+    """Order surgeries within a patient: manually-ordered ones (display_order >= 1)
+    first by that order; unordered (0) fall back to natural alphabetical label and
+    sort after the ordered ones."""
+    order = s.display_order if (s.display_order and s.display_order > 0) else 10**9
+    return (order, _natural_label_key(s.surgery_label))
+
+
 def _enrich_surgery(
     surgery: "CohortPatientCase",
     cohort_slide_ids: Optional[set] = None,
@@ -2608,7 +2621,10 @@ def list_cohort_patients(cohort_id: int, db: Session = Depends(get_db)):
             "label": p.label,
             "note": p.note,
             "display_order": p.display_order,
-            "surgeries": [_enrich_surgery(s, cohort_slide_ids) for s in p.surgeries],
+            "surgeries": [
+                _enrich_surgery(s, cohort_slide_ids)
+                for s in sorted(p.surgeries, key=_surgery_sort_key)
+            ],
         }
         for p in patients
     ]
@@ -2674,6 +2690,38 @@ def reset_cohort_patient_order(cohort_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Cohort not found")
     with get_lock().write_lock():
         cohort.patients_manual_order = False
+        db.commit()
+    return {"status": "ok"}
+
+
+@app.patch("/cohorts/{cohort_id}/patients/{patient_id}/surgeries/reorder")
+def reorder_patient_surgeries(cohort_id: int, patient_id: int, data: SurgeryReorder, db: Session = Depends(get_db)):
+    """Set the manual order of a patient's surgeries (cases). Body lists case
+    hashes in the desired order; display_order is assigned 1..N by position."""
+    patient = db.query(CohortPatient).filter_by(id=patient_id, cohort_id=cohort_id).first()
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+    # Map requested case_hash → the patient's surgery for that case.
+    cases_by_hash = {
+        c.accession_hash: c.id
+        for c in db.query(Case).filter(Case.accession_hash.in_(data.case_hashes)).all()
+    }
+    surg_by_case_id = {s.case_id: s for s in patient.surgeries}
+    with get_lock().write_lock():
+        order = 1
+        seen: set[int] = set()
+        for h in data.case_hashes:
+            cid = cases_by_hash.get(h)
+            s = surg_by_case_id.get(cid) if cid is not None else None
+            if s is not None and s.id not in seen:
+                s.display_order = order
+                seen.add(s.id)
+                order += 1
+        # Any surgery not named keeps a stable spot after the ordered ones.
+        for s in patient.surgeries:
+            if s.id not in seen:
+                s.display_order = order
+                order += 1
         db.commit()
     return {"status": "ok"}
 

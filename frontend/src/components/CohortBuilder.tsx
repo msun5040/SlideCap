@@ -295,8 +295,15 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
     const patientOrder = new Map(cohortPatients.map((p, i) => [p.id, i]))
     patientGroups.sort((a, b) =>
       (patientOrder.get(a.patientId) ?? Infinity) - (patientOrder.get(b.patientId) ?? Infinity))
+    // Honor the manual surgery order too: cohortPatients[].surgeries arrives in
+    // the saved order, so sort each patient's surgery groups by that index.
+    const surgeryOrder = new Map<number, number>()
+    for (const patient of cohortPatients) {
+      patient.surgeries.forEach((s, i) => surgeryOrder.set(s.id, i))
+    }
     for (const pg of patientGroups) {
-      pg.surgeries.sort((a, b) => a.surgeryLabel.localeCompare(b.surgeryLabel))
+      pg.surgeries.sort((a, b) =>
+        (surgeryOrder.get(a.surgeryId) ?? Infinity) - (surgeryOrder.get(b.surgeryId) ?? Infinity))
     }
 
     return { patientGroups, unassigned }
