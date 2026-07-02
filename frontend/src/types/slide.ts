@@ -100,6 +100,7 @@ export interface CohortPlaceholder {
   // Optional pin to a specific patient + surgery timepoint (Patients tab).
   patient_id?: number | null
   surgery_label?: string | null
+  display_order?: number | null
   created_at?: string | null
 }
 
@@ -118,6 +119,7 @@ export interface PatientSurgery {
   year: number | null
   slide_count: number
   note?: string
+  display_order?: number
 }
 
 export interface CohortPatient {

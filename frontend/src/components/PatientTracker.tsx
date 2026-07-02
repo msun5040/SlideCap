@@ -303,27 +303,6 @@ export function PatientTracker({ cohortId, caseGroups, placeholders = [], onPati
     } catch { fetchPatients() }
   }
 
-  // Move a surgery up/down within its patient and persist the manual order.
-  const moveSurgery = async (patientId: number, index: number, dir: -1 | 1) => {
-    const patient = patients.find((p) => p.id === patientId)
-    if (!patient) return
-    const target = index + dir
-    if (target < 0 || target >= patient.surgeries.length) return
-    const reordered = [...patient.surgeries]
-    const [moved] = reordered.splice(index, 1)
-    reordered.splice(target, 0, moved)
-    setPatients((prev) => prev.map((p) => p.id === patientId ? { ...p, surgeries: reordered } : p))  // optimistic
-    try {
-      const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/patients/${patientId}/surgeries/reorder`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ case_hashes: reordered.map((s) => s.case_hash) }),
-      })
-      if (res.ok) onPatientsChanged?.()
-      else fetchPatients()
-    } catch { fetchPatients() }
-  }
-
   // Placeholders pinned to each patient (id → list), for the pastel-red timepoints.
   const placeholdersByPatient = useMemo(() => {
     const m = new Map<number, CohortPlaceholder[]>()
@@ -335,6 +314,56 @@ export function PatientTracker({ cohortId, caseGroups, placeholders = [], onPati
     }
     return m
   }, [placeholders])
+
+  // A patient's timeline = real surgeries + pinned placeholders, ordered together.
+  // Manually-ordered items (display_order >= 1) first; the rest fall back to
+  // natural-alphabetical by label — so a placeholder labelled S2 sits between S1
+  // and S3 by default, and any item can be moved across the whole list.
+  type TimelineEntry =
+    | { kind: 'surgery'; order: number; label: string; surgery: PatientSurgery }
+    | { kind: 'placeholder'; order: number; label: string; placeholder: CohortPlaceholder }
+  const buildTimeline = useCallback((patient: CohortPatient): TimelineEntry[] => {
+    const entries: TimelineEntry[] = [
+      ...patient.surgeries.map((s) => ({
+        kind: 'surgery' as const, order: s.display_order ?? 0, label: s.surgery_label ?? '', surgery: s,
+      })),
+      ...(placeholdersByPatient.get(patient.id) ?? []).map((p) => ({
+        kind: 'placeholder' as const, order: p.display_order ?? 0, label: p.surgery_label ?? '', placeholder: p,
+      })),
+    ]
+    entries.sort((a, b) => {
+      const ao = a.order && a.order > 0 ? a.order : 1e9
+      const bo = b.order && b.order > 0 ? b.order : 1e9
+      if (ao !== bo) return ao - bo
+      return a.label.localeCompare(b.label, undefined, { numeric: true, sensitivity: 'base' })
+    })
+    return entries
+  }, [placeholdersByPatient])
+
+  // Move a timeline entry (surgery or placeholder) up/down and persist the order.
+  const moveTimelineItem = async (patient: CohortPatient, timeline: TimelineEntry[], index: number, dir: -1 | 1) => {
+    const target = index + dir
+    if (target < 0 || target >= timeline.length) return
+    const reordered = [...timeline]
+    const [moved] = reordered.splice(index, 1)
+    reordered.splice(target, 0, moved)
+    const items = reordered.map((e) =>
+      e.kind === 'surgery'
+        ? { kind: 'surgery', ref: e.surgery.case_hash }
+        : { kind: 'placeholder', ref: String(e.placeholder.id) })
+    try {
+      const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/patients/${patient.id}/timeline/reorder`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ items }),
+      })
+      if (res.ok) {
+        fetchPatients()            // refresh surgery order (own state)
+        onPatientsChanged?.()      // re-sort the Cases tab
+        onPlaceholdersChanged?.()  // refresh placeholder order (prop)
+      } else fetchPatients()
+    } catch { fetchPatients() }
+  }
 
   const submitAddPlaceholder = async () => {
     if (!addPhPatientId || !addPhLabel.trim()) return
@@ -447,6 +476,7 @@ export function PatientTracker({ cohortId, caseGroups, placeholders = [], onPati
           const isExpanded = expandedPatients.has(patient.id)
           const isEditingLabel = editingPatientId === patient.id
           const isAddingSurgery = addSurgeryPatientId === patient.id
+          const timeline = buildTimeline(patient)
 
           return (
             <div key={patient.id} className="group/patient">
@@ -523,82 +553,130 @@ export function PatientTracker({ cohortId, caseGroups, placeholders = [], onPati
               {/* Expanded content */}
               {isExpanded && (
                 <div className="bg-muted/5">
-                  {patient.surgeries.length === 0 && (
-                    <p className="text-xs text-muted-foreground pl-12 py-1.5 italic">No surgeries yet</p>
+                  {timeline.length === 0 && (
+                    <p className="text-xs text-muted-foreground pl-12 py-1.5 italic">No timepoints yet</p>
                   )}
 
-                  {patient.surgeries.map((surgery, surgeryIndex) => {
-                    const isEditingSurg =
-                      editingSurgery?.patientId === patient.id &&
-                      editingSurgery?.caseHash === surgery.case_hash
+                  {timeline.map((entry, tIndex) => {
+                    const canUp = tIndex > 0
+                    const canDown = tIndex < timeline.length - 1
+                    const OrderButtons = (
+                      <>
+                        <button
+                          className="text-muted-foreground hover:text-foreground disabled:opacity-25 disabled:hover:text-muted-foreground"
+                          onClick={() => moveTimelineItem(patient, timeline, tIndex, -1)}
+                          disabled={!canUp}
+                          title="Move up"
+                        >
+                          <ArrowUp className="h-3 w-3" />
+                        </button>
+                        <button
+                          className="text-muted-foreground hover:text-foreground disabled:opacity-25 disabled:hover:text-muted-foreground"
+                          onClick={() => moveTimelineItem(patient, timeline, tIndex, 1)}
+                          disabled={!canDown}
+                          title="Move down"
+                        >
+                          <ArrowDown className="h-3 w-3" />
+                        </button>
+                      </>
+                    )
 
+                    if (entry.kind === 'surgery') {
+                      const surgery = entry.surgery
+                      const isEditingSurg =
+                        editingSurgery?.patientId === patient.id &&
+                        editingSurgery?.caseHash === surgery.case_hash
+                      return (
+                        <div
+                          key={`s-${surgery.case_hash}`}
+                          className="flex items-center gap-2 pl-11 pr-4 py-1.5 group/surgery hover:bg-muted/20"
+                        >
+                          <Stethoscope className="h-3 w-3 text-muted-foreground shrink-0" />
+
+                          {isEditingSurg ? (
+                            <Input
+                              autoFocus
+                              value={editingSurgeryLabel}
+                              onChange={(e) => setEditingSurgeryLabel(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') saveSurgeryLabel(patient.id, surgery.case_hash)
+                                if (e.key === 'Escape') setEditingSurgery(null)
+                              }}
+                              onBlur={() => saveSurgeryLabel(patient.id, surgery.case_hash)}
+                              className="h-5 text-xs w-14 py-0"
+                            />
+                          ) : (
+                            <Badge
+                              variant="secondary"
+                              className="text-xs cursor-pointer hover:bg-primary/10 transition-colors px-1.5 h-5 shrink-0"
+                              onClick={() => {
+                                setEditingSurgery({ patientId: patient.id, caseHash: surgery.case_hash })
+                                setEditingSurgeryLabel(surgery.surgery_label)
+                              }}
+                              title="Click to edit label"
+                            >
+                              {surgery.surgery_label}
+                            </Badge>
+                          )}
+
+                          <span className="text-xs font-mono text-foreground truncate">
+                            {displayCase(surgery)}
+                          </span>
+
+                          {surgery.year && (
+                            <span className="text-xs text-muted-foreground shrink-0">{surgery.year}</span>
+                          )}
+
+                          <span className="text-xs text-muted-foreground shrink-0">
+                            · {surgery.slide_count} slide{surgery.slide_count !== 1 ? 's' : ''}
+                          </span>
+
+                          <div className="ml-auto flex items-center opacity-0 group-hover/surgery:opacity-100 transition-all">
+                            {OrderButtons}
+                            <button
+                              className="text-muted-foreground hover:text-destructive transition-colors ml-0.5"
+                              onClick={() => removeSurgery(patient.id, surgery.case_hash)}
+                              title="Remove surgery"
+                            >
+                              <X className="h-3 w-3" />
+                            </button>
+                          </div>
+                        </div>
+                      )
+                    }
+
+                    // Placeholder timepoint — pastel red "needs attention"
+                    const ph = entry.placeholder
                     return (
                       <div
-                        key={surgery.case_hash}
-                        className="flex items-center gap-2 pl-11 pr-4 py-1.5 group/surgery hover:bg-muted/20"
+                        key={`ph-${ph.id}`}
+                        className="flex items-center gap-2 pl-11 pr-4 py-1.5 group/ph bg-red-50/70 hover:bg-red-50 border-l-2 border-red-300"
+                        title={ph.note || 'Slides still to be found & scanned'}
                       >
-                        <Stethoscope className="h-3 w-3 text-muted-foreground shrink-0" />
-
-                        {/* Surgery label — editable on click */}
-                        {isEditingSurg ? (
-                          <Input
-                            autoFocus
-                            value={editingSurgeryLabel}
-                            onChange={(e) => setEditingSurgeryLabel(e.target.value)}
-                            onKeyDown={(e) => {
-                              if (e.key === 'Enter') saveSurgeryLabel(patient.id, surgery.case_hash)
-                              if (e.key === 'Escape') setEditingSurgery(null)
-                            }}
-                            onBlur={() => saveSurgeryLabel(patient.id, surgery.case_hash)}
-                            className="h-5 text-xs w-14 py-0"
-                          />
-                        ) : (
+                        <CircleDashed className="h-3 w-3 text-red-400 shrink-0" />
+                        {ph.surgery_label && (
                           <Badge
                             variant="secondary"
-                            className="text-xs cursor-pointer hover:bg-primary/10 transition-colors px-1.5 h-5 shrink-0"
-                            onClick={() => {
-                              setEditingSurgery({ patientId: patient.id, caseHash: surgery.case_hash })
-                              setEditingSurgeryLabel(surgery.surgery_label)
-                            }}
-                            title="Click to edit label"
+                            className="text-xs px-1.5 h-5 shrink-0 bg-red-100 text-red-700 hover:bg-red-100 border border-red-200"
                           >
-                            {surgery.surgery_label}
+                            {ph.surgery_label}
                           </Badge>
                         )}
-
-                        <span className="text-xs font-mono text-foreground truncate">
-                          {displayCase(surgery)}
+                        <span className="text-xs font-mono text-red-700 truncate">{ph.label}</span>
+                        {ph.expected_slides ? (
+                          <span className="text-xs text-red-500 shrink-0">
+                            · ~{ph.expected_slides} slide{ph.expected_slides !== 1 ? 's' : ''}
+                          </span>
+                        ) : null}
+                        <span className="text-[10px] uppercase tracking-wide text-red-500 shrink-0 ml-1">
+                          needs scan
                         </span>
-
-                        {surgery.year && (
-                          <span className="text-xs text-muted-foreground shrink-0">{surgery.year}</span>
-                        )}
-
-                        <span className="text-xs text-muted-foreground shrink-0">
-                          · {surgery.slide_count} slide{surgery.slide_count !== 1 ? 's' : ''}
-                        </span>
-
-                        <div className="ml-auto flex items-center opacity-0 group-hover/surgery:opacity-100 transition-all">
-                          <button
-                            className="text-muted-foreground hover:text-foreground disabled:opacity-25 disabled:hover:text-muted-foreground"
-                            onClick={() => moveSurgery(patient.id, surgeryIndex, -1)}
-                            disabled={surgeryIndex === 0}
-                            title="Move up"
-                          >
-                            <ArrowUp className="h-3 w-3" />
-                          </button>
-                          <button
-                            className="text-muted-foreground hover:text-foreground disabled:opacity-25 disabled:hover:text-muted-foreground"
-                            onClick={() => moveSurgery(patient.id, surgeryIndex, 1)}
-                            disabled={surgeryIndex === patient.surgeries.length - 1}
-                            title="Move down"
-                          >
-                            <ArrowDown className="h-3 w-3" />
-                          </button>
+                        <div className="ml-auto flex items-center opacity-0 group-hover/ph:opacity-100 transition-all">
+                          {OrderButtons}
                           <button
                             className="text-muted-foreground hover:text-destructive transition-colors ml-0.5"
-                            onClick={() => removeSurgery(patient.id, surgery.case_hash)}
-                            title="Remove surgery"
+                            onClick={() => deletePlaceholder(ph.id)}
+                            title="Remove placeholder"
                           >
                             <X className="h-3 w-3" />
                           </button>
@@ -606,41 +684,6 @@ export function PatientTracker({ cohortId, caseGroups, placeholders = [], onPati
                       </div>
                     )
                   })}
-
-                  {/* Pinned placeholders — pastel red "needs attention" timepoints */}
-                  {(placeholdersByPatient.get(patient.id) ?? []).map((ph) => (
-                    <div
-                      key={`ph-${ph.id}`}
-                      className="flex items-center gap-2 pl-11 pr-4 py-1.5 group/ph bg-red-50/70 hover:bg-red-50 border-l-2 border-red-300"
-                      title={ph.note || 'Slides still to be found & scanned'}
-                    >
-                      <CircleDashed className="h-3 w-3 text-red-400 shrink-0" />
-                      {ph.surgery_label && (
-                        <Badge
-                          variant="secondary"
-                          className="text-xs px-1.5 h-5 shrink-0 bg-red-100 text-red-700 hover:bg-red-100 border border-red-200"
-                        >
-                          {ph.surgery_label}
-                        </Badge>
-                      )}
-                      <span className="text-xs font-mono text-red-700 truncate">{ph.label}</span>
-                      {ph.expected_slides ? (
-                        <span className="text-xs text-red-500 shrink-0">
-                          · ~{ph.expected_slides} slide{ph.expected_slides !== 1 ? 's' : ''}
-                        </span>
-                      ) : null}
-                      <span className="text-[10px] uppercase tracking-wide text-red-500 shrink-0 ml-1">
-                        needs scan
-                      </span>
-                      <button
-                        className="ml-auto opacity-0 group-hover/ph:opacity-100 text-muted-foreground hover:text-destructive transition-all"
-                        onClick={() => deletePlaceholder(ph.id)}
-                        title="Remove placeholder"
-                      >
-                        <X className="h-3 w-3" />
-                      </button>
-                    </div>
-                  ))}
 
                   {/* Add placeholder inline form */}
                   {addPhPatientId === patient.id && (

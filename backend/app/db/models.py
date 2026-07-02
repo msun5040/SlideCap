@@ -488,6 +488,9 @@ class CohortPlaceholder(Base):
     # top of the Cases tab.
     patient_id = Column(Integer, ForeignKey('cohort_patients.id', ondelete='CASCADE'), nullable=True, index=True)
     surgery_label = Column(String(20))              # e.g. "S1", "S2"
+    # Manual order within the patient's timeline, shared with CohortPatientCase.
+    # 0 = unordered (falls back to alphabetical by surgery_label, after ordered).
+    display_order = Column(Integer, nullable=False, default=0, server_default='0')
     created_at = Column(DateTime, default=datetime.utcnow)
 
     cohort = relationship('Cohort', back_populates='placeholders')
@@ -1368,6 +1371,7 @@ def _migrate_cohort_placeholders(engine):
         adds = {
             'patient_id': "ALTER TABLE cohort_placeholders ADD COLUMN patient_id INTEGER REFERENCES cohort_patients(id) ON DELETE CASCADE",
             'surgery_label': "ALTER TABLE cohort_placeholders ADD COLUMN surgery_label VARCHAR(20)",
+            'display_order': "ALTER TABLE cohort_placeholders ADD COLUMN display_order INTEGER NOT NULL DEFAULT 0",
         }
         with engine.connect() as conn:
             for col, ddl in adds.items():

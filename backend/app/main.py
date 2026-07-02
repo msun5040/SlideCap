@@ -2207,6 +2207,7 @@ def get_cohort(cohort_id: int, db: Session = Depends(get_db)):
                 "expected_slides": p.expected_slides,
                 "patient_id": p.patient_id,
                 "surgery_label": p.surgery_label,
+                "display_order": p.display_order,
                 "created_at": p.created_at.isoformat() if p.created_at else None,
             }
             for p in sorted(cohort.placeholders, key=lambda x: x.id)
@@ -2404,6 +2405,7 @@ def _serialize_placeholder(p: CohortPlaceholder) -> dict:
         "expected_slides": p.expected_slides,
         "patient_id": p.patient_id,
         "surgery_label": p.surgery_label,
+        "display_order": p.display_order,
         "created_at": p.created_at.isoformat() if p.created_at else None,
     }
 
@@ -2529,9 +2531,14 @@ class PatientReorder(BaseModel):
     patient_ids: list[int]
 
 
-class SurgeryReorder(BaseModel):
-    # Case hashes (accession_hashes) in the desired order within the patient.
-    case_hashes: list[str]
+class TimelineItem(BaseModel):
+    kind: str   # 'surgery' | 'placeholder'
+    ref: str    # case_hash for a surgery; placeholder id (as string) for a placeholder
+
+
+class TimelineReorder(BaseModel):
+    # Timeline items (surgeries + placeholders) in the desired order.
+    items: list[TimelineItem]
 
 
 def _surgery_sort_key(s: "CohortPatientCase"):
@@ -2574,6 +2581,7 @@ def _enrich_surgery(
         "year": case.year,
         "slide_count": slide_count,
         "note": surgery.note,
+        "display_order": surgery.display_order,
     }
 
 
@@ -2694,33 +2702,58 @@ def reset_cohort_patient_order(cohort_id: int, db: Session = Depends(get_db)):
     return {"status": "ok"}
 
 
-@app.patch("/cohorts/{cohort_id}/patients/{patient_id}/surgeries/reorder")
-def reorder_patient_surgeries(cohort_id: int, patient_id: int, data: SurgeryReorder, db: Session = Depends(get_db)):
-    """Set the manual order of a patient's surgeries (cases). Body lists case
-    hashes in the desired order; display_order is assigned 1..N by position."""
+@app.patch("/cohorts/{cohort_id}/patients/{patient_id}/timeline/reorder")
+def reorder_patient_timeline(cohort_id: int, patient_id: int, data: TimelineReorder, db: Session = Depends(get_db)):
+    """Set the manual order of a patient's timeline — real surgeries (cases) AND
+    placeholders together, so a placeholder can sit between two surgeries. Body
+    lists items ({kind, ref}) in the desired order; a shared display_order counter
+    is assigned 1..N across both. `ref` is the case_hash for surgeries and the
+    placeholder id for placeholders."""
     patient = db.query(CohortPatient).filter_by(id=patient_id, cohort_id=cohort_id).first()
     if not patient:
         raise HTTPException(status_code=404, detail="Patient not found")
-    # Map requested case_hash → the patient's surgery for that case.
+
+    surgery_refs = [i.ref for i in data.items if i.kind == "surgery"]
     cases_by_hash = {
         c.accession_hash: c.id
-        for c in db.query(Case).filter(Case.accession_hash.in_(data.case_hashes)).all()
-    }
+        for c in db.query(Case).filter(Case.accession_hash.in_(surgery_refs)).all()
+    } if surgery_refs else {}
     surg_by_case_id = {s.case_id: s for s in patient.surgeries}
+    ph_by_id = {
+        p.id: p
+        for p in db.query(CohortPlaceholder).filter_by(cohort_id=cohort_id, patient_id=patient_id).all()
+    }
+
     with get_lock().write_lock():
         order = 1
-        seen: set[int] = set()
-        for h in data.case_hashes:
-            cid = cases_by_hash.get(h)
-            s = surg_by_case_id.get(cid) if cid is not None else None
-            if s is not None and s.id not in seen:
-                s.display_order = order
-                seen.add(s.id)
-                order += 1
-        # Any surgery not named keeps a stable spot after the ordered ones.
+        seen_surg: set[int] = set()
+        seen_ph: set[int] = set()
+        for item in data.items:
+            if item.kind == "surgery":
+                cid = cases_by_hash.get(item.ref)
+                s = surg_by_case_id.get(cid) if cid is not None else None
+                if s is not None and s.id not in seen_surg:
+                    s.display_order = order
+                    seen_surg.add(s.id)
+                    order += 1
+            elif item.kind == "placeholder":
+                try:
+                    pid = int(item.ref)
+                except (TypeError, ValueError):
+                    pid = None
+                ph = ph_by_id.get(pid) if pid is not None else None
+                if ph is not None and ph.id not in seen_ph:
+                    ph.display_order = order
+                    seen_ph.add(ph.id)
+                    order += 1
+        # Anything not named keeps a stable spot after the ordered items.
         for s in patient.surgeries:
-            if s.id not in seen:
+            if s.id not in seen_surg:
                 s.display_order = order
+                order += 1
+        for ph in ph_by_id.values():
+            if ph.id not in seen_ph:
+                ph.display_order = order
                 order += 1
         db.commit()
     return {"status": "ok"}
