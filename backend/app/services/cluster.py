@@ -438,11 +438,26 @@ class ClusterService:
         if rc != 0:
             raise RuntimeError(f"failed to write job script on cluster: {_e}")
 
-        # Create tmux session that runs the script under bash
-        tmux_cmd = f"tmux new-session -d -s {session_name} 'bash {script_q}'"
-        stdout, stderr, exit_code = self.run_command(tmux_cmd)
+        # Run the job the SAME way a human does in their terminal: open an
+        # interactive login-shell tmux session (which loads /etc/profile +
+        # ~/.bash_profile + ~/.bashrc — CUDA paths, LD_LIBRARY_PATH, modules, conda,
+        # etc.), then TYPE the command into it. Passing the command directly to
+        # `tmux new-session -d 'cmd'` instead runs it in a stripped, non-interactive
+        # shell with none of that setup — which is why an identical script works when
+        # run by hand but fails when launched by SlideCap.
+        create_cmd = f"tmux new-session -d -s {session_name}"
+        _co, _ce, create_rc = self.run_command(create_cmd)
+        if create_rc != 0:
+            raise RuntimeError(f"tmux session creation failed: {_ce}")
+
+        # Type `bash <script>; exit` — exactly like running it by hand. The trailing
+        # `exit` closes the interactive shell when the job finishes so the poller
+        # detects the session ending.
+        typed = f"bash {script_path}; exit"
+        send_cmd = f"tmux send-keys -t {session_name} {_shlex.quote(typed)} Enter"
+        stdout, stderr, exit_code = self.run_command(send_cmd)
         if exit_code != 0:
-            raise RuntimeError(f"tmux session creation failed: {stderr}")
+            raise RuntimeError(f"tmux send-keys failed: {stderr}")
 
         return session_name
 
