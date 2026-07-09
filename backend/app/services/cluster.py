@@ -420,8 +420,16 @@ class ClusterService:
         # DEBUG: dump the exact command so it can be reproduced by hand on the cluster.
         print(f"\n[start_job] === session {session_name} ===\n{full_command}\n=== end command ===\n", flush=True)
 
+        # Run the whole thing under BASH, and immune to quoting, by piping a
+        # base64 blob into `bash`. tmux otherwise launches the command with the
+        # login shell (often /bin/sh/dash), where bashisms like `source` in a
+        # user's env_setup fail instantly — killing the session with an empty log.
+        import base64 as _b64
+        encoded = _b64.b64encode(full_command.encode()).decode()
+        inner = f"echo {encoded} | base64 -d | bash"
+
         # Create tmux session
-        tmux_cmd = f"tmux new-session -d -s {session_name} '{full_command}'"
+        tmux_cmd = f"tmux new-session -d -s {session_name} '{inner}'"
         stdout, stderr, exit_code = self.run_command(tmux_cmd)
         if exit_code != 0:
             raise RuntimeError(f"tmux session creation failed: {stderr}")
