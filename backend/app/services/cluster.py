@@ -420,16 +420,26 @@ class ClusterService:
         # DEBUG: dump the exact command so it can be reproduced by hand on the cluster.
         print(f"\n[start_job] === session {session_name} ===\n{full_command}\n=== end command ===\n", flush=True)
 
-        # Run the whole thing under BASH, and immune to quoting, by piping a
-        # base64 blob into `bash`. tmux otherwise launches the command with the
-        # login shell (often /bin/sh/dash), where bashisms like `source` in a
-        # user's env_setup fail instantly — killing the session with an empty log.
-        import base64 as _b64
-        encoded = _b64.b64encode(full_command.encode()).decode()
-        inner = f"echo {encoded} | base64 -d | bash"
+        # Write the command to a script on the cluster, then run that script with
+        # BASH inside tmux. This avoids ALL shell-quoting pitfalls (env_setup /
+        # command_template may contain quotes) AND guarantees bash — tmux otherwise
+        # launches the command with the login shell (often /bin/sh/dash), where
+        # bashisms like `source` in env_setup fail instantly and kill the session
+        # with no log. Writing a script sidesteps both.
+        script_path = f"{tmp_base}/job_{job_id}.sh"
+        script_q = _shlex.quote(script_path)
+        write_script = (
+            f"mkdir -p {base_q} && cat > {script_q} << 'SLIDECAP_EOF'\n"
+            f"{full_command}\n"
+            f"SLIDECAP_EOF\n"
+            f"chmod +x {script_q}"
+        )
+        _o, _e, rc = self.run_command(write_script)
+        if rc != 0:
+            raise RuntimeError(f"failed to write job script on cluster: {_e}")
 
-        # Create tmux session
-        tmux_cmd = f"tmux new-session -d -s {session_name} '{inner}'"
+        # Create tmux session that runs the script under bash
+        tmux_cmd = f"tmux new-session -d -s {session_name} 'bash {script_q}'"
         stdout, stderr, exit_code = self.run_command(tmux_cmd)
         if exit_code != 0:
             raise RuntimeError(f"tmux session creation failed: {stderr}")
