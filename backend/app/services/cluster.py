@@ -370,6 +370,19 @@ class ClusterService:
         # Force TMPDIR to fast/local scratch (heavy Ray/CellViT/UNI temp I/O).
         body.append(f"export TMPDIR={tmp_q}")
         body.append(f"mkdir -p {tmp_q}")
+        # Best-effort: also steer the usual /tmp-hungry caches off root. torch
+        # inductor / triton write compile caches that otherwise land in /tmp.
+        body.append(f"export TORCHINDUCTOR_CACHE_DIR={_shlex.quote(local_tmp + '/inductor')}")
+        body.append(f"export TRITON_CACHE_DIR={_shlex.quote(local_tmp + '/triton')}")
+        # Ray puts sockets in its temp dir → must be LOCAL (NFS breaks it). Point it
+        # at CLUSTER_RAY_TMPDIR (default /dev/shm, local tmpfs) instead of /tmp/ray.
+        ray_tmp = None
+        ray_base = (settings.CLUSTER_RAY_TMPDIR or "").rstrip("/")
+        if ray_base:
+            ray_tmp = f"{ray_base}/{job_id}"
+            ray_q = _shlex.quote(ray_tmp)
+            body.append(f"export RAY_TMPDIR={ray_q}")
+            body.append(f"mkdir -p {ray_q}")
         body.append(command)
         body_cmd = " && ".join(body)
 
@@ -379,20 +392,29 @@ class ClusterService:
         prep = (
             f"mkdir -p {base_q} 2>/dev/null; "
             f"find {base_q} -maxdepth 1 -type d -mmin +360 -exec rm -rf {{}} + 2>/dev/null; "
-            f"rm -rf {out_q}; mkdir -p {out_q}"
         )
+        if ray_base:
+            # Old Ray temp dirs on tmpfs (/dev/shm) pin RAM — sweep stale ones too.
+            rb_q = _shlex.quote(ray_base)
+            prep += (
+                f"mkdir -p {rb_q} 2>/dev/null; "
+                f"find {rb_q} -maxdepth 1 -type d -mmin +360 -exec rm -rf {{}} + 2>/dev/null; "
+            )
+        prep += f"rm -rf {out_q}; mkdir -p {out_q}"
 
         # Capture the WHOLE body (setup errors included) to run.log — so a bad
         # env_setup / missing dir / out-of-space shows up in the UI instead of a
         # silent "session ended without output".
         run = f"{prep}; {{ {body_cmd} ; }} 2>&1 | tee {out_q}/run.log"
 
-        # Always clean up the WSI copy + local temp, success or failure.
+        # Always clean up the WSI copy + local temp (+ Ray temp), success or failure.
         cleanup = (
             f"; rm -rf {_shlex.quote(remote_wsi_dir)}"
             f"; rm -rf {tmp_q}"
-            f"; true"
         )
+        if ray_tmp:
+            cleanup += f"; rm -rf {_shlex.quote(ray_tmp)}"
+        cleanup += "; true"
         full_command = run + cleanup
 
         # Create tmux session

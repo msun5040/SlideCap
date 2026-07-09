@@ -98,7 +98,14 @@ class Settings(BaseSettings):
     # /tmp, but on clusters where / is small/full, point this at a bigger mount
     # (e.g. "/mnt/scratch/slidecap_tmp"). Per-job dirs are created under it and
     # removed after each run; stale ones (>6h) are swept at the next job start.
-    CLUSTER_TMPDIR: str = "/tmp/slidecap_tmp"
+    CLUSTER_TMPDIR: str = "/ligonlab/michael/slidecap_tmp"
+
+    # Ray's temp/spill dir. Unlike everything else, Ray puts Unix domain SOCKETS
+    # here, which do NOT work on NFS — so this must be a LOCAL filesystem, not the
+    # NFS CLUSTER_TMPDIR. /dev/shm is local (tmpfs, RAM-backed) and usually large,
+    # so it's the safe default when the local root disk is full. Set to "" to leave
+    # Ray on its default (/tmp/ray). Exported as RAY_TMPDIR per job.
+    CLUSTER_RAY_TMPDIR: str = "/dev/shm/slidecap_ray"
 
     # Minimum free space (MB) required on the cluster output volume before a job
     # is allowed to start. Below this, the submit fails fast with a clear
