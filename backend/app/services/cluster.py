@@ -417,6 +417,9 @@ class ClusterService:
         cleanup += "; true"
         full_command = run + cleanup
 
+        # DEBUG: dump the exact command so it can be reproduced by hand on the cluster.
+        print(f"\n[start_job] === session {session_name} ===\n{full_command}\n=== end command ===\n", flush=True)
+
         # Create tmux session
         tmux_cmd = f"tmux new-session -d -s {session_name} '{full_command}'"
         stdout, stderr, exit_code = self.run_command(tmux_cmd)
