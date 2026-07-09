@@ -6,6 +6,7 @@ GPU status queries, file transfer (rsync/SFTP), tmux job management,
 and background status polling.
 """
 import json
+import os
 import shutil
 import subprocess
 import threading
@@ -327,35 +328,72 @@ class ClusterService:
         else:
             raise RuntimeError("Analysis has no command_template or script_path defined")
 
-        parts = []
+        from ..config import settings
+        tmp_base = settings.CLUSTER_TMPDIR.rstrip("/") or "/tmp/slidecap_tmp"
+        local_tmp = f"{tmp_base}/{job_id}"
+        out_q = _shlex.quote(remote_output_dir)
+        tmp_q = _shlex.quote(local_tmp)
+        base_q = _shlex.quote(tmp_base)
+
+        # ── Preflight: fail fast (with a clear message) if the cluster disk is
+        # essentially full — otherwise setup dies before it can write run.log and
+        # the user just sees "session ended without output". ──
+        min_free_mb = getattr(settings, "CLUSTER_MIN_FREE_MB", 0)
+        if min_free_mb and min_free_mb > 0:
+            check_dir = os.path.dirname(remote_output_dir.rstrip("/")) or "/"
+            avail_out, _, _ = self.run_command(
+                f"df -Pk {_shlex.quote(check_dir)} 2>/dev/null | awk 'NR==2{{print $4}}'"
+            )
+            try:
+                avail_mb = int(avail_out.strip()) // 1024
+            except (ValueError, TypeError):
+                avail_mb = None
+            if avail_mb is not None and avail_mb < min_free_mb:
+                raise RuntimeError(
+                    f"Cluster disk nearly full: only {avail_mb} MB free on the volume "
+                    f"holding {check_dir} (need ≥ {min_free_mb} MB). Free space on the "
+                    f"cluster and resubmit."
+                )
+
+        # Body that MUST be captured to run.log: working dir, env setup, GPU pin,
+        # TMPDIR, and the analysis command. Chained with && so a failing setup step
+        # stops the run — but its output is now logged (see the tee wrapper below).
+        body = []
         if analysis.working_directory:
-            parts.append(f"cd {analysis.working_directory}")
+            # Raw (not quoted) so ~ and $VARS in the configured path still expand.
+            body.append(f"cd {analysis.working_directory}")
         if analysis.env_setup:
-            parts.append(analysis.env_setup)
-
+            body.append(analysis.env_setup)
         # Pin the job to the requested GPU
-        parts.append(f"export CUDA_VISIBLE_DEVICES={gpu_index}")
-        parts.append(f"export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1")
+        body.append(f"export CUDA_VISIBLE_DEVICES={gpu_index}")
+        body.append("export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1")
+        # Force TMPDIR to fast/local scratch (heavy Ray/CellViT/UNI temp I/O).
+        body.append(f"export TMPDIR={tmp_q}")
+        body.append(f"mkdir -p {tmp_q}")
+        body.append(command)
+        body_cmd = " && ".join(body)
 
-        # Force TMPDIR to local disk — Ray/CellViT write heavy temp I/O that is
-        # extremely slow over NFS/SMB.  /tmp is always local.
-        local_tmp = f"/tmp/slidecap_tmp/{job_id}"
-        parts.append(f"export TMPDIR={_shlex.quote(local_tmp)}")
-        parts.append(f"mkdir -p {_shlex.quote(local_tmp)}")
+        # Prep (runs BEFORE the tee, so it can't be clobbered and failures here are
+        # non-fatal): sweep stale per-job temp dirs (>6h) left by dead jobs, then
+        # (re)create a fresh output dir so run.log is always writable.
+        prep = (
+            f"mkdir -p {base_q} 2>/dev/null; "
+            f"find {base_q} -maxdepth 1 -type d -mmin +360 -exec rm -rf {{}} + 2>/dev/null; "
+            f"rm -rf {out_q}; mkdir -p {out_q}"
+        )
 
-        # Clean any stale output from a previous run, then create fresh dir
-        parts.append(f"rm -rf {_shlex.quote(remote_output_dir)}")
-        parts.append(f"mkdir -p {_shlex.quote(remote_output_dir)}")
-        parts.append(f"{command} 2>&1 | tee {_shlex.quote(remote_output_dir)}/run.log")
+        # Capture the WHOLE body (setup errors included) to run.log — so a bad
+        # env_setup / missing dir / out-of-space shows up in the UI instead of a
+        # silent "session ended without output".
+        run = f"{prep}; {{ {body_cmd} ; }} 2>&1 | tee {out_q}/run.log"
 
-        full_command = " && ".join(parts)
-
-        # After analysis (success or failure): clean up WSI dir and local tmp
-        full_command += (
+        # Always clean up the WSI copy + local temp, success or failure.
+        cleanup = (
             f"; rm -rf {_shlex.quote(remote_wsi_dir)}"
-            f"; rm -rf {_shlex.quote(local_tmp)}"
+            f"; rm -rf {tmp_q}"
             f"; true"
         )
+        full_command = run + cleanup
 
         # Create tmux session
         tmux_cmd = f"tmux new-session -d -s {session_name} '{full_command}'"
@@ -1023,6 +1061,9 @@ class JobStatusPoller:
             stripped = line.strip()
             if not stripped:
                 continue
+            # Disk full — common cause of setup/temp failures on small cluster roots
+            if "No space left on device" in stripped:
+                return "No space left on device — the cluster disk is full."
             # CUDA / GPU OOM
             if "OutOfMemoryError" in stripped or "out of memory" in stripped.lower():
                 return stripped[:300]

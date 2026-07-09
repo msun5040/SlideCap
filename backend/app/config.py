@@ -94,6 +94,17 @@ class Settings(BaseSettings):
     # Leave as None to use rsync transfers (default).
     CLUSTER_NETWORK_MOUNT: Optional[str] = None
 
+    # Base directory on the cluster for per-job scratch/TMPDIR. Default is local
+    # /tmp, but on clusters where / is small/full, point this at a bigger mount
+    # (e.g. "/mnt/scratch/slidecap_tmp"). Per-job dirs are created under it and
+    # removed after each run; stale ones (>6h) are swept at the next job start.
+    CLUSTER_TMPDIR: str = "/tmp/slidecap_tmp"
+
+    # Minimum free space (MB) required on the cluster output volume before a job
+    # is allowed to start. Below this, the submit fails fast with a clear
+    # "disk full" message instead of dying with an empty log. 0 disables the check.
+    CLUSTER_MIN_FREE_MB: int = 512
+
     @property
     def staging_path(self) -> Path:
         return Path(self.NETWORK_ROOT) / "slide_staging"
