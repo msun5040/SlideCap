@@ -100,6 +100,10 @@ export interface CohortPlaceholder {
   // Optional pin to a specific patient + surgery timepoint (Patients tab).
   patient_id?: number | null
   surgery_label?: string | null
+  // Optional pin to a case (accession_hash): renders as a "needs scan" slide row
+  // inside that case in the Cases tab. stain_type is an optional stain label.
+  case_hash?: string | null
+  stain_type?: string | null
   display_order?: number | null
   created_at?: string | null
 }
@@ -109,6 +113,8 @@ export interface CaseGroup {
   accession_number: string | null
   year: number | null
   slides: CohortSlide[]
+  // Slide-level placeholders pinned to this case ("needs scan" stand-in slides).
+  placeholders?: CohortPlaceholder[]
 }
 
 export interface PatientSurgery {

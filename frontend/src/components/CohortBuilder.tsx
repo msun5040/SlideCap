@@ -176,6 +176,11 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
   const [placeholderCount, setPlaceholderCount] = useState('')
   const [savingPlaceholder, setSavingPlaceholder] = useState(false)
 
+  // ── Build-a-slide placeholder (per case, in the Cases tab) ────────────
+  const [slidePhCaseHash, setSlidePhCaseHash] = useState<string | null>(null)  // which case's form is open
+  const [slidePhLabel, setSlidePhLabel] = useState('')
+  const [slidePhStain, setSlidePhStain] = useState('')
+
   // ── Settings tab: cohort auto-tags ───────────────────────────────────
   const [autoTagIds, setAutoTagIds] = useState<Set<number>>(new Set())
   const [savingAutoTags, setSavingAutoTags] = useState(false)
@@ -210,9 +215,21 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
           accession_number: slide.accession_number,
           year: slide.year,
           slides: [],
+          placeholders: [],
         })
       }
       groupMap.get(key)!.slides.push(slide)
+    }
+    // Attach slide-level placeholders to their case (creating a placeholder-only
+    // group if the case has no real slides in the cohort yet).
+    for (const ph of cohort.placeholders ?? []) {
+      if (!ph.case_hash) continue
+      let group = groupMap.get(ph.case_hash)
+      if (!group) {
+        group = { case_hash: ph.case_hash, accession_number: null, year: null, slides: [], placeholders: [] }
+        groupMap.set(ph.case_hash, group)
+      }
+      group.placeholders!.push(ph)
     }
     const groups = Array.from(groupMap.values())
     groups.sort((a, b) => (a.accession_number || a.case_hash).localeCompare(b.accession_number || b.case_hash))
@@ -823,6 +840,27 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
     }
   }
 
+  // Build a "needs scan" placeholder slide for a specific case in the cohort.
+  const addSlidePlaceholder = async (caseHash: string) => {
+    if (!cohort) return
+    const label = slidePhLabel.trim()
+    if (!label) return
+    try {
+      const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/placeholders`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label, case_hash: caseHash, stain_type: slidePhStain.trim() || null }),
+      })
+      if (res.ok) {
+        const created: CohortPlaceholder = await res.json()
+        setCohort(c => c ? { ...c, placeholders: [...(c.placeholders ?? []), created] } : c)
+        setSlidePhLabel(''); setSlidePhStain(''); setSlidePhCaseHash(null)
+      }
+    } catch (e) {
+      console.error('Failed to add slide placeholder:', e)
+    }
+  }
+
   const deletePlaceholder = async (id: number) => {
     if (!cohort) return
     const prev = cohort.placeholders ?? []
@@ -895,31 +933,44 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
     } catch (e) { setCohort(prev); console.error('Remove slide error:', e) }
   }
 
-  const removeCase = async (caseSlides: CohortSlide[]) => {
-    if (!cohort || caseSlides.length === 0) return
+  // Remove a whole case from the cohort — its real slides AND any "needs scan"
+  // placeholder slides (so placeholder-only cases can be removed too).
+  const removeCase = async (group: CaseGroup) => {
+    if (!cohort) return
+    const caseSlides = group.slides
+    const phIds = (group.placeholders ?? []).map(p => p.id)
+    if (caseSlides.length === 0 && phIds.length === 0) return
     // If this case is explicitly followed, unfollow first so its slides don't
     // get re-added on the next index. (Cohort-wide auto-add is left untouched.)
-    const caseHash = caseSlides[0].case_hash
-    if (caseHash && followedCaseHashes.has(caseHash)) {
-      await toggleFollowCase(caseHash, false)
+    if (group.case_hash && followedCaseHashes.has(group.case_hash)) {
+      await toggleFollowCase(group.case_hash, false)
     }
-    const hashes = caseSlides.map(s => s.slide_hash)
-    const hashSet = new Set(hashes)
+    const hashSet = new Set(caseSlides.map(s => s.slide_hash))
     const prev = cohort
-    setCohort({ ...cohort, slides: cohort.slides.filter(s => !hashSet.has(s.slide_hash)) })
+    setCohort({
+      ...cohort,
+      slides: cohort.slides.filter(s => !hashSet.has(s.slide_hash)),
+      placeholders: (cohort.placeholders ?? []).filter(p => !phIds.includes(p.id)),
+    })
     try {
-      const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/slides`, {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ slide_hashes: hashes }),
-      })
-      if (res.ok) {
-        const data = await res.json()
-        setCohort(p => p ? { ...p, slide_count: data.total_slides, case_count: data.total_cases } : p)
-      } else {
-        setCohort(prev)
-        const err = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }))
-        console.error('Remove case failed:', err)
+      // Delete placeholder slides.
+      await Promise.all(phIds.map(id =>
+        fetch(`${getApiBase()}/cohorts/${cohortId}/placeholders/${id}`, { method: 'DELETE' })))
+      // Delete real slides.
+      if (hashSet.size > 0) {
+        const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/slides`, {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ slide_hashes: [...hashSet] }),
+        })
+        if (res.ok) {
+          const data = await res.json()
+          setCohort(p => p ? { ...p, slide_count: data.total_slides, case_count: data.total_cases } : p)
+        } else {
+          setCohort(prev)
+          const err = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }))
+          console.error('Remove case failed:', err)
+        }
       }
     } catch (e) { setCohort(prev); console.error('Remove case error:', e) }
   }
@@ -1134,13 +1185,13 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
           {activeTab === 'cases' && (
             <div className="flex-1 overflow-hidden flex flex-col">
               {/* Outstanding placeholders — cohort-level (not pinned to a patient) */}
-              {(cohort.placeholders ?? []).filter(p => !p.patient_id).length > 0 && (
+              {(cohort.placeholders ?? []).filter(p => !p.patient_id && !p.case_hash).length > 0 && (
                 <div className="shrink-0 border-b border-amber-200 bg-amber-50/40 px-2 py-2 space-y-1 max-h-44 overflow-auto">
                   <div className="flex items-center gap-1.5 px-1 text-[11px] font-medium text-amber-700">
                     <CircleDashed className="h-3.5 w-3.5" />
-                    Outstanding — to find &amp; scan ({(cohort.placeholders ?? []).filter(p => !p.patient_id).length})
+                    Outstanding — to find &amp; scan ({(cohort.placeholders ?? []).filter(p => !p.patient_id && !p.case_hash).length})
                   </div>
-                  {(cohort.placeholders ?? []).filter(p => !p.patient_id).map(p => (
+                  {(cohort.placeholders ?? []).filter(p => !p.patient_id && !p.case_hash).map(p => (
                     <div
                       key={p.id}
                       className="flex items-center gap-2 rounded-md border border-dashed border-amber-300 bg-white/70 px-2.5 py-1.5 group/ph"
@@ -1171,7 +1222,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
               )}
 
               {caseGroups.length === 0 ? (
-                (cohort.placeholders ?? []).filter(p => !p.patient_id).length > 0 ? (
+                (cohort.placeholders ?? []).filter(p => !p.patient_id && !p.case_hash).length > 0 ? (
                   <div className="flex-1 flex items-center justify-center text-center p-8">
                     <p className="text-xs text-muted-foreground">
                       No slides added yet — the items above are still outstanding.
@@ -1415,6 +1466,16 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                                 <span className="text-[11px] text-muted-foreground shrink-0 tabular-nums">
                                   {group.slides.length}
                                 </span>
+                                {/* Pending placeholder-slide indicator */}
+                                {(group.placeholders?.length ?? 0) > 0 && (
+                                  <span
+                                    className="shrink-0 inline-flex items-center gap-0.5 text-[10px] text-red-600 bg-red-50 border border-red-200 rounded-full px-1.5 py-0.5"
+                                    title={`${group.placeholders!.length} slide${group.placeholders!.length !== 1 ? 's' : ''} to scan`}
+                                  >
+                                    <CircleDashed className="h-2.5 w-2.5" />
+                                    {group.placeholders!.length}
+                                  </span>
+                                )}
 
                                 {/* Analysis status indicators */}
                                 {caseStatuses.length > 0 && (
@@ -1505,7 +1566,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                                 {/* Remove */}
                                 <button
                                   className="shrink-0 opacity-0 group-hover/case:opacity-100 text-muted-foreground hover:text-destructive transition-opacity"
-                                  onClick={() => removeCase(group.slides)}
+                                  onClick={() => removeCase(group)}
                                   title="Remove case from cohort"
                                 >
                                   <X className="h-3.5 w-3.5" />
@@ -1593,6 +1654,87 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                                       </div>
                                     )
                                   })}
+
+                                  {/* Placeholder ("needs scan") slides for this case */}
+                                  {(group.placeholders ?? []).map((ph) => (
+                                    <div
+                                      key={`slph-${ph.id}`}
+                                      className="flex items-center gap-2.5 px-3 py-1.5 group/slph bg-red-50/60 border-l-2 border-red-300"
+                                      title={ph.note || 'Slide still to be found & scanned'}
+                                    >
+                                      <CircleDashed className="h-2.5 w-2.5 text-red-400 shrink-0" />
+                                      <span className="text-xs font-mono text-red-700 w-16 truncate">{ph.label}</span>
+                                      {ph.stain_type && (
+                                        <Badge variant="outline" className="text-[10px] h-5 px-1.5 font-medium border-red-200 text-red-700">
+                                          {ph.stain_type}
+                                        </Badge>
+                                      )}
+                                      <span className="text-[10px] uppercase tracking-wide text-red-500 ml-1">needs scan</span>
+                                      <div className="flex-1" />
+                                      <button
+                                        className="shrink-0 opacity-0 group-hover/slph:opacity-100 text-muted-foreground hover:text-destructive transition-opacity"
+                                        onClick={(e) => { e.stopPropagation(); deletePlaceholder(ph.id) }}
+                                        title="Remove placeholder slide"
+                                      >
+                                        <X className="h-3 w-3" />
+                                      </button>
+                                    </div>
+                                  ))}
+
+                                  {/* Build a placeholder slide for this case */}
+                                  {slidePhCaseHash === group.case_hash ? (
+                                    <div
+                                      className="flex items-center gap-1.5 px-3 py-2 bg-red-50/60 border-t border-red-100"
+                                      onClick={(e) => e.stopPropagation()}
+                                    >
+                                      <CircleDashed className="h-3 w-3 text-red-400 shrink-0" />
+                                      <Input
+                                        autoFocus
+                                        placeholder="Slide label, e.g. B1 recut"
+                                        value={slidePhLabel}
+                                        onChange={(e) => setSlidePhLabel(e.target.value)}
+                                        onKeyDown={(e) => {
+                                          if (e.key === 'Enter') addSlidePlaceholder(group.case_hash)
+                                          if (e.key === 'Escape') setSlidePhCaseHash(null)
+                                        }}
+                                        className="h-7 text-xs flex-1 min-w-24"
+                                      />
+                                      <Input
+                                        placeholder="Stain"
+                                        value={slidePhStain}
+                                        onChange={(e) => setSlidePhStain(e.target.value)}
+                                        onKeyDown={(e) => {
+                                          if (e.key === 'Enter') addSlidePlaceholder(group.case_hash)
+                                          if (e.key === 'Escape') setSlidePhCaseHash(null)
+                                        }}
+                                        className="h-7 text-xs w-20"
+                                      />
+                                      <Button
+                                        size="sm"
+                                        className="h-7 text-xs bg-red-600 hover:bg-red-700"
+                                        onClick={() => addSlidePlaceholder(group.case_hash)}
+                                        disabled={!slidePhLabel.trim()}
+                                      >
+                                        Add
+                                      </Button>
+                                      <button className="text-muted-foreground hover:text-foreground" onClick={() => setSlidePhCaseHash(null)}>
+                                        <X className="h-3.5 w-3.5" />
+                                      </button>
+                                    </div>
+                                  ) : (
+                                    <button
+                                      className="flex items-center gap-1.5 px-3 py-1.5 text-[11px] text-red-500 hover:text-red-700 transition-colors w-full"
+                                      onClick={(e) => {
+                                        e.stopPropagation()
+                                        setSlidePhCaseHash(group.case_hash)
+                                        setSlidePhLabel(''); setSlidePhStain('')
+                                      }}
+                                      title="Add a placeholder for a slide still to be found & scanned"
+                                    >
+                                      <CircleDashed className="h-3 w-3" />
+                                      Add slide to scan
+                                    </button>
+                                  )}
                                 </div>
                               )}
                             </div>
@@ -1952,10 +2094,16 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                             <TableCell className="text-sm text-muted-foreground">{slide.block_id}</TableCell>
                             <TableCell>
                               {inCohort ? (
-                                <Badge className="bg-green-500/10 text-green-700 text-xs gap-1 border-0">
-                                  <Check className="h-3 w-3" />
-                                  Added
-                                </Badge>
+                                <button
+                                  className="group/added inline-flex items-center gap-1 rounded px-2 h-6 text-xs bg-green-500/10 text-green-700 hover:bg-red-500/10 hover:text-red-600 transition-colors"
+                                  onClick={e => { e.stopPropagation(); removeSlide(slide.slide_hash) }}
+                                  title="Remove from cohort"
+                                >
+                                  <Check className="h-3 w-3 group-hover/added:hidden" />
+                                  <X className="h-3 w-3 hidden group-hover/added:inline" />
+                                  <span className="group-hover/added:hidden">Added</span>
+                                  <span className="hidden group-hover/added:inline">Remove</span>
+                                </button>
                               ) : (
                                 <Button
                                   variant="ghost"

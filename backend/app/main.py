@@ -2207,6 +2207,8 @@ def get_cohort(cohort_id: int, db: Session = Depends(get_db)):
                 "expected_slides": p.expected_slides,
                 "patient_id": p.patient_id,
                 "surgery_label": p.surgery_label,
+                "case_hash": p.case_hash,
+                "stain_type": p.stain_type,
                 "display_order": p.display_order,
                 "created_at": p.created_at.isoformat() if p.created_at else None,
             }
@@ -2395,6 +2397,8 @@ class CohortPlaceholderCreate(BaseModel):
     expected_slides: Optional[int] = None
     patient_id: Optional[int] = None
     surgery_label: Optional[str] = None
+    case_hash: Optional[str] = None
+    stain_type: Optional[str] = None
 
 
 def _serialize_placeholder(p: CohortPlaceholder) -> dict:
@@ -2405,6 +2409,8 @@ def _serialize_placeholder(p: CohortPlaceholder) -> dict:
         "expected_slides": p.expected_slides,
         "patient_id": p.patient_id,
         "surgery_label": p.surgery_label,
+        "case_hash": p.case_hash,
+        "stain_type": p.stain_type,
         "display_order": p.display_order,
         "created_at": p.created_at.isoformat() if p.created_at else None,
     }
@@ -2432,6 +2438,8 @@ def add_cohort_placeholder(cohort_id: int, data: CohortPlaceholderCreate, db: Se
             expected_slides=data.expected_slides,
             patient_id=data.patient_id,
             surgery_label=(data.surgery_label or None),
+            case_hash=(data.case_hash or None),
+            stain_type=(data.stain_type or None),
         )
         db.add(placeholder)
         db.commit()

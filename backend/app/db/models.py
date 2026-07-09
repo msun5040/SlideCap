@@ -488,6 +488,11 @@ class CohortPlaceholder(Base):
     # top of the Cases tab.
     patient_id = Column(Integer, ForeignKey('cohort_patients.id', ondelete='CASCADE'), nullable=True, index=True)
     surgery_label = Column(String(20))              # e.g. "S1", "S2"
+    # Slide-level placeholders attach to a specific case (by accession_hash) and
+    # render as a "needs scan" slide row inside that case in the Cases tab. NULL =
+    # a case-level / cohort-level / patient-timepoint placeholder (see above).
+    case_hash = Column(String(64), index=True)
+    stain_type = Column(String(50))                 # optional, e.g. "HE", "IHC-CD3"
     # Manual order within the patient's timeline, shared with CohortPatientCase.
     # 0 = unordered (falls back to alphabetical by surgery_label, after ordered).
     display_order = Column(Integer, nullable=False, default=0, server_default='0')
@@ -1372,6 +1377,8 @@ def _migrate_cohort_placeholders(engine):
             'patient_id': "ALTER TABLE cohort_placeholders ADD COLUMN patient_id INTEGER REFERENCES cohort_patients(id) ON DELETE CASCADE",
             'surgery_label': "ALTER TABLE cohort_placeholders ADD COLUMN surgery_label VARCHAR(20)",
             'display_order': "ALTER TABLE cohort_placeholders ADD COLUMN display_order INTEGER NOT NULL DEFAULT 0",
+            'case_hash': "ALTER TABLE cohort_placeholders ADD COLUMN case_hash VARCHAR(64)",
+            'stain_type': "ALTER TABLE cohort_placeholders ADD COLUMN stain_type VARCHAR(50)",
         }
         with engine.connect() as conn:
             for col, ddl in adds.items():
