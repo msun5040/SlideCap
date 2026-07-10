@@ -332,7 +332,12 @@ class ClusterService:
         template_vars = {
             "wsi_dir": remote_wsi_dir,
             "outdir": remote_output_dir,
-            "gpu": str(gpu_index),  # Physical GPU index — also exported via CUDA_VISIBLE_DEVICES
+            # The job runs with CUDA_VISIBLE_DEVICES={gpu_index} (see body below),
+            # which isolates it to that ONE physical GPU and remaps it to logical
+            # device 0. So the command must always select `cuda:0` — passing the
+            # physical index here would be "invalid device ordinal" for any
+            # gpu_index != 0, since only a single GPU is visible to the process.
+            "gpu": "0",
             "batch_size": str(params.get("batch_size", 4)),
             "model_path": params.get("model_path", ""),
         }
@@ -380,7 +385,9 @@ class ClusterService:
             body.append(f"cd {analysis.working_directory}")
         if analysis.env_setup:
             body.append(analysis.env_setup)
-        # Pin the job to the requested GPU
+        # Pin the job to the requested physical GPU. This isolates the process
+        # to that one card and remaps it to logical device 0 — which is why the
+        # command's {gpu} placeholder is always "0" (see template_vars above).
         body.append(f"export CUDA_VISIBLE_DEVICES={gpu_index}")
         body.append("export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1")
         # Force TMPDIR to fast/local scratch (heavy Ray/CellViT/UNI temp I/O).
