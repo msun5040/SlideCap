@@ -32,6 +32,22 @@ class ClusterService:
         self._client: Optional[paramiko.SSHClient] = None
         self._lock = threading.Lock()
 
+    @property
+    def _tmux(self) -> str:
+        """`tmux` invocation with TMUX_TMPDIR pointed off the (possibly full) root
+        /tmp onto a local fs with space + socket support. MUST be used for EVERY
+        tmux command — new-session, send-keys, has-session, kill-session,
+        list-sessions — or they'll look for the server on different sockets and
+        never see each other's sessions."""
+        import shlex as _shlex
+        from ..config import settings
+        tdir = (settings.CLUSTER_TMUX_TMPDIR or "").rstrip("/")
+        if not tdir:
+            return "tmux"
+        # Ensure the socket dir exists (tmux won't create a missing TMUX_TMPDIR),
+        # then point tmux at it. `mkdir -p ... && TMUX_TMPDIR=... tmux` runs per call.
+        return f"mkdir -p {_shlex.quote(tdir)} 2>/dev/null; TMUX_TMPDIR={_shlex.quote(tdir)} tmux"
+
     def connect(self, host: str, port: int, username: str, password: str) -> dict:
         """
         Open SSH connection with provided credentials.
@@ -445,7 +461,7 @@ class ClusterService:
         # `tmux new-session -d 'cmd'` instead runs it in a stripped, non-interactive
         # shell with none of that setup — which is why an identical script works when
         # run by hand but fails when launched by SlideCap.
-        create_cmd = f"tmux new-session -d -s {session_name}"
+        create_cmd = f"{self._tmux} new-session -d -s {session_name}"
         _co, _ce, create_rc = self.run_command(create_cmd)
         if create_rc != 0:
             raise RuntimeError(f"tmux session creation failed: {_ce}")
@@ -454,7 +470,7 @@ class ClusterService:
         # `exit` closes the interactive shell when the job finishes so the poller
         # detects the session ending.
         typed = f"bash {script_path}; exit"
-        send_cmd = f"tmux send-keys -t {session_name} {_shlex.quote(typed)} Enter"
+        send_cmd = f"{self._tmux} send-keys -t {session_name} {_shlex.quote(typed)} Enter"
         stdout, stderr, exit_code = self.run_command(send_cmd)
         if exit_code != 0:
             raise RuntimeError(f"tmux send-keys failed: {stderr}")
@@ -467,7 +483,7 @@ class ClusterService:
         Returns {"alive": bool, "log_tail": str}.
         """
         # Check if tmux session exists
-        _, _, exit_code = self.run_command(f"tmux has-session -t {session_name} 2>/dev/null")
+        _, _, exit_code = self.run_command(f"{self._tmux} has-session -t {session_name} 2>/dev/null")
         alive = exit_code == 0
 
         # Read last 50 lines of run.log
@@ -480,12 +496,12 @@ class ClusterService:
 
     def cancel_job(self, session_name: str) -> bool:
         """Kill a tmux session."""
-        _, _, exit_code = self.run_command(f"tmux kill-session -t {session_name} 2>/dev/null")
+        _, _, exit_code = self.run_command(f"{self._tmux} kill-session -t {session_name} 2>/dev/null")
         return exit_code == 0
 
     def list_tmux_sessions(self) -> list[str]:
         """List all slidecap tmux sessions."""
-        stdout, _, exit_code = self.run_command("tmux list-sessions -F '#{session_name}' 2>/dev/null")
+        stdout, _, exit_code = self.run_command(f"{self._tmux} list-sessions -F '#{{session_name}}' 2>/dev/null")
         if exit_code != 0 or not stdout:
             return []
         return [s for s in stdout.split("\n") if s.startswith("slidecap_")]

@@ -107,6 +107,13 @@ class Settings(BaseSettings):
     # Ray on its default (/tmp/ray). Exported as RAY_TMPDIR per job.
     CLUSTER_RAY_TMPDIR: str = "/dev/shm/slidecap_ray"
 
+    # tmux keeps its control SOCKET in $TMUX_TMPDIR/tmux-<uid>/ (default /tmp).
+    # On clusters where / (and thus /tmp) is full, tmux can't create/hold that
+    # socket and every session dies instantly ("error connecting to
+    # /tmp/tmux-<uid>/default"). Point it at a local fs with space + socket
+    # support (/dev/shm = tmpfs). Applied to ALL tmux commands SlideCap runs.
+    CLUSTER_TMUX_TMPDIR: str = "/dev/shm"
+
     # Minimum free space (MB) required on the cluster output volume before a job
     # is allowed to start. Below this, the submit fails fast with a clear
     # "disk full" message instead of dying with an empty log. 0 disables the check.
