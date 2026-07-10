@@ -632,7 +632,19 @@ class JobStatusPoller:
                         return False
                     if done_glob:
                         return done_glob.replace("{stem}", stem) in present
-                    return any(stem in p and not p.endswith((".progress", ".progress.tmp")) for p in present)
+                    # Fallback (no done_glob): any output file carrying the stem
+                    # counts as done — but NEVER an in-progress marker. `.lock`,
+                    # `.tmp`, `.part` are written *while* a file is being produced
+                    # (e.g. trident drops `contours/{stem}.jpg.lock` at the very
+                    # start of segmentation), so matching them flips a slide to
+                    # "completed" before the analysis has actually written anything.
+                    return any(
+                        stem in p
+                        and not p.endswith(
+                            (".progress", ".progress.tmp", ".lock", ".tmp", ".part")
+                        )
+                        for p in present
+                    )
 
                 # Legacy analyses (no .progress): the script processes serially,
                 # so show ONE in-flight slide per session (the first unfinished),
@@ -795,6 +807,28 @@ class JobStatusPoller:
         remote_output_dir = representative.remote_output_path
         job = representative.job
         analysis_name = job.model_name if job else "unknown"
+
+        # ── Guard: never transfer/clean up while the job is still running ──
+        # This function ends by `rm -rf {remote_output_dir}` (see
+        # _cleanup_cluster_files_batch). Completion is detected from output
+        # files, which can appear long before the analysis actually finishes
+        # (a `.jpg.lock` or a segmentation contour is written well before
+        # feature extraction). If the tmux session is still alive, deleting the
+        # output dir would abort the running process and leave only that early
+        # snapshot. Skip entirely until the session ends; the poller/user can
+        # retry once it's truly done.
+        session_name = representative.cluster_job_id
+        if session_name:
+            try:
+                if self.cluster.check_job_status(session_name, "").get("alive"):
+                    print(
+                        f"[Transfer] Job {job.id if job else '?'}: session "
+                        f"{session_name} still running — skipping transfer to avoid "
+                        f"deleting a live job's output."
+                    )
+                    return
+            except Exception as e:
+                print(f"[Transfer] liveness check failed for {session_name}: {e}")
 
         if not remote_output_dir or not self.analyses_path:
             for js in group:
