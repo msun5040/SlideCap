@@ -425,31 +425,32 @@ export function AnalysisRegistry() {
                 </p>
               </div>
 
+              {/* Done pattern applies to BOTH batch and sharded — it's how the
+                  poller decides a slide is finished. Always shown. */}
+              <div className="space-y-1.5">
+                <label className="text-sm font-medium">Per-slide Done Pattern</label>
+                <input
+                  className="w-full rounded-md border bg-background px-3 py-2 text-sm font-mono"
+                  placeholder="{stem}.h5"
+                  value={formDoneGlob}
+                  onChange={(e) => setFormDoneGlob(e.target.value)}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Output file that marks one slide done — e.g. <code>{'{stem}'}.h5</code> for UNI features. {'{stem}'} = slide filename without extension. Leave empty to treat any output containing the stem as done — not recommended: an early <code>.jpg.lock</code> or contour can flip a slide to "completed" before it actually finishes.
+                </p>
+              </div>
+
               {formExecutionMode === 'sharded' && (
-                <div className="grid grid-cols-2 gap-3">
-                  <div className="space-y-1.5">
-                    <label className="text-sm font-medium">Per-slide Done Pattern</label>
-                    <input
-                      className="w-full rounded-md border bg-background px-3 py-2 text-sm font-mono"
-                      placeholder="{stem}_cells.pt"
-                      value={formDoneGlob}
-                      onChange={(e) => setFormDoneGlob(e.target.value)}
-                    />
-                    <p className="text-xs text-muted-foreground">
-                      Output file marking one slide done. {'{stem}'} = slide filename without extension. Empty = any output containing the stem.
-                    </p>
-                  </div>
-                  <div className="space-y-1.5">
-                    <label className="text-sm font-medium">Max GPUs</label>
-                    <input
-                      type="number"
-                      min={0}
-                      className="w-full rounded-md border bg-background px-3 py-2 text-sm"
-                      value={formMaxGpus}
-                      onChange={(e) => setFormMaxGpus(Number(e.target.value))}
-                    />
-                    <p className="text-xs text-muted-foreground">0 = use every GPU the cluster reports.</p>
-                  </div>
+                <div className="space-y-1.5">
+                  <label className="text-sm font-medium">Max GPUs</label>
+                  <input
+                    type="number"
+                    min={0}
+                    className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+                    value={formMaxGpus}
+                    onChange={(e) => setFormMaxGpus(Number(e.target.value))}
+                  />
+                  <p className="text-xs text-muted-foreground">0 = use every GPU the cluster reports.</p>
                 </div>
               )}
             </div>
