@@ -5744,6 +5744,349 @@ def list_result_files(
     return _build_file_tree(output_dir, output_dir)
 
 
+# ── Data Pull: analysis-aware selection + analysis-file extraction ──────────
+#
+# The Data Pull tab lets a user assemble a set of cases, filter them (by stain
+# and by which analyses ran), and pull either the WSI files (existing
+# /slides/pull-export|download) or the *analysis output files* (e.g. a cohort's
+# UNI .h5 features). These endpoints back the analysis side of that flow.
+
+class SlideAnalysesRequest(BaseModel):
+    slide_hashes: List[str]
+
+
+@app.post("/slides/pull-analyses")
+def pull_analyses(data: SlideAnalysesRequest, db: Session = Depends(get_db)):
+    """Batch: completed analyses per slide hash.
+
+    Powers the Data Pull tab's "by analysis" filter and the analysis-file
+    extractor. Cohort/request imports don't carry completed_analyses, so the
+    tab calls this after import to learn which analyses each slide has and the
+    job_id needed to reach the output files.
+
+    Returns {results: {slide_hash: [{job_id, analysis_name, version,
+    analysis_kind, status, completed_at}]}}. Every requested hash is present
+    (empty list if it has no completed analyses).
+    """
+    out: dict[str, list] = {h: [] for h in data.slide_hashes}
+    if not data.slide_hashes:
+        return {"results": out}
+
+    slides = db.query(Slide).filter(Slide.slide_hash.in_(data.slide_hashes)).all()
+    id_to_hash = {s.id: s.slide_hash for s in slides}
+    if not id_to_hash:
+        return {"results": out}
+
+    rows = (
+        db.query(JobSlide)
+        .join(AnalysisJob)
+        .options(joinedload(JobSlide.job).joinedload(AnalysisJob.analysis))
+        .filter(
+            JobSlide.slide_id.in_(list(id_to_hash.keys())),
+            JobSlide.status == "completed",
+        )
+        .order_by(JobSlide.completed_at.desc())
+        .all()
+    )
+    for js in rows:
+        h = id_to_hash.get(js.slide_id)
+        if h is None:
+            continue
+        out.setdefault(h, []).append({
+            "job_id": js.job_id,
+            "analysis_name": js.job.model_name if js.job else "",
+            "version": (js.job.model_version or "") if js.job else "",
+            "analysis_kind": js.job.analysis.kind if js.job and js.job.analysis else None,
+            "status": js.status,
+            "completed_at": js.completed_at.isoformat() if js.completed_at else None,
+        })
+    return {"results": out}
+
+
+class AnalysisInspectItem(BaseModel):
+    slide_hash: str
+    job_id: int
+
+
+class AnalysisInspectRequest(BaseModel):
+    items: List[AnalysisInspectItem]
+
+
+@app.post("/analyses/pull-inspect")
+def analyses_pull_inspect(data: AnalysisInspectRequest, db: Session = Depends(get_db)):
+    """Batch file trees for (job_id, slide_hash) pairs.
+
+    Same node shape as GET /results/{job_id}/files. Used by the extractor to
+    compute the union of output file types across a cohort and to let the user
+    hand-pick individual files per slide.
+
+    Returns {trees: {"<job_id>:<slide_hash>": FileTreeNode[]}}.
+    """
+    trees: dict[str, list] = {}
+    job_cache: dict[int, object] = {}
+    for item in data.items:
+        key = f"{item.job_id}:{item.slide_hash}"
+        if key in trees:
+            continue
+        if item.job_id not in job_cache:
+            job_cache[item.job_id] = (
+                db.query(AnalysisJob)
+                .options(joinedload(AnalysisJob.slides).joinedload(JobSlide.slide))
+                .filter_by(id=item.job_id)
+                .first()
+            )
+        job = job_cache[item.job_id]
+        if not job:
+            trees[key] = []
+            continue
+        js = next((js for js in job.slides if js.slide and js.slide.slide_hash == item.slide_hash), None)
+        output_dir = _resolve_job_slide_output(js) if js else None
+        trees[key] = (
+            _build_file_tree(output_dir, output_dir)
+            if output_dir and output_dir.exists() else []
+        )
+    return {"trees": trees}
+
+
+class AnalysisPullFileItem(BaseModel):
+    slide_hash: str
+    job_id: int
+    # Relative file paths within the slide's analysis output dir (posix), as
+    # returned by pull-inspect / list_result_files.
+    files: List[str]
+
+
+class AnalysisPullExportRequest(BaseModel):
+    items: List[AnalysisPullFileItem]
+    output_dir: str
+    # Subfolder under output_dir for the extracted analysis files, so an
+    # analysis pull dropped alongside a WSI pull (pull-NNN/ bins) doesn't
+    # collide with it. Set "" to write directly under output_dir.
+    subdir: str = "analysis-files"
+    method: str = "hardlink"  # hardlink | copy | symlink | auto
+    skip_existing: bool = True
+
+
+def _pull_group_name(slide_hash: str) -> tuple[str, str]:
+    """(accession, per-slide folder name) for laying out an analysis pull.
+
+    Mirror layout: each slide's selected files land under one folder named
+    <accession>_<hash8>, preserving whatever nested structure the analysis
+    produced (the relpath carries it). Falls back to the hash when the file
+    isn't parseable/available.
+    """
+    accession = slide_hash[:12]
+    if indexer:
+        fp = indexer.get_filepath(slide_hash)
+        if fp:
+            parsed = indexer.parser.parse(fp.name)
+            if parsed and parsed.accession:
+                accession = parsed.accession
+    group = re.sub(r"[^\w.\-]", "_", f"{accession}_{slide_hash[:8]}")
+    return accession, group
+
+
+def _resolve_analysis_pull_files(items: List[AnalysisPullFileItem], db: Session):
+    """Resolve pull items to (src, group, relpath, slide_hash, accession) tuples.
+
+    Shared by export (hardlink/copy) and download (ZIP). Skips files that are
+    missing on disk or fail the traversal guard; returns those separately.
+    """
+    resolved: list[dict] = []
+    missing: list[dict] = []
+    accessions: set[str] = set()
+    job_cache: dict[int, object] = {}
+    for item in items:
+        if item.job_id not in job_cache:
+            job_cache[item.job_id] = (
+                db.query(AnalysisJob)
+                .options(joinedload(AnalysisJob.slides).joinedload(JobSlide.slide))
+                .filter_by(id=item.job_id)
+                .first()
+            )
+        job = job_cache[item.job_id]
+        js = None
+        if job:
+            js = next((js for js in job.slides if js.slide and js.slide.slide_hash == item.slide_hash), None)
+        output_dir = _resolve_job_slide_output(js) if js else None
+        accession, group = _pull_group_name(item.slide_hash)
+        for rel in item.files:
+            if not output_dir:
+                missing.append({"slide_hash": item.slide_hash, "file": rel})
+                continue
+            try:
+                src = _safe_resolve(output_dir, rel)
+            except ValueError:
+                missing.append({"slide_hash": item.slide_hash, "file": rel})
+                continue
+            if not src.exists() or not src.is_file():
+                missing.append({"slide_hash": item.slide_hash, "file": rel})
+                continue
+            accessions.add(accession)
+            resolved.append({
+                "src": src,
+                "group": group,
+                "rel": rel,
+                "slide_hash": item.slide_hash,
+                "accession": accession,
+            })
+    return resolved, missing, sorted(accessions)
+
+
+@app.post("/analyses/pull-export")
+def analyses_pull_export(data: AnalysisPullExportRequest, db: Session = Depends(get_db)):
+    """Materialize selected analysis output files under output_dir, mirroring
+    each slide's output structure inside a per-slide folder.
+
+    Layout: {output_dir}/{subdir}/{accession}_{hash8}/{relpath}. Uses the same
+    hardlink → copy fallback as the WSI pull, writes a manifest.csv, and
+    records the pull in pull-history (export_type="analysis").
+    """
+    if not data.items:
+        raise HTTPException(status_code=400, detail="No files requested")
+
+    method_request = (data.method or "hardlink").lower()
+    if method_request not in ("auto", "hardlink", "symlink", "copy"):
+        raise HTTPException(status_code=400, detail=f"Invalid method: {data.method}")
+
+    try:
+        output_root = Path(data.output_dir).expanduser().resolve()
+        output_root.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise HTTPException(status_code=400, detail=f"Cannot create output_dir: {e}")
+    if not output_root.is_dir():
+        raise HTTPException(status_code=400, detail=f"output_dir is not a directory: {output_root}")
+
+    sub = re.sub(r"[^\w.\-/]", "", (data.subdir or "")).strip("/")
+    dest_root = (output_root / sub) if sub else output_root
+    try:
+        dest_root.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise HTTPException(status_code=400, detail=f"Cannot create destination: {e}")
+
+    resolved, missing, accessions = _resolve_analysis_pull_files(data.items, db)
+    if not resolved:
+        raise HTTPException(status_code=404, detail="No analysis files available on disk for the given selection")
+
+    preferred_method = _resolve_link_method(dest_root, resolved[0]["src"], method_request)
+
+    failures: list[dict] = []
+    manifest_rows: list[dict] = []
+    total_exported = 0
+    total_skipped = 0
+    for r in resolved:
+        dst = dest_root / r["group"] / r["rel"]
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            used = _link_or_copy(r["src"], dst, preferred_method, skip_existing=data.skip_existing)
+            if used == "skipped":
+                total_skipped += 1
+            else:
+                total_exported += 1
+            manifest_rows.append({
+                "slide_hash": r["slide_hash"],
+                "accession": r["accession"],
+                "group": r["group"],
+                "file": r["rel"],
+                "src_path": str(r["src"]),
+                "method": used,
+            })
+        except Exception as e:
+            failures.append({"slide_hash": r["slide_hash"], "file": r["rel"], "error": str(e)})
+
+    with open(dest_root / "manifest.csv", "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["slide_hash", "accession", "group", "file", "src_path", "method"])
+        writer.writeheader()
+        writer.writerows(manifest_rows)
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    total_requested = sum(len(i.files) for i in data.items)
+
+    _record_pull_history({
+        "id": datetime.now().strftime("%Y%m%d-%H%M%S-") + f"{os.getpid():d}",
+        "exported_at": timestamp,
+        "export_type": "analysis",
+        "output_dir": str(dest_root),
+        "preferred_method": preferred_method,
+        "method_requested": method_request,
+        "skip_existing": data.skip_existing,
+        "bin_size": 0,
+        "bin_count": 0,
+        "total_requested": total_requested,
+        "total_exported": total_exported,
+        "total_skipped": total_skipped,
+        "missing_count": len(missing),
+        "failure_count": len(failures),
+        "case_count": len(accessions),
+        "accessions": accessions,
+        "bins": [],
+    })
+
+    return {
+        "output_dir": str(dest_root),
+        "export_type": "analysis",
+        "preferred_method": preferred_method,
+        "skip_existing": data.skip_existing,
+        "total_requested": total_requested,
+        "total_exported": total_exported,
+        "total_skipped": total_skipped,
+        "missing_count": len(missing),
+        "failure_count": len(failures),
+        "case_count": len(accessions),
+        "failures": failures[:25],
+        "missing": missing[:25],
+        "manifest_path": str(dest_root / "manifest.csv"),
+    }
+
+
+class AnalysisPullDownloadRequest(BaseModel):
+    items: List[AnalysisPullFileItem]
+
+
+@app.post("/analyses/pull-download")
+def analyses_pull_download(data: AnalysisPullDownloadRequest, db: Session = Depends(get_db)):
+    """Stream a ZIP of selected analysis output files, mirroring each slide's
+    output structure under a per-slide folder (accession_hash8/relpath)."""
+    if not data.items:
+        raise HTTPException(status_code=400, detail="No files requested")
+
+    resolved, _missing, _accessions = _resolve_analysis_pull_files(data.items, db)
+    if not resolved:
+        raise HTTPException(status_code=404, detail="No analysis files found for the selected items")
+
+    pairs: list[tuple[Path, str]] = [
+        (r["src"], f"{r['group']}/{r['rel']}") for r in resolved
+    ]
+
+    def generate():
+        q: queue.Queue = queue.Queue(maxsize=32)
+
+        def writer():
+            try:
+                stream = _ZipStreamWriter(q)
+                with zipfile.ZipFile(stream, 'w', zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+                    for file_path, arcname in pairs:
+                        zf.write(str(file_path), arcname)
+                stream.flush()
+            except Exception as e:
+                print(f"Analysis pull ZIP export error: {e}")
+            finally:
+                q.put(None)
+
+        t = threading.Thread(target=writer, daemon=True)
+        t.start()
+        while True:
+            chunk = q.get()
+            if chunk is None:
+                break
+            yield chunk
+        t.join(timeout=5)
+
+    return StreamingResponse(
+        generate(),
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="analysis-files.zip"'},
+    )
 
 
 @app.get("/results/{job_id}/file/{filename:path}")

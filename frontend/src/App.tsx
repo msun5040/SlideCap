@@ -270,7 +270,7 @@ export default function App() {
     { id: 'slides' as View, label: 'Slide Library', icon: Microscope },
     { id: 'cohorts' as View, label: 'Cohorts', icon: Users },
     { id: 'requests' as View, label: 'Requests', icon: ClipboardList },
-    { id: 'pull' as View, label: 'WSI Pull', icon: Package },
+    { id: 'pull' as View, label: 'Data Pull', icon: Package },
     { id: 'analysis' as View, label: 'Analysis', icon: FlaskConical },
   ]
 

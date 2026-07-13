@@ -1,21 +1,21 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import {
   Search,
-  Plus,
   Trash2,
   ChevronRight,
   ChevronDown,
   Check,
-  X,
   Download,
   Upload,
   FileText,
   Package,
   Microscope,
-  Circle,
   Copy,
   FolderOutput,
   History,
+  Filter,
+  FlaskConical,
+  X,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -35,11 +35,27 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+} from '@/components/ui/dropdown-menu'
 import { getApiBase, normalizeAccession } from '@/api'
 import { copyToClipboard } from '@/lib/clipboard'
+import { AnalysisFilePicker, type PickTarget } from '@/components/AnalysisFilePicker'
 import type { Slide, Cohort, CohortDetail, RequestSheet, RequestSheetDetail } from '@/types/slide'
 
 // ── Types ───────────────────────────────────────────────────────
+interface PullSlideAnalysis {
+  job_id: number
+  analysis_name: string
+  version: string
+  analysis_kind?: string | null
+}
+
 interface PullCase {
   accession: string
   slides: PullSlide[]
@@ -53,6 +69,11 @@ interface PullSlide {
   slide_number: string
   file_size_bytes?: number
   selected: boolean
+  // Names from the /search payload (may be undefined for cohort/sheet imports).
+  completed_analyses?: string[]
+  // Enriched via /slides/pull-analyses (undefined = not yet fetched, [] = none).
+  // Carries job_id, which the analysis-file extractor needs.
+  analyses?: PullSlideAnalysis[]
 }
 
 function formatBytes(bytes?: number): string {
@@ -76,6 +97,14 @@ function slideMatchesStainFilter(stain: string | undefined, buckets: Set<StainBu
   return buckets.has(stainBucket(stain))
 }
 
+// All analysis names known for a slide, from either enrichment source.
+function slideAnalysisNames(s: PullSlide): Set<string> {
+  const names = new Set<string>()
+  for (const a of s.analyses || []) names.add(a.analysis_name)
+  for (const n of s.completed_analyses || []) names.add(n)
+  return names
+}
+
 interface ExportReport {
   output_dir: string
   preferred_method: 'symlink' | 'hardlink' | 'copy'
@@ -91,9 +120,22 @@ interface ExportReport {
   summary_path: string
 }
 
+interface AnalysisExportReport {
+  output_dir: string
+  preferred_method: 'symlink' | 'hardlink' | 'copy'
+  total_requested: number
+  total_exported: number
+  total_skipped: number
+  missing_count: number
+  failure_count: number
+  case_count: number
+  manifest_path: string
+}
+
 interface PullHistoryEntry {
   id: string
   exported_at: string
+  export_type?: string
   output_dir: string
   preferred_method: 'symlink' | 'hardlink' | 'copy'
   method_requested: string
@@ -143,13 +185,21 @@ export function SlidePull() {
   const [pasteLoading, setPasteLoading] = useState(false)
   const [pasteStainFilter, setPasteStainFilter] = useState<Set<StainBucket>>(new Set(['H&E']))
 
+  // In-selection filters (inline, always visible)
+  const [filterCaseText, setFilterCaseText] = useState('')
+  const [filterStain, setFilterStain] = useState<Set<StainBucket>>(new Set())
+  const [filterAnalyses, setFilterAnalyses] = useState<Set<string>>(new Set())
+
   // Export
   const [copied, setCopied] = useState(false)
-  const [downloading, setDownloading] = useState(false)
-  const [downloadError, setDownloadError] = useState('')
 
-  // Export to directory
+  // Unified export dialog
   const [isExportOpen, setIsExportOpen] = useState(false)
+  const [exportMode, setExportMode] = useState<'directory' | 'zip'>('directory')
+  const [includeSlides, setIncludeSlides] = useState(true)
+  const [includeAnalysis, setIncludeAnalysis] = useState(false)
+  const [exportAnalysisName, setExportAnalysisName] = useState('')
+  const [analysisFileSel, setAnalysisFileSel] = useState<Record<string, string[]>>({})
   const [exportDir, setExportDir] = useState('')
   const [exportBinSize, setExportBinSize] = useState(100)
   const [exportMethod, setExportMethod] = useState<'hardlink' | 'copy' | 'symlink'>('hardlink')
@@ -157,6 +207,8 @@ export function SlidePull() {
   const [exporting, setExporting] = useState(false)
   const [exportError, setExportError] = useState('')
   const [exportReport, setExportReport] = useState<ExportReport | null>(null)
+  const [analysisReport, setAnalysisReport] = useState<AnalysisExportReport | null>(null)
+  const [zipDone, setZipDone] = useState(false)
 
   // Pull history
   const [isHistoryOpen, setIsHistoryOpen] = useState(false)
@@ -180,6 +232,7 @@ export function SlidePull() {
           slide_number: slide.slide_number,
           file_size_bytes: slide.file_size_bytes,
           selected: true,
+          completed_analyses: slide.completed_analyses,
         }
 
         const idx = caseMap.get(acc)
@@ -197,6 +250,46 @@ export function SlidePull() {
       return next
     })
   }, [])
+
+  // ── Enrich slides with completed analyses (job_id + name) ─────
+  // Cohort/request imports don't carry analysis info, and even search only
+  // gives names. We need job_ids to reach the output files, so batch-fetch
+  // /slides/pull-analyses for any slide we haven't enriched yet.
+  const enriching = useRef(false)
+  useEffect(() => {
+    const missing = new Set<string>()
+    for (const c of cases) for (const s of c.slides) if (s.analyses === undefined) missing.add(s.slide_hash)
+    if (missing.size === 0 || enriching.current) return
+    enriching.current = true
+    const hashes = Array.from(missing)
+    fetch(`${getApiBase()}/slides/pull-analyses`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ slide_hashes: hashes }),
+    })
+      .then(r => (r.ok ? r.json() : { results: {} }))
+      .then((data: { results: Record<string, PullSlideAnalysis[]> }) => {
+        const map = data.results || {}
+        setCases(prev => prev.map(c => ({
+          ...c,
+          slides: c.slides.map(s =>
+            s.analyses === undefined && missing.has(s.slide_hash)
+              ? { ...s, analyses: map[s.slide_hash] || [] }
+              : s
+          ),
+        })))
+      })
+      .catch(() => {
+        // Mark as enriched-empty so we don't retry forever on a dead backend.
+        setCases(prev => prev.map(c => ({
+          ...c,
+          slides: c.slides.map(s =>
+            s.analyses === undefined && missing.has(s.slide_hash) ? { ...s, analyses: [] } : s
+          ),
+        })))
+      })
+      .finally(() => { enriching.current = false })
+  }, [cases])
 
   // ── Search handler (supports comma-separated accessions) ─────
   const handleSearch = async () => {
@@ -360,24 +453,81 @@ export function SlidePull() {
     ))
   }
 
-  const toggleAllInCase = (accession: string) => {
-    setCases(prev => prev.map(c => {
-      if (c.accession !== accession) return c
-      const allSelected = c.slides.every(s => s.selected)
-      return { ...c, slides: c.slides.map(s => ({ ...s, selected: !allSelected })) }
-    }))
+  const setSelectionForHashes = (hashes: Set<string>, selected: boolean) => {
+    setCases(prev => prev.map(c => ({
+      ...c,
+      slides: c.slides.map(s => (hashes.has(s.slide_hash) ? { ...s, selected } : s)),
+    })))
   }
 
   const removeCase = (accession: string) => {
     setCases(prev => prev.filter(c => c.accession !== accession))
   }
 
-  const selectAll = () => {
-    setCases(prev => prev.map(c => ({ ...c, slides: c.slides.map(s => ({ ...s, selected: true })) })))
-  }
+  // ── Inline filters ────────────────────────────────────────────
+  const caseSubset = useMemo(() => {
+    const toks = filterCaseText.split(/[\n,;\s]+/).map(t => normalizeAccession(t.trim())).filter(Boolean)
+    return toks.length ? new Set(toks) : null
+  }, [filterCaseText])
 
-  const deselectAll = () => {
-    setCases(prev => prev.map(c => ({ ...c, slides: c.slides.map(s => ({ ...s, selected: false })) })))
+  const analysisOptions = useMemo(() => {
+    const set = new Set<string>()
+    for (const c of cases) for (const s of c.slides) for (const n of slideAnalysisNames(s)) set.add(n)
+    return Array.from(set).sort()
+  }, [cases])
+
+  const slidePassesFilters = useCallback((s: PullSlide): boolean => {
+    if (filterStain.size && !filterStain.has(stainBucket(s.stain_type))) return false
+    if (filterAnalyses.size) {
+      const names = slideAnalysisNames(s)
+      let ok = false
+      for (const n of filterAnalyses) if (names.has(n)) { ok = true; break }
+      if (!ok) return false
+    }
+    return true
+  }, [filterStain, filterAnalyses])
+
+  const visibleCases = useMemo(() => {
+    const out: PullCase[] = []
+    for (const c of cases) {
+      if (caseSubset && !caseSubset.has(normalizeAccession(c.accession))) continue
+      const slides = c.slides.filter(slidePassesFilters)
+      if (slides.length === 0) continue
+      out.push({ ...c, slides })
+    }
+    return out
+  }, [cases, caseSubset, slidePassesFilters])
+
+  const filtersActive = !!caseSubset || filterStain.size > 0 || filterAnalyses.size > 0
+
+  const shownHashes = useMemo(
+    () => new Set(visibleCases.flatMap(c => c.slides.map(s => s.slide_hash))),
+    [visibleCases]
+  )
+
+  const selectShown = () => setSelectionForHashes(shownHashes, true)
+  const clearShown = () => setSelectionForHashes(shownHashes, false)
+
+  const toggleFilterStain = (b: StainBucket) => {
+    setFilterStain(prev => {
+      const next = new Set(prev)
+      if (next.has(b)) next.delete(b)
+      else next.add(b)
+      return next
+    })
+  }
+  const toggleFilterAnalysis = (name: string) => {
+    setFilterAnalyses(prev => {
+      const next = new Set(prev)
+      if (next.has(name)) next.delete(name)
+      else next.add(name)
+      return next
+    })
+  }
+  const clearFilters = () => {
+    setFilterCaseText('')
+    setFilterStain(new Set())
+    setFilterAnalyses(new Set())
   }
 
   // ── Stats ─────────────────────────────────────────────────────
@@ -386,7 +536,49 @@ export function SlidePull() {
   const totalSize = cases.reduce((sum, c) => sum + c.slides.filter(s => s.selected).reduce((ss, s) => ss + (s.file_size_bytes || 0), 0), 0)
   const selectedCases = cases.filter(c => c.slides.some(s => s.selected)).length
 
-  // ── Export pull list ──────────────────────────────────────────
+  // Analyses present among *selected* slides — drives the extractor's dropdown.
+  const selectedAnalysisNames = useMemo(() => {
+    const set = new Set<string>()
+    for (const c of cases) for (const s of c.slides) if (s.selected) for (const a of (s.analyses || [])) set.add(a.analysis_name)
+    return Array.from(set).sort()
+  }, [cases])
+
+  // Selected slides that have the chosen analysis → picker targets.
+  const analysisTargets = useMemo<PickTarget[]>(() => {
+    if (!exportAnalysisName) return []
+    const out: PickTarget[] = []
+    for (const c of cases) for (const s of c.slides) {
+      if (!s.selected) continue
+      const a = (s.analyses || []).find(a => a.analysis_name === exportAnalysisName)
+      if (!a) continue
+      out.push({
+        key: `${a.job_id}:${s.slide_hash}`,
+        slide_hash: s.slide_hash,
+        job_id: a.job_id,
+        label: `${c.accession} · ${s.block_id}-${s.slide_number}`,
+      })
+    }
+    return out
+  }, [cases, exportAnalysisName])
+
+  const analysisItems = useMemo(() => (
+    Object.entries(analysisFileSel)
+      .filter(([, files]) => files.length > 0)
+      .map(([key, files]) => {
+        const sep = key.indexOf(':')
+        return { job_id: parseInt(key.slice(0, sep), 10), slide_hash: key.slice(sep + 1), files }
+      })
+  ), [analysisFileSel])
+  const analysisFileCount = analysisItems.reduce((n, i) => n + i.files.length, 0)
+
+  // When the extractor is enabled but no analysis chosen, default to the first.
+  useEffect(() => {
+    if (includeAnalysis && !exportAnalysisName && selectedAnalysisNames.length > 0) {
+      setExportAnalysisName(selectedAnalysisNames[0])
+    }
+  }, [includeAnalysis, exportAnalysisName, selectedAnalysisNames])
+
+  // ── Export pull list (CSV) ────────────────────────────────────
   const generatePullList = (): string => {
     const lines: string[] = ['Accession,Block,Stain,Slide#']
     for (const c of cases) {
@@ -413,45 +605,112 @@ export function SlidePull() {
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = `slide-pull-${new Date().toISOString().slice(0, 10)}.csv`
+    a.download = `data-pull-${new Date().toISOString().slice(0, 10)}.csv`
     a.click()
     URL.revokeObjectURL(url)
   }
 
+  // ── Unified export ────────────────────────────────────────────
   const openExportDialog = () => {
     setExportError('')
     setExportReport(null)
+    setAnalysisReport(null)
+    setZipDone(false)
     setIsExportOpen(true)
   }
 
-  const runExportToDirectory = async () => {
-    const hashes = cases.flatMap(c => c.slides.filter(s => s.selected).map(s => s.slide_hash))
-    if (hashes.length === 0) return
-    if (!exportDir.trim()) {
-      setExportError('Output directory is required')
+  const downloadBlob = async (path: string, body: unknown, filename: string) => {
+    const res = await fetch(`${getApiBase()}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    if (!res.ok) {
+      const detail = await res.json().catch(() => null)
+      throw new Error(detail?.detail || `Download failed (${res.status})`)
+    }
+    const blob = await res.blob()
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  const runExport = async () => {
+    setExportError('')
+    setZipDone(false)
+    if (!includeSlides && !includeAnalysis) {
+      setExportError('Choose what to export — slide files, analysis files, or both.')
       return
     }
+    const slideHashes = cases.flatMap(c => c.slides.filter(s => s.selected).map(s => s.slide_hash))
+    const wantSlides = includeSlides && slideHashes.length > 0
+    const wantAnalysis = includeAnalysis && analysisItems.length > 0
+    if (!wantSlides && !wantAnalysis) {
+      setExportError(includeAnalysis && analysisItems.length === 0
+        ? 'No analysis files selected — pick a file type or individual files.'
+        : 'No slides selected.')
+      return
+    }
+
     setExporting(true)
-    setExportError('')
     setExportReport(null)
+    setAnalysisReport(null)
     try {
-      const res = await fetch(`${getApiBase()}/slides/pull-export`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          slide_hashes: hashes,
-          output_dir: exportDir.trim(),
-          bin_size: Math.max(1, exportBinSize | 0),
-          method: exportMethod,
-          skip_existing: exportSkipExisting,
-        }),
-      })
-      if (!res.ok) {
-        const detail = await res.json().catch(() => null)
-        throw new Error(detail?.detail || `Export failed (${res.status})`)
+      if (exportMode === 'directory') {
+        if (!exportDir.trim()) {
+          setExportError('Output directory is required.')
+          setExporting(false)
+          return
+        }
+        if (wantSlides) {
+          const res = await fetch(`${getApiBase()}/slides/pull-export`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              slide_hashes: slideHashes,
+              output_dir: exportDir.trim(),
+              bin_size: Math.max(1, exportBinSize | 0),
+              method: exportMethod,
+              skip_existing: exportSkipExisting,
+            }),
+          })
+          if (!res.ok) {
+            const detail = await res.json().catch(() => null)
+            throw new Error(detail?.detail || `Slide export failed (${res.status})`)
+          }
+          setExportReport((await res.json()) as ExportReport)
+        }
+        if (wantAnalysis) {
+          const res = await fetch(`${getApiBase()}/analyses/pull-export`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              items: analysisItems,
+              output_dir: exportDir.trim(),
+              method: exportMethod,
+              skip_existing: exportSkipExisting,
+            }),
+          })
+          if (!res.ok) {
+            const detail = await res.json().catch(() => null)
+            throw new Error(detail?.detail || `Analysis export failed (${res.status})`)
+          }
+          setAnalysisReport((await res.json()) as AnalysisExportReport)
+        }
+      } else {
+        // ZIP download mode
+        const stamp = new Date().toISOString().slice(0, 10)
+        if (wantSlides) {
+          await downloadBlob('/slides/pull-download', { slide_hashes: slideHashes }, `slide-pull-${stamp}.zip`)
+        }
+        if (wantAnalysis) {
+          await downloadBlob('/analyses/pull-download', { items: analysisItems }, `analysis-files-${stamp}.zip`)
+        }
+        setZipDone(true)
       }
-      const report = (await res.json()) as ExportReport
-      setExportReport(report)
     } catch (e: any) {
       console.error('Export failed:', e)
       setExportError(e.message || 'Export failed')
@@ -481,35 +740,32 @@ export function SlidePull() {
     }
   }
 
-  const downloadFiles = async () => {
-    const hashes = cases.flatMap(c => c.slides.filter(s => s.selected).map(s => s.slide_hash))
-    if (hashes.length === 0) return
-    setDownloading(true)
-    setDownloadError('')
-    try {
-      const res = await fetch(`${getApiBase()}/slides/pull-download`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ slide_hashes: hashes }),
-      })
-      if (!res.ok) {
-        const detail = await res.json().catch(() => null)
-        throw new Error(detail?.detail || `Download failed (${res.status})`)
-      }
-      const blob = await res.blob()
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = `slide-pull-${new Date().toISOString().slice(0, 10)}.zip`
-      a.click()
-      URL.revokeObjectURL(url)
-    } catch (e: any) {
-      console.error('Download failed:', e)
-      setDownloadError(e.message || 'Download failed')
-    } finally {
-      setDownloading(false)
-    }
-  }
+  // ── Import dropdown (shared by header + empty state) ───────────
+  const importMenu = (triggerClass = 'h-7 text-[12px]') => (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button size="sm" variant="outline" className={triggerClass}>
+          <Upload className="h-3 w-3 mr-1" />Import<ChevronDown className="h-3 w-3 ml-1 opacity-60" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-48">
+        <DropdownMenuLabel className="text-[11px] text-muted-foreground">Add cases from…</DropdownMenuLabel>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem className="text-[13px]" onSelect={() => setIsPasteOpen(true)}>
+          <FileText className="h-3.5 w-3.5 mr-2" />Paste case list
+        </DropdownMenuItem>
+        <DropdownMenuItem className="text-[13px]" onSelect={() => setIsSearchOpen(true)}>
+          <Search className="h-3.5 w-3.5 mr-2" />Search
+        </DropdownMenuItem>
+        <DropdownMenuItem className="text-[13px]" onSelect={openCohortImport}>
+          <Upload className="h-3.5 w-3.5 mr-2" />From cohort
+        </DropdownMenuItem>
+        <DropdownMenuItem className="text-[13px]" onSelect={openSheetImport}>
+          <FileText className="h-3.5 w-3.5 mr-2" />From request sheet
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
 
   // ── Empty state ───────────────────────────────────────────────
   if (cases.length === 0 && !loading) {
@@ -517,8 +773,8 @@ export function SlidePull() {
       <div className="h-full flex flex-col">
         <div className="flex items-center justify-between mb-4">
           <div>
-            <h2 className="text-lg font-semibold">WSI Pull</h2>
-            <p className="text-[13px] text-muted-foreground">Select slides from cases to create a pull request</p>
+            <h2 className="text-lg font-semibold">Data Pull</h2>
+            <p className="text-[13px] text-muted-foreground">Select slides and analysis outputs from cases to pull</p>
           </div>
         </div>
 
@@ -528,27 +784,15 @@ export function SlidePull() {
               <Package className="h-7 w-7 text-primary" />
             </div>
             <div>
-              <p className="text-[14px] font-medium mb-1">Start a WSI Pull</p>
-              <p className="text-[13px] text-muted-foreground">Add cases to select which slides you need pulled</p>
+              <p className="text-[14px] font-medium mb-1">Start a Data Pull</p>
+              <p className="text-[13px] text-muted-foreground">Add cases to select which slides and analysis files you need</p>
             </div>
-            <div className="grid grid-cols-2 gap-2 max-w-xs mx-auto">
-              <Button variant="outline" size="sm" className="h-9 text-[13px]" onClick={() => setIsPasteOpen(true)}>
-                <FileText className="h-3.5 w-3.5 mr-1.5" />Paste Cases
-              </Button>
-              <Button variant="outline" size="sm" className="h-9 text-[13px]" onClick={() => setIsSearchOpen(true)}>
-                <Search className="h-3.5 w-3.5 mr-1.5" />Search
-              </Button>
-              <Button variant="outline" size="sm" className="h-9 text-[13px]" onClick={openCohortImport}>
-                <Upload className="h-3.5 w-3.5 mr-1.5" />From Cohort
-              </Button>
-              <Button variant="outline" size="sm" className="h-9 text-[13px]" onClick={openSheetImport}>
-                <FileText className="h-3.5 w-3.5 mr-1.5" />From Request
-              </Button>
+            <div className="flex justify-center">
+              {importMenu('h-9 text-[13px] px-4')}
             </div>
           </div>
         </div>
 
-        {/* Dialogs rendered at bottom */}
         {renderDialogs()}
       </div>
     )
@@ -664,84 +908,158 @@ export function SlidePull() {
           </DialogContent>
         </Dialog>
 
-        {/* Export to directory dialog */}
+        {/* Unified export dialog */}
         <Dialog open={isExportOpen} onOpenChange={setIsExportOpen}>
-          <DialogContent className="sm:max-w-lg">
+          <DialogContent className="sm:max-w-xl max-h-[88vh] overflow-y-auto">
             <DialogHeader>
-              <DialogTitle>Export to Directory</DialogTitle>
+              <DialogTitle>Export</DialogTitle>
               <DialogDescription>
-                Create a directory of slide files for Halo. Splits into {exportBinSize}-slide bins.
+                Pull slide files and/or analysis output files for the {selectedSlides} selected slide{selectedSlides === 1 ? '' : 's'}.
               </DialogDescription>
             </DialogHeader>
-            <div className="space-y-3 py-2">
-              <div className="space-y-1.5">
-                <label className="text-[11px] font-medium text-muted-foreground uppercase tracking-wide">Output directory</label>
-                <Input
-                  value={exportDir}
-                  onChange={(e) => setExportDir(e.target.value)}
-                  placeholder="e.g. /Volumes/halo-share/pulls/2026-06-02-mycase"
-                  className="text-[13px] font-mono"
-                  autoFocus
-                  disabled={exporting}
-                />
-                <p className="text-[11px] text-muted-foreground">Absolute path on the SlideCap host. Will be created if it doesn't exist.</p>
-              </div>
-              <div className="space-y-1.5">
-                <label className="text-[11px] font-medium text-muted-foreground uppercase tracking-wide">Method</label>
-                <Select value={exportMethod} onValueChange={(v) => setExportMethod(v as 'hardlink' | 'copy' | 'symlink')} disabled={exporting}>
-                  <SelectTrigger className="text-[13px]">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="hardlink" className="text-[13px]">Hardlink (recommended)</SelectItem>
-                    <SelectItem value="copy" className="text-[13px]">Copy</SelectItem>
-                    <SelectItem value="symlink" className="text-[13px]">Symlink</SelectItem>
-                  </SelectContent>
-                </Select>
-                <p className="text-[11px] text-muted-foreground">
-                  {exportMethod === 'hardlink' && 'Instant. Looks like a real file to Halo. No extra disk space. Requires same volume as the WSI files.'}
-                  {exportMethod === 'copy' && 'Slowest but always works. Duplicates bytes on disk.'}
-                  {exportMethod === 'symlink' && 'Instant, but Halo may not follow symlinks. Use only if you have verified it works.'}
-                  {' '}Falls back to copy if the preferred method fails.
-                </p>
-              </div>
-              <div className="space-y-1.5">
-                <label className="text-[11px] font-medium text-muted-foreground uppercase tracking-wide">Slides per bin</label>
-                <Input
-                  type="number"
-                  min={1}
-                  max={1000}
-                  value={exportBinSize}
-                  onChange={(e) => setExportBinSize(parseInt(e.target.value || '100', 10))}
-                  className="text-[13px] w-24"
-                  disabled={exporting}
-                />
-                <p className="text-[11px] text-muted-foreground">
-                  {selectedSlides > 0
-                    ? `${selectedSlides} selected → ${Math.ceil(selectedSlides / Math.max(1, exportBinSize))} bin${Math.ceil(selectedSlides / Math.max(1, exportBinSize)) === 1 ? '' : 's'}`
-                    : 'Select slides first'}
-                </p>
+            <div className="space-y-4 py-2">
+              {/* Destination mode */}
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => { setExportMode('directory'); setZipDone(false) }}
+                  className={`flex-1 rounded-md border p-2.5 text-left transition-colors ${
+                    exportMode === 'directory' ? 'border-primary bg-primary/5' : 'border-gray-300 hover:bg-muted/30'
+                  }`}
+                >
+                  <div className="flex items-center gap-1.5 text-[13px] font-medium">
+                    <FolderOutput className="h-3.5 w-3.5" />Hardlink to directory
+                  </div>
+                  <p className="text-[11px] text-muted-foreground mt-0.5">Write into a folder on the network drive (no copy).</p>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { setExportMode('zip'); setZipDone(false) }}
+                  className={`flex-1 rounded-md border p-2.5 text-left transition-colors ${
+                    exportMode === 'zip' ? 'border-primary bg-primary/5' : 'border-gray-300 hover:bg-muted/30'
+                  }`}
+                >
+                  <div className="flex items-center gap-1.5 text-[13px] font-medium">
+                    <Package className="h-3.5 w-3.5" />Download ZIP
+                  </div>
+                  <p className="text-[11px] text-muted-foreground mt-0.5">Download the files to this computer.</p>
+                </button>
               </div>
 
-              <div className="flex items-start gap-2 pt-0.5">
-                <Checkbox
-                  id="skip-existing"
-                  checked={exportSkipExisting}
-                  onCheckedChange={(v) => setExportSkipExisting(v === true)}
-                  disabled={exporting}
-                  className="mt-0.5"
-                />
-                <label htmlFor="skip-existing" className="text-[12px] leading-tight cursor-pointer select-none">
-                  <span className="font-medium">Skip slides already in the target</span>
-                  <span className="block text-[11px] text-muted-foreground">
-                    Resumes an interrupted pull — re-pasting the same list only links what's missing. Uncheck to re-materialize everything.
+              {/* What to include */}
+              <div className="space-y-2">
+                <p className="text-[11px] font-medium text-muted-foreground uppercase tracking-wide">Include</p>
+                <label className="flex items-start gap-2 cursor-pointer">
+                  <Checkbox checked={includeSlides} onCheckedChange={(v) => setIncludeSlides(v === true)} className="mt-0.5" />
+                  <span className="text-[13px] leading-tight">
+                    <span className="font-medium">Slide files (.svs)</span>
+                    <span className="block text-[11px] text-muted-foreground">{selectedSlides} selected slide{selectedSlides === 1 ? '' : 's'}</span>
+                  </span>
+                </label>
+                <label className="flex items-start gap-2 cursor-pointer">
+                  <Checkbox checked={includeAnalysis} onCheckedChange={(v) => setIncludeAnalysis(v === true)} className="mt-0.5" />
+                  <span className="text-[13px] leading-tight">
+                    <span className="font-medium">Analysis output files</span>
+                    <span className="block text-[11px] text-muted-foreground">
+                      {selectedAnalysisNames.length === 0
+                        ? 'No completed analyses on the selected slides'
+                        : `${selectedAnalysisNames.length} analysis type${selectedAnalysisNames.length === 1 ? '' : 's'} available`}
+                    </span>
                   </span>
                 </label>
               </div>
 
+              {/* Analysis file picker */}
+              {includeAnalysis && selectedAnalysisNames.length > 0 && (
+                <div className="rounded-md border border-gray-200 bg-muted/20 p-2.5 space-y-2">
+                  <div className="flex items-center gap-2">
+                    <FlaskConical className="h-3.5 w-3.5 text-muted-foreground" />
+                    <Select value={exportAnalysisName} onValueChange={(v) => { setExportAnalysisName(v); setAnalysisFileSel({}) }}>
+                      <SelectTrigger className="text-[13px] h-8 flex-1">
+                        <SelectValue placeholder="Choose an analysis…" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {selectedAnalysisNames.map(n => (
+                          <SelectItem key={n} value={n} className="text-[13px]">{n}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <span className="text-[11px] text-muted-foreground shrink-0">{analysisTargets.length} slide{analysisTargets.length === 1 ? '' : 's'}</span>
+                  </div>
+                  <AnalysisFilePicker
+                    targets={analysisTargets}
+                    value={analysisFileSel}
+                    onChange={setAnalysisFileSel}
+                  />
+                </div>
+              )}
+
+              {/* Directory-only fields */}
+              {exportMode === 'directory' && (
+                <>
+                  <div className="space-y-1.5">
+                    <label className="text-[11px] font-medium text-muted-foreground uppercase tracking-wide">Output directory</label>
+                    <Input
+                      value={exportDir}
+                      onChange={(e) => setExportDir(e.target.value)}
+                      placeholder="e.g. /Volumes/halo-share/pulls/2026-07-13-mycohort"
+                      className="text-[13px] font-mono"
+                      disabled={exporting}
+                    />
+                    <p className="text-[11px] text-muted-foreground">
+                      Absolute path on the SlideCap host. Slides go into {exportBinSize}-slide <span className="font-mono">pull-NNN/</span> bins; analysis files into <span className="font-mono">analysis-files/&lt;case&gt;/</span>.
+                    </p>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="space-y-1.5">
+                      <label className="text-[11px] font-medium text-muted-foreground uppercase tracking-wide">Method</label>
+                      <Select value={exportMethod} onValueChange={(v) => setExportMethod(v as 'hardlink' | 'copy' | 'symlink')} disabled={exporting}>
+                        <SelectTrigger className="text-[13px]"><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="hardlink" className="text-[13px]">Hardlink (recommended)</SelectItem>
+                          <SelectItem value="copy" className="text-[13px]">Copy</SelectItem>
+                          <SelectItem value="symlink" className="text-[13px]">Symlink</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="space-y-1.5">
+                      <label className="text-[11px] font-medium text-muted-foreground uppercase tracking-wide">Slides per bin</label>
+                      <Input
+                        type="number"
+                        min={1}
+                        max={1000}
+                        value={exportBinSize}
+                        onChange={(e) => setExportBinSize(parseInt(e.target.value || '100', 10))}
+                        className="text-[13px]"
+                        disabled={exporting || !includeSlides}
+                      />
+                    </div>
+                  </div>
+                  <div className="flex items-start gap-2">
+                    <Checkbox
+                      id="skip-existing"
+                      checked={exportSkipExisting}
+                      onCheckedChange={(v) => setExportSkipExisting(v === true)}
+                      disabled={exporting}
+                      className="mt-0.5"
+                    />
+                    <label htmlFor="skip-existing" className="text-[12px] leading-tight cursor-pointer select-none">
+                      <span className="font-medium">Skip files already in the target</span>
+                      <span className="block text-[11px] text-muted-foreground">
+                        Resumes an interrupted pull — re-running only links what's missing.
+                      </span>
+                    </label>
+                  </div>
+                </>
+              )}
+
               {exportError && (
-                <div className="rounded-md border border-red-300 bg-red-50 p-2.5 text-[12px] text-red-700">
-                  {exportError}
+                <div className="rounded-md border border-red-300 bg-red-50 p-2.5 text-[12px] text-red-700">{exportError}</div>
+              )}
+
+              {zipDone && (
+                <div className="rounded-md border border-emerald-300 bg-emerald-50 p-2.5 text-[12px] text-success-ink flex items-center gap-2">
+                  <Check className="h-3.5 w-3.5" /> Download started.
                 </div>
               )}
 
@@ -749,50 +1067,50 @@ export function SlidePull() {
                 <div className="rounded-md border border-emerald-300 bg-emerald-50 p-3 text-[12px] space-y-2">
                   <div className="flex items-center gap-2">
                     <Check className="h-3.5 w-3.5 text-success-ink" />
-                    <span className="font-medium text-success-ink">Export complete</span>
-                    <span className="ml-auto rounded-sm bg-success-soft text-success-ink px-1.5 py-0.5 text-[11px] font-medium">
-                      {exportReport.preferred_method}
-                    </span>
+                    <span className="font-medium text-success-ink">Slides exported</span>
+                    <span className="ml-auto rounded-sm bg-success-soft text-success-ink px-1.5 py-0.5 text-[11px] font-medium">{exportReport.preferred_method}</span>
                   </div>
                   <div className="font-mono text-[11px] text-emerald-900 break-all">{exportReport.output_dir}</div>
                   <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-[12px]">
                     <span className="text-emerald-900/70">Bins created</span><span className="tabular-nums text-right">{exportReport.bin_count}</span>
                     <span className="text-emerald-900/70">In target</span><span className="tabular-nums text-right">{exportReport.total_exported}</span>
-                    {exportReport.total_skipped > 0 && (
-                      <>
-                        <span className="text-emerald-900/70">Skipped (already present)</span><span className="tabular-nums text-right">{exportReport.total_skipped}</span>
-                      </>
-                    )}
+                    {exportReport.total_skipped > 0 && (<><span className="text-emerald-900/70">Skipped</span><span className="tabular-nums text-right">{exportReport.total_skipped}</span></>)}
                     <span className="text-emerald-900/70">Missing</span><span className="tabular-nums text-right">{exportReport.missing_count}</span>
                     <span className="text-emerald-900/70">Failed</span><span className="tabular-nums text-right">{exportReport.failure_count}</span>
                   </div>
-                  {exportReport.bins.length > 0 && (
-                    <div className="border-t border-emerald-200 pt-1.5 space-y-0.5 max-h-32 overflow-y-auto">
-                      {exportReport.bins.map(b => (
-                        <div key={b.bin} className="flex justify-between text-[11px] font-mono">
-                          <span>{b.bin}</span>
-                          <span className="tabular-nums">{b.slides} slides{b.skipped ? ` · ${b.skipped} skipped` : ''}{b.failures ? ` · ${b.failures} failed` : ''}</span>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                  {exportReport.preferred_method === 'copy' && exportMethod !== 'copy' && (
-                    <p className="text-[11px] text-amber-700 border-t border-emerald-200 pt-1.5">
-                      Preferred method ({exportMethod}) failed on this target — fell back to copy. SlideCap dedup is preserved on the source side only.
-                    </p>
-                  )}
+                </div>
+              )}
+
+              {analysisReport && (
+                <div className="rounded-md border border-emerald-300 bg-emerald-50 p-3 text-[12px] space-y-2">
+                  <div className="flex items-center gap-2">
+                    <Check className="h-3.5 w-3.5 text-success-ink" />
+                    <span className="font-medium text-success-ink">Analysis files exported</span>
+                    <span className="ml-auto rounded-sm bg-success-soft text-success-ink px-1.5 py-0.5 text-[11px] font-medium">{analysisReport.preferred_method}</span>
+                  </div>
+                  <div className="font-mono text-[11px] text-emerald-900 break-all">{analysisReport.output_dir}</div>
+                  <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-[12px]">
+                    <span className="text-emerald-900/70">Cases</span><span className="tabular-nums text-right">{analysisReport.case_count}</span>
+                    <span className="text-emerald-900/70">Files written</span><span className="tabular-nums text-right">{analysisReport.total_exported}</span>
+                    {analysisReport.total_skipped > 0 && (<><span className="text-emerald-900/70">Skipped</span><span className="tabular-nums text-right">{analysisReport.total_skipped}</span></>)}
+                    <span className="text-emerald-900/70">Missing</span><span className="tabular-nums text-right">{analysisReport.missing_count}</span>
+                    <span className="text-emerald-900/70">Failed</span><span className="tabular-nums text-right">{analysisReport.failure_count}</span>
+                  </div>
                 </div>
               )}
             </div>
             <DialogFooter>
               <Button variant="outline" size="sm" onClick={() => setIsExportOpen(false)}>
-                {exportReport ? 'Close' : 'Cancel'}
+                {(exportReport || analysisReport || zipDone) ? 'Close' : 'Cancel'}
               </Button>
-              {!exportReport && (
-                <Button size="sm" onClick={runExportToDirectory} disabled={selectedSlides === 0 || !exportDir.trim() || exporting}>
-                  {exporting ? 'Exporting...' : `Export ${selectedSlides} slide${selectedSlides === 1 ? '' : 's'}`}
-                </Button>
-              )}
+              <Button size="sm" onClick={runExport} disabled={exporting}>
+                {exporting
+                  ? (exportMode === 'directory' ? 'Exporting…' : 'Preparing…')
+                  : exportMode === 'directory'
+                    ? 'Export'
+                    : 'Download'}
+                {!exporting && (includeAnalysis && analysisFileCount > 0 ? ` · ${includeSlides ? `${selectedSlides} slides + ` : ''}${analysisFileCount} files` : includeSlides ? ` · ${selectedSlides} slides` : '')}
+              </Button>
             </DialogFooter>
           </DialogContent>
         </Dialog>
@@ -802,9 +1120,7 @@ export function SlidePull() {
           <DialogContent className="sm:max-w-2xl">
             <DialogHeader>
               <DialogTitle>Pull History</DialogTitle>
-              <DialogDescription>
-                Past Export-to-Directory pulls and the cases they touched. Newest first.
-              </DialogDescription>
+              <DialogDescription>Past directory pulls and the cases they touched. Newest first.</DialogDescription>
             </DialogHeader>
             <div className="py-2 max-h-[60vh] overflow-y-auto">
               {historyLoading && <p className="text-[12px] text-muted-foreground">Loading history...</p>}
@@ -827,6 +1143,7 @@ export function SlidePull() {
                         <div className="min-w-0 flex-1">
                           <div className="flex items-center gap-2">
                             <span className="text-[12px] font-medium tabular-nums">{h.exported_at}</span>
+                            {h.export_type === 'analysis' && <span className="rounded bg-violet-100 text-violet-700 px-1.5 py-0.5 text-[10px] font-medium">analysis</span>}
                             <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide">{h.preferred_method}</span>
                             {h.skip_existing && <span className="rounded bg-blue-100 text-blue-700 px-1.5 py-0.5 text-[10px] font-medium">skip-existing</span>}
                           </div>
@@ -834,7 +1151,7 @@ export function SlidePull() {
                         </div>
                         <div className="text-[11px] text-muted-foreground tabular-nums shrink-0 text-right">
                           {h.case_count} case{h.case_count === 1 ? '' : 's'}<br />
-                          {h.total_exported} slide{h.total_exported === 1 ? '' : 's'}
+                          {h.total_exported} file{h.total_exported === 1 ? '' : 's'}
                         </div>
                       </button>
                       {open && (
@@ -845,7 +1162,7 @@ export function SlidePull() {
                             <span className="text-muted-foreground">Skipped</span><span className="col-span-2 tabular-nums">{h.total_skipped}</span>
                             <span className="text-muted-foreground">Missing</span><span className="col-span-2 tabular-nums">{h.missing_count}</span>
                             <span className="text-muted-foreground">Failed</span><span className="col-span-2 tabular-nums">{h.failure_count}</span>
-                            <span className="text-muted-foreground">Bins</span><span className="col-span-2 tabular-nums">{h.bin_count} × {h.bin_size}</span>
+                            {h.bin_count > 0 && (<><span className="text-muted-foreground">Bins</span><span className="col-span-2 tabular-nums">{h.bin_count} × {h.bin_size}</span></>)}
                           </div>
                           {h.bins.length > 0 && (
                             <div className="border-t border-gray-200 pt-1.5 space-y-0.5 max-h-28 overflow-y-auto">
@@ -955,26 +1272,86 @@ export function SlidePull() {
       {/* Header row */}
       <div className="flex items-center justify-between mb-3">
         <div>
-          <h2 className="text-lg font-semibold">WSI Pull</h2>
-          <p className="text-[12px] text-muted-foreground">{cases.length} cases · {selectedSlides} of {totalSlides} slides selected · {formatBytes(totalSize)}</p>
+          <h2 className="text-lg font-semibold">Data Pull</h2>
+          <p className="text-[12px] text-muted-foreground">
+            {cases.length} cases · {selectedSlides} of {totalSlides} slides selected · {formatBytes(totalSize)}
+            {filtersActive && <span className="text-primary"> · {visibleCases.length} shown</span>}
+          </p>
         </div>
         <div className="flex items-center gap-1.5">
-          <Button size="sm" variant="outline" className="h-7 text-[12px]" onClick={() => setIsPasteOpen(true)}>
-            <FileText className="h-3 w-3 mr-1" />Paste
-          </Button>
-          <Button size="sm" variant="outline" className="h-7 text-[12px]" onClick={() => setIsSearchOpen(true)}>
-            <Search className="h-3 w-3 mr-1" />Search
-          </Button>
-          <Button size="sm" variant="outline" className="h-7 text-[12px]" onClick={openCohortImport}>
-            <Upload className="h-3 w-3 mr-1" />Cohort
-          </Button>
-          <Button size="sm" variant="outline" className="h-7 text-[12px]" onClick={openSheetImport}>
-            <FileText className="h-3 w-3 mr-1" />Request
-          </Button>
+          {importMenu()}
           <div className="w-px h-5 bg-border mx-0.5" />
-          <Button size="sm" variant="ghost" className="h-7 text-[12px]" onClick={selectAll}>Select All</Button>
-          <Button size="sm" variant="ghost" className="h-7 text-[12px]" onClick={deselectAll}>Clear</Button>
+          <Button size="sm" variant="ghost" className="h-7 text-[12px]" onClick={selectShown}>
+            {filtersActive ? 'Select shown' : 'Select all'}
+          </Button>
+          <Button size="sm" variant="ghost" className="h-7 text-[12px]" onClick={clearShown}>Clear</Button>
         </div>
+      </div>
+
+      {/* Inline filter bar */}
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2 mb-2 px-3 py-2 rounded-md border border-gray-200 bg-muted/20">
+        <div className="flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground uppercase tracking-wide shrink-0">
+          <Filter className="h-3.5 w-3.5" />Filter
+        </div>
+        {/* Case subset */}
+        <div className="flex items-center gap-1.5">
+          <Input
+            value={filterCaseText}
+            onChange={(e) => setFilterCaseText(e.target.value)}
+            placeholder="Limit to cases (paste accessions)…"
+            className="h-7 text-[12px] font-mono w-56"
+          />
+          {caseSubset && <span className="text-[11px] text-muted-foreground tabular-nums">{caseSubset.size}</span>}
+        </div>
+        {/* Stain */}
+        <div className="flex items-center gap-1.5">
+          <span className="text-[11px] text-muted-foreground">Stain</span>
+          {(['H&E', 'IHC', 'Other'] as StainBucket[]).map(b => {
+            const active = filterStain.has(b)
+            return (
+              <button
+                key={b}
+                type="button"
+                onClick={() => toggleFilterStain(b)}
+                className={`text-[11px] px-2 py-0.5 rounded border transition-colors ${
+                  active
+                    ? b === 'H&E' ? 'bg-rose-50 text-rose-700 border-rose-300'
+                      : b === 'IHC' ? 'bg-blue-50 text-blue-700 border-blue-300'
+                        : 'bg-gray-100 text-gray-700 border-gray-300'
+                    : 'bg-background text-muted-foreground border-gray-300 hover:bg-muted/30'
+                }`}
+              >
+                {b}
+              </button>
+            )
+          })}
+        </div>
+        {/* Analysis */}
+        {analysisOptions.length > 0 && (
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <span className="text-[11px] text-muted-foreground">Analysis</span>
+            {analysisOptions.map(name => {
+              const active = filterAnalyses.has(name)
+              return (
+                <button
+                  key={name}
+                  type="button"
+                  onClick={() => toggleFilterAnalysis(name)}
+                  className={`text-[11px] px-2 py-0.5 rounded border transition-colors inline-flex items-center gap-1 ${
+                    active ? 'bg-violet-50 text-violet-700 border-violet-300' : 'bg-background text-muted-foreground border-gray-300 hover:bg-muted/30'
+                  }`}
+                >
+                  <FlaskConical className="h-3 w-3" />{name}
+                </button>
+              )
+            })}
+          </div>
+        )}
+        {filtersActive && (
+          <button type="button" onClick={clearFilters} className="text-[11px] text-muted-foreground hover:text-foreground inline-flex items-center gap-1 ml-auto">
+            <X className="h-3 w-3" />Clear filters
+          </button>
+        )}
       </div>
 
       {/* Content: case tree + summary sidebar */}
@@ -994,10 +1371,16 @@ export function SlidePull() {
 
           {/* Scrollable tree */}
           <div className="flex-1 overflow-y-auto">
-            {cases.map(c => {
+            {visibleCases.length === 0 && (
+              <div className="p-6 text-center text-[12px] text-muted-foreground">
+                No cases match the current filters.
+              </div>
+            )}
+            {visibleCases.map(c => {
               const caseSelected = c.slides.filter(s => s.selected).length
               const allSelected = c.slides.every(s => s.selected)
               const someSelected = caseSelected > 0 && !allSelected
+              const caseHashes = new Set(c.slides.map(s => s.slide_hash))
 
               return (
                 <div key={c.accession}>
@@ -1009,7 +1392,7 @@ export function SlidePull() {
                     <div className="w-5 flex items-center justify-center">
                       <Checkbox
                         checked={allSelected ? true : someSelected ? 'indeterminate' : false}
-                        onCheckedChange={() => toggleAllInCase(c.accession)}
+                        onCheckedChange={() => setSelectionForHashes(caseHashes, !allSelected)}
                       />
                     </div>
                     <div className="flex-1 min-w-0">
@@ -1032,40 +1415,48 @@ export function SlidePull() {
                   </div>
 
                   {/* Slide rows */}
-                  {c.expanded && c.slides.map(s => (
-                    <div
-                      key={s.slide_hash}
-                      className={`flex items-center gap-2 px-3 py-1 border-b border-gray-50 transition-colors ${
-                        s.selected ? 'bg-primary/[0.03]' : 'opacity-50'
-                      } hover:bg-muted/10`}
-                    >
-                      <div className="w-5" />
-                      <div className="w-5 flex items-center justify-center">
-                        <Checkbox
-                          checked={s.selected}
-                          onCheckedChange={() => toggleSlide(c.accession, s.slide_hash)}
-                        />
+                  {c.expanded && c.slides.map(s => {
+                    const names = slideAnalysisNames(s)
+                    return (
+                      <div
+                        key={s.slide_hash}
+                        className={`flex items-center gap-2 px-3 py-1 border-b border-gray-50 transition-colors ${
+                          s.selected ? 'bg-primary/[0.03]' : 'opacity-50'
+                        } hover:bg-muted/10`}
+                      >
+                        <div className="w-5" />
+                        <div className="w-5 flex items-center justify-center">
+                          <Checkbox
+                            checked={s.selected}
+                            onCheckedChange={() => toggleSlide(c.accession, s.slide_hash)}
+                          />
+                        </div>
+                        <div className="flex-1 min-w-0 flex items-center gap-1.5">
+                          <Microscope className="h-3 w-3 text-muted-foreground/50 shrink-0" />
+                          <span className="text-[12px] font-mono text-muted-foreground truncate">{s.slide_hash.slice(0, 10)}...</span>
+                          {names.size > 0 && (
+                            <span className="inline-flex items-center gap-1 rounded bg-violet-50 text-violet-700 border border-violet-200 px-1 py-0.5 text-[10px] font-medium shrink-0" title={Array.from(names).join(', ')}>
+                              <FlaskConical className="h-2.5 w-2.5" />{names.size}
+                            </span>
+                          )}
+                        </div>
+                        <div className="w-16 text-center">
+                          <span className="inline-flex rounded bg-gray-100 border border-gray-300 px-1.5 py-0.5 text-[11px] font-mono">{s.block_id || '—'}</span>
+                        </div>
+                        <div className="w-20 text-center">
+                          <span className={`inline-flex rounded px-1.5 py-0.5 text-[11px] font-medium ${
+                            stainBucket(s.stain_type) === 'H&E' ? 'bg-rose-50 text-rose-700 border border-rose-200' :
+                            stainBucket(s.stain_type) === 'IHC' ? 'bg-blue-50 text-blue-700 border border-blue-200' :
+                            'bg-gray-50 text-gray-600 border border-gray-200'
+                          }`}>{s.stain_type || '—'}</span>
+                        </div>
+                        <div className="w-16 text-right text-[11px] text-muted-foreground tabular-nums">
+                          {formatBytes(s.file_size_bytes)}
+                        </div>
+                        <div className="w-8" />
                       </div>
-                      <div className="flex-1 min-w-0 flex items-center gap-1.5">
-                        <Microscope className="h-3 w-3 text-muted-foreground/50 shrink-0" />
-                        <span className="text-[12px] font-mono text-muted-foreground truncate">{s.slide_hash.slice(0, 10)}...</span>
-                      </div>
-                      <div className="w-16 text-center">
-                        <span className="inline-flex rounded bg-gray-100 border border-gray-300 px-1.5 py-0.5 text-[11px] font-mono">{s.block_id || '—'}</span>
-                      </div>
-                      <div className="w-20 text-center">
-                        <span className={`inline-flex rounded px-1.5 py-0.5 text-[11px] font-medium ${
-                          stainBucket(s.stain_type) === 'H&E' ? 'bg-rose-50 text-rose-700 border border-rose-200' :
-                          stainBucket(s.stain_type) === 'IHC' ? 'bg-blue-50 text-blue-700 border border-blue-200' :
-                          'bg-gray-50 text-gray-600 border border-gray-200'
-                        }`}>{s.stain_type || '—'}</span>
-                      </div>
-                      <div className="w-16 text-right text-[11px] text-muted-foreground tabular-nums">
-                        {formatBytes(s.file_size_bytes)}
-                      </div>
-                      <div className="w-8" />
-                    </div>
-                  ))}
+                    )
+                  })}
                 </div>
               )
             })}
@@ -1128,7 +1519,7 @@ export function SlidePull() {
               disabled={selectedSlides === 0}
             >
               <FolderOutput className="h-3 w-3 mr-1.5" />
-              Export to Directory
+              Export…
             </Button>
             <Button
               size="sm"
@@ -1139,19 +1530,6 @@ export function SlidePull() {
               <History className="h-3 w-3 mr-1.5" />
               Pull History
             </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              className="w-full h-8 text-[12px]"
-              onClick={downloadFiles}
-              disabled={selectedSlides === 0 || downloading}
-            >
-              <Package className="h-3 w-3 mr-1.5" />
-              {downloading ? 'Preparing ZIP...' : 'Download ZIP'}
-            </Button>
-            {downloadError && (
-              <p className="text-[11px] text-red-600">{downloadError}</p>
-            )}
             <Button
               size="sm"
               variant="outline"
