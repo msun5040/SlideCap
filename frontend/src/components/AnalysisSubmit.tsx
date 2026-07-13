@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useMemo } from 'react'
 import {
   Search, Send, Users, AlertTriangle, Loader2, CheckCircle, XCircle,
   ChevronDown, ChevronRight, Tag, Hash, Stethoscope, FolderOpen, Microscope,
-  FileText, Play, Flag, Clock, ShieldCheck, Eye,
+  FileText, Play, Flag, Clock, ShieldCheck, Eye, Filter, FlaskConical,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -75,6 +75,17 @@ interface QCResult {
 // Global tag used to mark a slide as "flagged" from the Cohort view.
 const SLIDE_FLAG_TAG = 'flagged'
 
+// Coarse stain buckets for the cohort slide-selection filter (mirrors Data Pull).
+type StainBucket = 'H&E' | 'IHC' | 'Other'
+function stainBucket(stain?: string | null): StainBucket {
+  const s = (stain || '').trim().toUpperCase()
+  if (s === 'HE' || s === 'HNE' || s === 'H&E' || s === 'H E') return 'H&E'
+  if (s.startsWith('IHC')) return 'IHC'
+  return 'Other'
+}
+// Sentinel token in the analysis filter meaning "no completed analyses yet".
+const UNANALYZED = '__unanalyzed__'
+
 function analysisStatusIcon(status: string) {
   if (status === 'completed') return <CheckCircle className="h-3 w-3 text-green-600" />
   if (status === 'running' || status === 'transferring') return <Loader2 className="h-3 w-3 text-blue-500 animate-spin" />
@@ -104,6 +115,13 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
   const [cohortSelectedHashes, setCohortSelectedHashes] = useState<Set<string>>(new Set())
   const [expandedPatients, setExpandedPatients] = useState<Set<number>>(new Set())
   const [expandedCases, setExpandedCases] = useState<Set<string>>(new Set())
+  // "By patient" tree (default) vs flat case→slide list (like Data Pull).
+  const [cohortViewMode, setCohortViewMode] = useState<'patient' | 'flat'>('patient')
+  // Flat view is expanded by default; this set tracks cases the user collapsed.
+  const [flatCollapsedCases, setFlatCollapsedCases] = useState<Set<string>>(new Set())
+  // In-selection filters for the cohort slide picker.
+  const [cohortFilterStain, setCohortFilterStain] = useState<Set<StainBucket>>(new Set())
+  const [cohortFilterAnalyses, setCohortFilterAnalyses] = useState<Set<string>>(new Set())
   // Per-slide analysis history + cohort flags, shown as badges in the drill-down
   const [slideAnalysisStatus, setSlideAnalysisStatus] = useState<Record<string, Record<string, SlideAnalysisEntry>>>({})
   const [cohortFlags, setCohortFlags] = useState<CohortFlag[]>([])
@@ -353,6 +371,77 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
   const slideHashesForPatient = (p: CohortPatient) =>
     caseHashesForPatient(p).flatMap(slideHashesForCase)
 
+  // ── Cohort slide filters (stain / prior-analysis) ────────────────────
+  // Union of analysis names seen across the cohort's slides — drives the
+  // analysis filter chips (plus an "Unanalyzed" sentinel).
+  const cohortAnalysisOptions = useMemo(() => {
+    const set = new Set<string>()
+    for (const m of Object.values(slideAnalysisStatus)) {
+      for (const e of Object.values(m)) set.add(e.analysis_name)
+    }
+    return Array.from(set).sort()
+  }, [slideAnalysisStatus])
+
+  const completedNamesFor = (hash: string): string[] => {
+    const m = slideAnalysisStatus[hash]
+    return m ? Object.values(m).filter(e => e.status === 'completed').map(e => e.analysis_name) : []
+  }
+
+  const cohortFiltersActive = cohortFilterStain.size > 0 || cohortFilterAnalyses.size > 0
+
+  const slidePassesCohortFilter = (s: CohortSlide): boolean => {
+    if (cohortFilterStain.size && !cohortFilterStain.has(stainBucket(s.stain_type))) return false
+    if (cohortFilterAnalyses.size) {
+      const done = completedNamesFor(s.slide_hash)
+      let ok = false
+      for (const tok of cohortFilterAnalyses) {
+        if (tok === UNANALYZED) { if (done.length === 0) { ok = true; break } }
+        else if (done.includes(tok)) { ok = true; break }
+      }
+      if (!ok) return false
+    }
+    return true
+  }
+
+  const visibleSlidesForCase = (caseHash: string): CohortSlide[] =>
+    (slidesByCase.get(caseHash) || []).filter(slidePassesCohortFilter)
+  const visibleHashesForCase = (caseHash: string) => visibleSlidesForCase(caseHash).map(s => s.slide_hash)
+  const visibleHashesForPatient = (p: CohortPatient) =>
+    p.surgeries.flatMap(su => visibleHashesForCase(su.case_hash))
+
+  // All slide hashes currently passing the filter (across the whole cohort).
+  const shownCohortHashes = cohortDetail
+    ? cohortDetail.slides.filter(slidePassesCohortFilter).map(s => s.slide_hash)
+    : []
+
+  const toggleCohortStain = (b: StainBucket) => setCohortFilterStain(prev => {
+    const n = new Set(prev); n.has(b) ? n.delete(b) : n.add(b); return n
+  })
+  const toggleCohortAnalysisFilter = (name: string) => setCohortFilterAnalyses(prev => {
+    const n = new Set(prev); n.has(name) ? n.delete(name) : n.add(name); return n
+  })
+  const clearCohortFilters = () => { setCohortFilterStain(new Set()); setCohortFilterAnalyses(new Set()) }
+
+  // Bulk select/clear the currently-shown (filtered) slides.
+  const selectShownCohort = () => setHashesSelected(shownCohortHashes, true)
+  const clearShownCohort = () => setHashesSelected(shownCohortHashes, false)
+
+  const expandAllCohort = () => {
+    setExpandedPatients(new Set(cohortPatients.map(p => p.id)))
+    setExpandedCases(new Set(cohortCaseGroups.map(g => g.case_hash)))
+    setFlatCollapsedCases(new Set())
+  }
+  const collapseAllCohort = () => {
+    setExpandedPatients(new Set())
+    setExpandedCases(new Set())
+    setFlatCollapsedCases(new Set(cohortCaseGroups.map(g => g.case_hash)))
+  }
+  // Flat view: expanded by default; a filter also forces matches open.
+  const flatCaseOpen = (hash: string) => cohortFiltersActive || !flatCollapsedCases.has(hash)
+  const toggleFlatCase = (hash: string) => setFlatCollapsedCases(prev => {
+    const n = new Set(prev); n.has(hash) ? n.delete(hash) : n.add(hash); return n
+  })
+
   // tri-state for a group checkbox given the slide hashes it covers
   const groupCheckState = (hashes: string[]): boolean | 'indeterminate' => {
     if (hashes.length === 0) return false
@@ -504,10 +593,6 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
   }
 
   const allCohortHashes = cohortDetail ? cohortDetail.slides.map(s => s.slide_hash) : []
-  const toggleAllCohortSlides = () => {
-    if (cohortSelectedHashes.size >= allCohortHashes.length) setCohortSelectedHashes(new Set())
-    else setCohortSelectedHashes(new Set(allCohortHashes))
-  }
 
   // Quick-run a single slide: select just that slide and jump straight to QC.
   const runSingleSlide = (hash: string) => {
@@ -1163,120 +1248,249 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
                       </div>
 
                       {patientSelectMode === 'specific' && (
-                        <div className="rounded-lg border divide-y max-h-96 overflow-auto">
-                          {/* Select all header */}
-                          <div
-                            className="flex items-center gap-3 px-4 py-2.5 bg-muted/30 cursor-pointer sticky top-0 z-10"
-                            onClick={toggleAllCohortSlides}
-                          >
-                            <Checkbox
-                              checked={groupCheckState(allCohortHashes)}
-                              onCheckedChange={toggleAllCohortSlides}
-                            />
-                            <span className="text-sm font-medium">
-                              {cohortSelectedHashes.size} / {allCohortHashes.length} slides selected
-                            </span>
-                            <span className="text-xs text-muted-foreground ml-auto">
-                              Expand a patient → case to pick individual slides
-                            </span>
+                        <div className="space-y-2">
+                          {/* Filter bar (stain + prior-analysis) */}
+                          <div className="flex flex-wrap items-center gap-x-3 gap-y-2 px-3 py-2 rounded-md border bg-muted/20">
+                            <div className="flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground uppercase tracking-wide shrink-0">
+                              <Filter className="h-3.5 w-3.5" />Filter
+                            </div>
+                            <div className="flex items-center gap-1.5">
+                              <span className="text-[11px] text-muted-foreground">Stain</span>
+                              {(['H&E', 'IHC', 'Other'] as StainBucket[]).map(b => {
+                                const active = cohortFilterStain.has(b)
+                                return (
+                                  <button
+                                    key={b}
+                                    type="button"
+                                    onClick={() => toggleCohortStain(b)}
+                                    className={`text-[11px] px-2 py-0.5 rounded border transition-colors ${
+                                      active
+                                        ? b === 'H&E' ? 'bg-rose-50 text-rose-700 border-rose-300'
+                                          : b === 'IHC' ? 'bg-blue-50 text-blue-700 border-blue-300'
+                                            : 'bg-gray-100 text-gray-700 border-gray-300'
+                                        : 'bg-background text-muted-foreground border-input hover:bg-muted/30'
+                                    }`}
+                                  >
+                                    {b}
+                                  </button>
+                                )
+                              })}
+                            </div>
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                              <span className="text-[11px] text-muted-foreground">Analysis</span>
+                              {cohortAnalysisOptions.map(name => {
+                                const active = cohortFilterAnalyses.has(name)
+                                return (
+                                  <button
+                                    key={name}
+                                    type="button"
+                                    onClick={() => toggleCohortAnalysisFilter(name)}
+                                    className={`text-[11px] px-2 py-0.5 rounded border transition-colors inline-flex items-center gap-1 ${
+                                      active ? 'bg-violet-50 text-violet-700 border-violet-300' : 'bg-background text-muted-foreground border-input hover:bg-muted/30'
+                                    }`}
+                                  >
+                                    <FlaskConical className="h-3 w-3" />{name}
+                                  </button>
+                                )
+                              })}
+                              <button
+                                type="button"
+                                onClick={() => toggleCohortAnalysisFilter(UNANALYZED)}
+                                className={`text-[11px] px-2 py-0.5 rounded border transition-colors ${
+                                  cohortFilterAnalyses.has(UNANALYZED) ? 'bg-emerald-50 text-emerald-700 border-emerald-300' : 'bg-background text-muted-foreground border-input hover:bg-muted/30'
+                                }`}
+                                title="Slides with no completed analyses yet"
+                              >
+                                Unanalyzed
+                              </button>
+                            </div>
+                            {cohortFiltersActive && (
+                              <button type="button" onClick={clearCohortFilters} className="text-[11px] text-muted-foreground hover:text-foreground inline-flex items-center gap-1 ml-auto">
+                                <XCircle className="h-3 w-3" />Clear filters
+                              </button>
+                            )}
                           </div>
 
-                          {/* Assigned patients → surgeries (cases) → slides */}
-                          {cohortPatients.map(patient => {
-                            const pHashes = slideHashesForPatient(patient)
-                            const isExpanded = expandedPatients.has(patient.id)
-                            return (
-                              <div key={patient.id}>
-                                <div className="flex items-center gap-3 px-4 py-2 hover:bg-muted/30 transition-colors">
-                                  <Checkbox
-                                    checked={groupCheckState(pHashes)}
-                                    onCheckedChange={() => toggleGroup(pHashes)}
-                                    onClick={e => e.stopPropagation()}
-                                  />
-                                  <button
-                                    className="flex-1 flex items-center gap-2 text-left"
-                                    onClick={() => toggleExpandPatient(patient.id)}
-                                  >
-                                    {isExpanded
-                                      ? <ChevronDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-                                      : <ChevronRight className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-                                    }
-                                    <span className="text-sm font-medium">{patient.label}</span>
-                                    <span className="text-xs text-muted-foreground">
-                                      {patient.surgeries.length} surger{patient.surgeries.length !== 1 ? 'ies' : 'y'}
-                                      {' · '}
-                                      {pHashes.length} slides
-                                    </span>
-                                  </button>
-                                </div>
-                                {isExpanded && patient.surgeries.map(surgery => {
-                                  const cHashes = slideHashesForCase(surgery.case_hash)
-                                  const caseSlides = slidesByCase.get(surgery.case_hash) || []
-                                  const caseExpanded = expandedCases.has(surgery.case_hash)
-                                  return (
-                                    <div key={surgery.id} className="bg-muted/5">
-                                      <div className="flex items-center gap-3 pl-9 pr-4 py-1.5 hover:bg-muted/30 transition-colors">
-                                        <Checkbox
-                                          checked={groupCheckState(cHashes)}
-                                          onCheckedChange={() => toggleGroup(cHashes)}
-                                          onClick={e => e.stopPropagation()}
-                                        />
-                                        <button
-                                          className="flex-1 flex items-center gap-2 text-left"
-                                          onClick={() => caseSlides.length > 0 && toggleExpandCase(surgery.case_hash)}
-                                        >
-                                          {caseSlides.length > 0
-                                            ? (caseExpanded
-                                              ? <ChevronDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-                                              : <ChevronRight className="h-3.5 w-3.5 text-muted-foreground shrink-0" />)
-                                            : <span className="w-3.5 shrink-0" />
-                                          }
-                                          <Stethoscope className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                                          <span className="text-sm font-medium">{surgery.surgery_label}</span>
-                                          <span className="text-xs text-muted-foreground">{displayCase(surgery)}</span>
-                                          <span className="ml-auto text-xs text-muted-foreground">{cHashes.length} slides</span>
-                                        </button>
-                                      </div>
-                                      {caseExpanded && caseSlides.map(renderCohortSlideRow)}
-                                    </div>
-                                  )
-                                })}
-                              </div>
-                            )
-                          })}
+                          {/* View toggle + bulk + expand controls */}
+                          <div className="flex flex-wrap items-center gap-2">
+                            <div className="flex gap-0.5 rounded-md border p-0.5">
+                              <button
+                                className={`text-xs px-2.5 py-1 rounded transition-colors ${cohortViewMode === 'patient' ? 'bg-primary text-primary-foreground' : 'hover:bg-muted'}`}
+                                onClick={() => setCohortViewMode('patient')}
+                              >
+                                By patient
+                              </button>
+                              <button
+                                className={`text-xs px-2.5 py-1 rounded transition-colors ${cohortViewMode === 'flat' ? 'bg-primary text-primary-foreground' : 'hover:bg-muted'}`}
+                                onClick={() => setCohortViewMode('flat')}
+                              >
+                                Flat
+                              </button>
+                            </div>
+                            <span className="text-xs text-muted-foreground">
+                              {cohortSelectedHashes.size} / {allCohortHashes.length} selected
+                              {cohortFiltersActive && <span className="text-primary"> · {shownCohortHashes.length} shown</span>}
+                            </span>
+                            <div className="ml-auto flex items-center gap-1.5">
+                              <Button size="sm" variant="outline" className="h-7 text-xs" onClick={selectShownCohort} disabled={shownCohortHashes.length === 0}>
+                                {cohortFiltersActive ? 'Select shown' : 'Select all'}
+                              </Button>
+                              <Button size="sm" variant="outline" className="h-7 text-xs" onClick={clearShownCohort} disabled={shownCohortHashes.length === 0}>
+                                Clear
+                              </Button>
+                              {cohortViewMode === 'patient' && (
+                                <>
+                                  <Button size="sm" variant="ghost" className="h-7 text-xs" onClick={expandAllCohort}>Expand all</Button>
+                                  <Button size="sm" variant="ghost" className="h-7 text-xs" onClick={collapseAllCohort}>Collapse all</Button>
+                                </>
+                              )}
+                            </div>
+                          </div>
 
-                          {/* Unassigned cases → slides */}
-                          {unassignedCases.map(c => {
-                            const cHashes = slideHashesForCase(c.case_hash)
-                            const caseSlides = slidesByCase.get(c.case_hash) || []
-                            const caseExpanded = expandedCases.has(c.case_hash)
-                            return (
-                              <div key={c.case_hash}>
-                                <div className="flex items-center gap-3 px-4 py-2 hover:bg-muted/30 transition-colors">
-                                  <Checkbox
-                                    checked={groupCheckState(cHashes)}
-                                    onCheckedChange={() => toggleGroup(cHashes)}
-                                    onClick={e => e.stopPropagation()}
-                                  />
-                                  <button
-                                    className="flex-1 flex items-center gap-2 text-left"
-                                    onClick={() => caseSlides.length > 0 && toggleExpandCase(c.case_hash)}
-                                  >
-                                    {caseSlides.length > 0
-                                      ? (caseExpanded
-                                        ? <ChevronDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-                                        : <ChevronRight className="h-3.5 w-3.5 text-muted-foreground shrink-0" />)
-                                      : <span className="w-3.5 shrink-0" />
-                                    }
-                                    <span className="text-sm text-muted-foreground italic">{displayCase(c)}</span>
-                                    <span className="text-[10px] text-muted-foreground">unassigned</span>
-                                    <span className="ml-auto text-xs text-muted-foreground">{cHashes.length} slides</span>
-                                  </button>
-                                </div>
-                                {caseExpanded && caseSlides.map(renderCohortSlideRow)}
+                          {/* Tree */}
+                          <div className="rounded-lg border divide-y max-h-96 overflow-auto">
+                            {shownCohortHashes.length === 0 && (
+                              <div className="px-4 py-6 text-center text-sm text-muted-foreground">
+                                No slides match the current filters.
                               </div>
-                            )
-                          })}
+                            )}
+
+                            {cohortViewMode === 'patient' && <>
+                              {/* Assigned patients → surgeries (cases) → slides */}
+                              {cohortPatients.map(patient => {
+                                const pHashes = visibleHashesForPatient(patient)
+                                if (cohortFiltersActive && pHashes.length === 0) return null
+                                const isExpanded = cohortFiltersActive || expandedPatients.has(patient.id)
+                                return (
+                                  <div key={patient.id}>
+                                    <div className="flex items-center gap-3 px-4 py-2 hover:bg-muted/30 transition-colors">
+                                      <Checkbox
+                                        checked={groupCheckState(pHashes)}
+                                        onCheckedChange={() => toggleGroup(pHashes)}
+                                        onClick={e => e.stopPropagation()}
+                                      />
+                                      <button
+                                        className="flex-1 flex items-center gap-2 text-left"
+                                        onClick={() => toggleExpandPatient(patient.id)}
+                                      >
+                                        {isExpanded
+                                          ? <ChevronDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                                          : <ChevronRight className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                                        }
+                                        <span className="text-sm font-medium">{patient.label}</span>
+                                        <span className="text-xs text-muted-foreground">
+                                          {patient.surgeries.length} surger{patient.surgeries.length !== 1 ? 'ies' : 'y'}
+                                          {' · '}
+                                          {pHashes.length} slides
+                                        </span>
+                                      </button>
+                                    </div>
+                                    {isExpanded && patient.surgeries.map(surgery => {
+                                      const cHashes = visibleHashesForCase(surgery.case_hash)
+                                      if (cohortFiltersActive && cHashes.length === 0) return null
+                                      const caseSlides = visibleSlidesForCase(surgery.case_hash)
+                                      const caseExpanded = cohortFiltersActive || expandedCases.has(surgery.case_hash)
+                                      return (
+                                        <div key={surgery.id} className="bg-muted/5">
+                                          <div className="flex items-center gap-3 pl-9 pr-4 py-1.5 hover:bg-muted/30 transition-colors">
+                                            <Checkbox
+                                              checked={groupCheckState(cHashes)}
+                                              onCheckedChange={() => toggleGroup(cHashes)}
+                                              onClick={e => e.stopPropagation()}
+                                            />
+                                            <button
+                                              className="flex-1 flex items-center gap-2 text-left"
+                                              onClick={() => caseSlides.length > 0 && toggleExpandCase(surgery.case_hash)}
+                                            >
+                                              {caseSlides.length > 0
+                                                ? (caseExpanded
+                                                  ? <ChevronDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                                                  : <ChevronRight className="h-3.5 w-3.5 text-muted-foreground shrink-0" />)
+                                                : <span className="w-3.5 shrink-0" />
+                                              }
+                                              <Stethoscope className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                                              <span className="text-sm font-medium">{surgery.surgery_label}</span>
+                                              <span className="text-xs text-muted-foreground">{displayCase(surgery)}</span>
+                                              <span className="ml-auto text-xs text-muted-foreground">{cHashes.length} slides</span>
+                                            </button>
+                                          </div>
+                                          {caseExpanded && caseSlides.map(renderCohortSlideRow)}
+                                        </div>
+                                      )
+                                    })}
+                                  </div>
+                                )
+                              })}
+
+                              {/* Unassigned cases → slides */}
+                              {unassignedCases.map(c => {
+                                const cHashes = visibleHashesForCase(c.case_hash)
+                                if (cohortFiltersActive && cHashes.length === 0) return null
+                                const caseSlides = visibleSlidesForCase(c.case_hash)
+                                const caseExpanded = cohortFiltersActive || expandedCases.has(c.case_hash)
+                                return (
+                                  <div key={c.case_hash}>
+                                    <div className="flex items-center gap-3 px-4 py-2 hover:bg-muted/30 transition-colors">
+                                      <Checkbox
+                                        checked={groupCheckState(cHashes)}
+                                        onCheckedChange={() => toggleGroup(cHashes)}
+                                        onClick={e => e.stopPropagation()}
+                                      />
+                                      <button
+                                        className="flex-1 flex items-center gap-2 text-left"
+                                        onClick={() => caseSlides.length > 0 && toggleExpandCase(c.case_hash)}
+                                      >
+                                        {caseSlides.length > 0
+                                          ? (caseExpanded
+                                            ? <ChevronDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                                            : <ChevronRight className="h-3.5 w-3.5 text-muted-foreground shrink-0" />)
+                                          : <span className="w-3.5 shrink-0" />
+                                        }
+                                        <span className="text-sm text-muted-foreground italic">{displayCase(c)}</span>
+                                        <span className="text-[10px] text-muted-foreground">unassigned</span>
+                                        <span className="ml-auto text-xs text-muted-foreground">{cHashes.length} slides</span>
+                                      </button>
+                                    </div>
+                                    {caseExpanded && caseSlides.map(renderCohortSlideRow)}
+                                  </div>
+                                )
+                              })}
+                            </>}
+
+                            {cohortViewMode === 'flat' && cohortCaseGroups.map(g => {
+                              const cHashes = visibleHashesForCase(g.case_hash)
+                              if (cohortFiltersActive && cHashes.length === 0) return null
+                              const caseSlides = visibleSlidesForCase(g.case_hash)
+                              const total = slidesByCase.get(g.case_hash)?.length ?? 0
+                              const selInCase = cHashes.reduce((n, h) => n + (cohortSelectedHashes.has(h) ? 1 : 0), 0)
+                              const open = flatCaseOpen(g.case_hash)
+                              return (
+                                <div key={g.case_hash}>
+                                  <div className="flex items-center gap-3 px-4 py-2 bg-muted/10 hover:bg-muted/30 transition-colors">
+                                    <Checkbox
+                                      checked={groupCheckState(cHashes)}
+                                      onCheckedChange={() => toggleGroup(cHashes)}
+                                      onClick={e => e.stopPropagation()}
+                                    />
+                                    <button
+                                      className="flex-1 flex items-center gap-2 text-left"
+                                      onClick={() => toggleFlatCase(g.case_hash)}
+                                    >
+                                      {open
+                                        ? <ChevronDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                                        : <ChevronRight className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                                      }
+                                      <span className="text-sm font-medium font-mono">{displayCase({ accession_number: g.accession_number, case_hash: g.case_hash })}</span>
+                                      <span className="ml-auto text-xs text-muted-foreground">
+                                        {selInCase}/{cHashes.length}{cohortFiltersActive && total !== cHashes.length ? ` of ${total}` : ''} slides
+                                      </span>
+                                    </button>
+                                  </div>
+                                  {open && caseSlides.map(renderCohortSlideRow)}
+                                </div>
+                              )
+                            })}
+                          </div>
                         </div>
                       )}
 

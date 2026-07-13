@@ -910,14 +910,14 @@ export function SlidePull() {
 
         {/* Unified export dialog */}
         <Dialog open={isExportOpen} onOpenChange={setIsExportOpen}>
-          <DialogContent className="sm:max-w-xl max-h-[88vh] overflow-y-auto">
+          <DialogContent className="sm:max-w-xl max-h-[88vh] overflow-y-auto overflow-x-hidden">
             <DialogHeader>
               <DialogTitle>Export</DialogTitle>
               <DialogDescription>
                 Pull slide files and/or analysis output files for the {selectedSlides} selected slide{selectedSlides === 1 ? '' : 's'}.
               </DialogDescription>
             </DialogHeader>
-            <div className="space-y-4 py-2">
+            <div className="space-y-4 py-2 min-w-0">
               {/* Destination mode */}
               <div className="flex gap-2">
                 <button
@@ -971,7 +971,7 @@ export function SlidePull() {
 
               {/* Analysis file picker */}
               {includeAnalysis && selectedAnalysisNames.length > 0 && (
-                <div className="rounded-md border border-gray-200 bg-muted/20 p-2.5 space-y-2">
+                <div className="rounded-md border border-gray-200 bg-muted/20 p-2.5 space-y-2 min-w-0">
                   <div className="flex items-center gap-2">
                     <FlaskConical className="h-3.5 w-3.5 text-muted-foreground" />
                     <Select value={exportAnalysisName} onValueChange={(v) => { setExportAnalysisName(v); setAnalysisFileSel({}) }}>

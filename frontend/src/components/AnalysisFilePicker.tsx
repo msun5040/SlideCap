@@ -225,7 +225,7 @@ export function AnalysisFilePicker({ targets, value, onChange }: Props) {
       </div>
 
       {/* Per-slide hand-pick */}
-      <div className="border border-gray-300 rounded-md divide-y divide-gray-100 max-h-64 overflow-y-auto">
+      <div className="border border-gray-300 rounded-md divide-y divide-gray-100 max-h-64 overflow-y-auto overflow-x-hidden">
         {targets.map(t => {
           const files = flat[t.key] || []
           const sel = new Set(value[t.key] || [])
@@ -240,7 +240,7 @@ export function AnalysisFilePicker({ targets, value, onChange }: Props) {
               >
                 {open ? <ChevronDown className="h-3.5 w-3.5 shrink-0" /> : <ChevronRight className="h-3.5 w-3.5 shrink-0" />}
                 <Folder className="h-3.5 w-3.5 text-amber-500 shrink-0" />
-                <span className="text-[12px] font-mono truncate flex-1" title={t.label}>{t.label}</span>
+                <span className="text-[12px] font-mono truncate flex-1 min-w-0" title={t.label}>{t.label}</span>
                 <span className="text-[11px] text-muted-foreground shrink-0">
                   {nSel > 0 ? `${nSel}/${files.length}` : `${files.length} files`}
                 </span>
@@ -260,7 +260,7 @@ export function AnalysisFilePicker({ targets, value, onChange }: Props) {
                           onCheckedChange={() => toggleFile(t.key, f.path)}
                         />
                         <FileText className="h-3 w-3 text-muted-foreground shrink-0" />
-                        <span className="text-[11px] font-mono truncate flex-1" title={f.path}>{f.path}</span>
+                        <span className="text-[11px] font-mono truncate flex-1 min-w-0" title={f.path}>{f.path}</span>
                         <span className="text-[10px] text-muted-foreground shrink-0">{formatBytes(f.size)}</span>
                       </label>
                     ))}
