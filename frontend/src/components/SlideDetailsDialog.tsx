@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Eye, FileText, Layers, Loader2, ScatterChart } from 'lucide-react'
+import { ChevronDown, ChevronRight, Eye, FileText, Layers, Loader2, ScatterChart } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import {
@@ -12,6 +12,7 @@ import {
 import { CopyableText } from '@/components/CopyableText'
 import { SlideViewerOSD } from '@/components/SlideViewerOSD'
 import { ScatterViewerOverlay } from '@/components/ScatterViewerOverlay'
+import { AnalysisFileTree } from '@/components/AnalysisFileTree'
 import type { Slide, AnalysisKind } from '@/types/slide'
 import { getApiBase, isDemo } from '@/api'
 import { displaySlide } from '@/lib/display'
@@ -56,6 +57,8 @@ export function SlideDetailsDialog({ slideHash, seed, onClose }: Props) {
   const [annotations, setAnnotations] = useState<AnnotationFile[]>([])
   const [annLoading, setAnnLoading] = useState(false)
   const [results, setResults] = useState<AnalysisResultRow[]>([])
+  // Which Completed-Analyses rows have their output file tree expanded.
+  const [expandedResults, setExpandedResults] = useState<Set<string>>(new Set())
   const [viewerOpen, setViewerOpen] = useState(false)
   // Registry of analysis-kind plugins, fetched once. Drives which renderer
   // buttons (UMAP / PCA / …) show up next to a Completed-Analyses row.
@@ -81,6 +84,7 @@ export function SlideDetailsDialog({ slideHash, seed, onClose }: Props) {
       setError(null)
       setAnnotations([])
       setResults([])
+      setExpandedResults(new Set())
       setViewerOpen(false)
       return
     }
@@ -96,6 +100,7 @@ export function SlideDetailsDialog({ slideHash, seed, onClose }: Props) {
     const ac = new AbortController()
     setLoading(true)
     setError(null)
+    setExpandedResults(new Set())
     fetch(`${getApiBase()}/slides/${slideHash}`, { signal: ac.signal })
       .then(async r => {
         if (!r.ok) {
@@ -251,32 +256,58 @@ export function SlideDetailsDialog({ slideHash, seed, onClose }: Props) {
                       UNI features" to "view the UMAP". Slide name passed
                       through to the overlay so the OSD viewer header is
                       already redacted. */}
-                  <div className="space-y-2 mt-1">
+                  <div className="space-y-1 mt-1">
                     {results.map((r) => {
                       const kind = kinds.find(k => k.id === r.analysis_kind)
                       const renderers = kind?.renderers || []
+                      const rowKey = `${r.job_id}-${r.analysis_name}`
+                      const isOpen = expandedResults.has(rowKey)
                       return (
-                        <div key={`${r.job_id}-${r.analysis_name}`} className="flex flex-wrap items-center gap-2">
-                          <Badge variant="outline" title={`Job #${r.job_id} — ${r.status}`}>
-                            {r.analysis_name} v{r.version}
-                          </Badge>
-                          {renderers.map(rd => (
-                            <Button
-                              key={rd.id}
-                              size="sm"
-                              variant="outline"
-                              className="h-7 text-xs"
-                              onClick={() => slide && setScatterViewer({
-                                jobId: r.job_id,
-                                rendererId: rd.id,
-                                rendererName: rd.name,
+                        <div key={rowKey} className="rounded-md border">
+                          <div className="flex flex-wrap items-center gap-2 p-2">
+                            {/* Chevron toggles the analysis's output file tree,
+                                mirroring the Results tab: expand to browse the
+                                folders/files this analysis produced. */}
+                            <button
+                              className="flex items-center gap-1.5 text-left"
+                              onClick={() => setExpandedResults(prev => {
+                                const next = new Set(prev)
+                                if (next.has(rowKey)) next.delete(rowKey)
+                                else next.add(rowKey)
+                                return next
                               })}
-                              title={rd.description}
+                              title={isOpen ? 'Hide output files' : 'Show output files'}
                             >
-                              <ScatterChart className="h-3 w-3 mr-1" />
-                              {rd.name}
-                            </Button>
-                          ))}
+                              {isOpen
+                                ? <ChevronDown className="h-4 w-4 text-muted-foreground shrink-0" />
+                                : <ChevronRight className="h-4 w-4 text-muted-foreground shrink-0" />}
+                              <Badge variant="outline" title={`Job #${r.job_id} — ${r.status}`}>
+                                {r.analysis_name} v{r.version}
+                              </Badge>
+                            </button>
+                            {renderers.map(rd => (
+                              <Button
+                                key={rd.id}
+                                size="sm"
+                                variant="outline"
+                                className="h-7 text-xs"
+                                onClick={() => slide && setScatterViewer({
+                                  jobId: r.job_id,
+                                  rendererId: rd.id,
+                                  rendererName: rd.name,
+                                })}
+                                title={rd.description}
+                              >
+                                <ScatterChart className="h-3 w-3 mr-1" />
+                                {rd.name}
+                              </Button>
+                            ))}
+                          </div>
+                          {isOpen && (
+                            <div className="border-t px-2">
+                              <AnalysisFileTree jobId={r.job_id} slideHash={slide.slide_hash} />
+                            </div>
+                          )}
                         </div>
                       )
                     })}
