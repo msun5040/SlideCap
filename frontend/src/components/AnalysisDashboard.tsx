@@ -41,7 +41,7 @@ export function AnalysisDashboard() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-2xl font-semibold mb-2">AI Analysis</h1>
+        <h1 className="text-2xl font-semibold mb-2">Analysis Dashboard</h1>
         <p className="text-muted-foreground">
           Manage analysis pipelines, submit jobs, and browse results
         </p>

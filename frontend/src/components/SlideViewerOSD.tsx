@@ -109,6 +109,8 @@ export function SlideViewerOSD({ slideHash, slideName, overlays: initialOverlays
   const onImageClickRef = useRef(onImageClick); onImageClickRef.current = onImageClick
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  // Set while the backend is converting a plain TIFF into a viewable pyramid.
+  const [preparing, setPreparing] = useState<string | null>(null)
   const [dimensions, setDimensions] = useState<{ width: number; height: number } | null>(null)
   const [overlays, setOverlays] = useState<OverlayRuntime[]>(
     initialOverlays.map(spec => ({ ...spec, visible: spec.visible ?? true, opacity: spec.opacity ?? 0.55 }))
@@ -123,8 +125,24 @@ export function SlideViewerOSD({ slideHash, slideName, overlays: initialOverlays
     const init = async () => {
       try {
         // Fetch the DZI manifest with auth, parse, hand parsed tile source to OSD
-        const res = await fetch(`${getApiBase()}/slides/${slideHash}/dzi.json`)
-        if (!res.ok) throw new Error(`DZI manifest HTTP ${res.status}`)
+        // A plain TIFF has to be converted to a pyramid before it can be
+        // tiled; the backend answers 503 with progress while that runs, so
+        // poll rather than failing the open.
+        let res = await fetch(`${getApiBase()}/slides/${slideHash}/dzi.json`)
+        while (res.status === 503 && !disposed) {
+          const d = await res.json().catch(() => null)
+          setPreparing(d?.detail?.message || 'Preparing this slide for viewing…')
+          await new Promise(r => setTimeout(r, 2500))
+          if (disposed) return
+          res = await fetch(`${getApiBase()}/slides/${slideHash}/dzi.json`)
+        }
+        setPreparing(null)
+        if (!res.ok) {
+          // Surface the backend's reason (e.g. an unreadable TIFF) rather than
+          // just the status code — it's the only clue the user gets.
+          const detail = await res.json().then(d => d?.detail).catch(() => null)
+          throw new Error(typeof detail === 'string' ? detail : `DZI manifest HTTP ${res.status}`)
+        }
         const dzi = await res.json()
         const width = parseInt(dzi.Image.Size.Width, 10)
         const height = parseInt(dzi.Image.Size.Height, 10)
@@ -334,11 +352,24 @@ export function SlideViewerOSD({ slideHash, slideName, overlays: initialOverlays
           </div>
         )}
 
+        {preparing && !error && (
+          <div className="absolute inset-0 flex items-center justify-center bg-black/60 z-20">
+            <div className="flex items-center gap-3 rounded-lg bg-black/70 px-5 py-4 text-white max-w-lg">
+              <Loader2 className="h-5 w-5 shrink-0 animate-spin" />
+              <div>
+                <p className="text-sm font-medium">Preparing this slide</p>
+                <p className="text-xs text-white/70 break-words">{preparing}</p>
+                <p className="mt-1 text-xs text-white/50">One-time conversion — it opens instantly next time.</p>
+              </div>
+            </div>
+          </div>
+        )}
+
         {error && (
           <div className="absolute inset-0 flex items-center justify-center">
-            <div className="bg-red-500/20 border border-red-500 text-red-200 px-4 py-3 rounded-lg">
+            <div className="bg-red-500/20 border border-red-500 text-red-200 px-4 py-3 rounded-lg max-w-lg">
               <p className="font-semibold">Error</p>
-              <p className="text-sm">{error}</p>
+              <p className="text-sm break-words">{error}</p>
             </div>
           </div>
         )}

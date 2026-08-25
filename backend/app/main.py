@@ -24,6 +24,7 @@ from sqlalchemy import text as sa_text, func, or_
 from .config import settings
 from .db import init_db, get_db, get_session, Case, Slide, Tag, Project, Cohort, CohortFlag, CohortPatient, CohortPatientCase, CohortPlaceholder, Analysis, AnalysisJob, JobSlide, SlideQC, RequestSheet, RequestRow, RequestStatus, Study, StudyGroup, init_lock, get_lock, Patient, ExternalMapping, generate_slidecap_id
 from .services import SlideHasher, SlideIndexer, ClusterService, JobStatusPoller
+from .services import tiff_pyramid
 from .auth import AuthMiddleware, create_challenge, verify_challenge, create_token, verify_token, cleanup_expired_challenges
 from . import demo as demo_mod
 
@@ -1146,42 +1147,151 @@ TILE_CACHE_VERSION = "v3"  # bump to invalidate the on-disk tile cache
 #     changed from 510 (with overlap) to 256 (without). v2 cache is
 #     incompatible — left in place but ignored by the v3 path.
 
-def _get_ts(slide_hash: str):
+# Sources tried in order when opening a slide. `tiff` first because it's the
+# only true native-JPEG passthrough; the rest re-encode but between them cover
+# formats tifffile/openslide reject — notably plain (non-pyramidal or striped)
+# TIFFs exported from QuPath/ImageJ, which neither of the first two will open.
+# Sources that aren't installed simply raise and are skipped.
+TILE_SOURCE_ORDER = ("tiff", "openslide", "vips", "gdal", "bioformats", "pil")
+
+
+def _pyramid_cache_path(slide_hash: str) -> Path:
+    """Where a converted pyramidal copy of a plain TIFF lives."""
+    return settings.local_data_path / "pyramid-cache" / f"{slide_hash}.tif"
+
+
+# slide_hash -> {state: converting|ready|error, message, filename}. In-process
+# only: a restart re-checks the cache file on disk, which is the real record.
+_pyramid_jobs: dict[str, dict] = {}
+_pyramid_lock = threading.Lock()
+# One conversion at a time: each one holds a full-resolution image in memory,
+# so a library view full of plain TIFFs must not start them all at once.
+_pyramid_slot = threading.Semaphore(1)
+
+
+def _start_pyramid_conversion(slide_hash: str, filepath: Path) -> dict:
+    """
+    Kick off (or join) a background conversion of a plain TIFF into a tiled
+    pyramidal one under the local pyramid cache. Returns the job state.
+
+    Runs in a thread because a big TIFF takes minutes; the DZI endpoint returns
+    503 while it's going so the viewer can show progress instead of hanging.
+    """
+    with _pyramid_lock:
+        job = _pyramid_jobs.get(slide_hash)
+        if job and job["state"] == "converting":
+            return job
+        job = {
+            "state": "converting",
+            "message": f"Preparing {filepath.name} for viewing (one-time conversion)…",
+            "filename": filepath.name,
+        }
+        _pyramid_jobs[slide_hash] = job
+
+    def _run():
+        dst = _pyramid_cache_path(slide_hash)
+        if not _pyramid_slot.acquire(blocking=False):
+            job.update(message=f"Waiting to convert {filepath.name} (another conversion is running)…")
+            _pyramid_slot.acquire()
+        try:
+            info = tiff_pyramid.convert(
+                filepath, dst,
+                progress=lambda m: job.update(
+                    message=f"Preparing {filepath.name} for viewing — {m}"
+                ),
+            )
+            job.update(state="ready", message=f"Ready ({info['levels']} levels, {info['compression']})")
+            # Drop any cached failure state so the next request opens the new file.
+            _ts_cache.pop(slide_hash, None)
+            _md_cache.pop(slide_hash, None)
+            print(f"[pyramid] {filepath.name}: converted -> {dst.name} "
+                  f"({info['output_size_bytes'] / 1024 / 1024:.0f} MB, {info['levels']} levels)")
+        except Exception as e:
+            job.update(state="error", message=f"{type(e).__name__}: {e}")
+            print(f"[pyramid] FAILED {filepath}: {type(e).__name__}: {e}")
+        finally:
+            _pyramid_slot.release()
+
+    threading.Thread(target=_run, name=f"pyramid-{slide_hash[:8]}", daemon=True).start()
+    return job
+
+
+def _get_ts(slide_hash: str, allow_convert: bool = True):
     """
     Get or create a large_image TileSource for a slide.
 
     Prefers the ``tiff`` source (true native-JPEG passthrough — bytes go
-    SVS → HTTP unchanged, no decode/encode). Falls back to ``openslide``
-    if tifffile can't open the file (rare formats, non-standard SVS, etc.).
-    Either way it's substantially faster than the openslide.DeepZoomGenerator
-    + PIL re-encode pipeline we used to run.
+    SVS → HTTP unchanged, no decode/encode), then walks TILE_SOURCE_ORDER,
+    then lets large_image auto-detect. Only `tiff` avoids re-encoding; the
+    rest are correctness fallbacks for formats it can't read.
+
+    Plain TIFFs (striped and/or single-resolution — what QuPath and ImageJ
+    export) can't be tiled by any source. Those get converted once into a
+    pyramidal copy in the local cache; while that runs we return 503 so the
+    viewer can show "preparing" rather than a dead error.
     """
     cached = _ts_cache.get(slide_hash)
     if cached is not None:
         return cached
 
-    filepath = indexer.get_filepath(slide_hash)
-    if not filepath or not filepath.exists():
+    original = indexer.get_filepath(slide_hash)
+    if not original or not original.exists():
         raise HTTPException(status_code=404, detail="Slide file not found")
+
+    # Serve a previously converted pyramid instead of re-failing on the original.
+    pyramid = _pyramid_cache_path(slide_hash)
+    filepath = pyramid if pyramid.exists() else original
 
     # Crucial: pass `encoding='JPEG'` BUT NOT `jpegQuality`. Setting a
     # quality forces re-encoding (~30 ms/tile); omitting it lets large_image
-    # ship the SVS's native JPEG bytes unchanged (~0 ms/tile). The
-    # openslide fallback does want jpegQuality since it has to re-encode
-    # from RGBA anyway; we set it post-open so it only applies there.
-    last_err: Exception | None = None
-    for source in ("tiff", "openslide"):
+    # ship the SVS's native JPEG bytes unchanged (~0 ms/tile). Every other
+    # source has to re-encode anyway, so those do want a quality — set
+    # post-open so it only applies there.
+    errors: list[str] = []
+    for source in TILE_SOURCE_ORDER:
         try:
             ts = large_image.open(str(filepath), sourceName=source, encoding="JPEG")
-            if source == "openslide":
-                # Re-encoding fallback path benefits from quality control.
-                ts._jpegQuality = TILE_JPEG_QUALITY
-            _ts_cache[slide_hash] = ts
-            return ts
         except Exception as e:
-            last_err = e
+            errors.append(f"{source}: {type(e).__name__}: {e}")
             continue
-    raise HTTPException(status_code=500, detail=f"Failed to open slide via large_image: {last_err}")
+        if source != "tiff":
+            ts._jpegQuality = TILE_JPEG_QUALITY
+        if source != TILE_SOURCE_ORDER[0]:
+            print(f"[tile-source] {filepath.name}: opened with '{source}' "
+                  f"(tiff source unavailable: {errors[0] if errors else 'n/a'})")
+        _ts_cache[slide_hash] = ts
+        return ts
+
+    # Last resort: let large_image pick from every source it has registered,
+    # including ones not in our list.
+    try:
+        ts = large_image.open(str(filepath), encoding="JPEG")
+        ts._jpegQuality = TILE_JPEG_QUALITY
+        print(f"[tile-source] {filepath.name}: opened with auto-detected "
+              f"'{getattr(ts, 'name', type(ts).__name__)}'")
+        _ts_cache[slide_hash] = ts
+        return ts
+    except Exception as e:
+        errors.append(f"auto: {type(e).__name__}: {e}")
+
+    # Nothing could read it. If it's a plain TIFF we can fix that ourselves —
+    # but only when the user actually opened the slide (allow_convert), never
+    # off the back of a thumbnail in a grid of many.
+    if allow_convert and tiff_pyramid.needs_pyramid(original):
+        job = _pyramid_jobs.get(slide_hash)
+        if job and job["state"] == "error":
+            raise HTTPException(
+                status_code=500,
+                detail=f"Couldn't prepare {original.name} for viewing: {job['message']}",
+            )
+        job = _start_pyramid_conversion(slide_hash, original)
+        raise HTTPException(status_code=503, detail={"state": "converting", "message": job["message"]})
+
+    detail = f"Can't open {filepath.name} as a slide image. " + " | ".join(errors)
+    print(f"[tile-source] FAILED {filepath}:")
+    for line in errors:
+        print(f"  {line}")
+    raise HTTPException(status_code=500, detail=detail)
 
 
 def _dzi_max_level(width: int, height: int) -> int:
@@ -1202,7 +1312,15 @@ def _md_for(slide_hash: str) -> tuple[int, int, int, int, int]:
     if cached is not None:
         return cached
     ts = _get_ts(slide_hash)
-    md = ts.getMetadata()
+    try:
+        md = ts.getMetadata()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Opened the file but couldn't read its image metadata: {type(e).__name__}: {e}",
+        )
     w, h, levels = md["sizeX"], md["sizeY"], md["levels"]
     ts_sz = md.get("tileWidth") or TILE_SIZE
     out = (w, h, levels, ts_sz, _dzi_max_level(w, h))
@@ -1270,7 +1388,21 @@ def _get_and_cache_embedded_thumbnail(slide_hash: str, filepath: Path) -> bytes:
         return image_bytes
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to extract thumbnail: {e}")
+        # openslide can't read every format the viewer can (plain TIFFs, for
+        # one). Fall back to whichever large_image source opened it there, so
+        # a slide that's viewable always has a thumbnail too.
+        try:
+            ts = _get_ts(slide_hash, allow_convert=False)
+            image_bytes, _ = ts.getThumbnail(encoding='JPEG', width=1024, height=1024)
+            cache_file.write_bytes(image_bytes)
+            return image_bytes
+        except HTTPException:
+            raise
+        except Exception as e2:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to extract thumbnail: openslide: {e}; large_image: {e2}",
+            )
 
 
 @app.get("/slides/{slide_hash}/thumbnail.jpeg")
@@ -1370,7 +1502,10 @@ def get_slide_label(slide_hash: str, max_size: int = Query(256, le=512)):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get label: {e}")
+        # Formats openslide can't read (plain TIFFs) simply have no label —
+        # 404 so the viewer hides the corner image instead of erroring.
+        print(f"[label] {filepath.name}: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=404, detail="No label image available")
 
 
 # Slides we've kicked off a background warm for in this process. Stops us

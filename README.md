@@ -1,6 +1,6 @@
 # slidecap
 
-A desktop application for organizing and searching pathology slides with AI analysis capabilities.
+A desktop application for organizing and searching pathology slides with built-in analysis pipeline capabilities.
 
 ## Quick Start
 
