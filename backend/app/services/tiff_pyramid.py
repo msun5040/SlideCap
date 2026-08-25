@@ -22,6 +22,7 @@ tifffile handles deflate on its own.
 """
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -41,26 +42,55 @@ def jpeg_available() -> bool:
         return False
 
 
-def needs_pyramid(path: Path) -> bool:
+def pyramid_check(path: Path) -> tuple[bool, str]:
     """
-    True if this file is a TIFF the viewer can't serve as-is (not tiled, or
-    tiled but with no pyramid). False for scanner formats and for TIFFs that
-    are already fine — and False if we can't tell, so callers never convert
-    on a guess.
+    Decide whether converting this file would make it viewable.
+
+    Returns (should_convert, reason). The reason is always populated — it's
+    what the DZI endpoint reports when a file can't be opened AND can't be
+    converted, so "nothing happened" is never unexplained.
+
+    Returns False whenever we can't tell, so callers never convert on a guess.
     """
-    if path.suffix.lower() in NATIVE_EXTS or path.suffix.lower() not in ('.tif', '.tiff'):
-        return False
+    ext = path.suffix.lower()
+    if ext in NATIVE_EXTS:
+        return False, f"{ext} is a scanner format — converting it would only lose quality"
+    if ext not in ('.tif', '.tiff'):
+        return False, f"not a TIFF ({ext or 'no extension'}); only plain TIFFs can be converted"
+
     try:
         import tifffile
+    except ImportError:
+        return False, ("the 'tifffile' package isn't installed on this server, so plain TIFFs "
+                       "can't be converted — run: pip install tifffile")
+
+    try:
         with tifffile.TiffFile(str(path)) as tf:
             if tf.is_svs or tf.is_ndpi:
-                return False
+                return False, "already a scanner-format TIFF"
             page = tf.pages[0]
-            if not page.is_tiled:
-                return True
-            return len(tf.series[0].levels) < 2
-    except Exception:
-        return False
+            tiled = bool(page.is_tiled)
+            try:
+                nlevels = len(tf.series[0].levels)
+            except Exception:
+                nlevels = 1
+            if not tiled:
+                return True, "plain (untiled) TIFF — converting"
+            if nlevels < 2:
+                return True, "tiled but single-resolution TIFF — converting"
+            return False, (
+                f"already tiled with {nlevels} pyramid levels "
+                f"(compression={page.compression!r}, {page.imagewidth}x{page.imagelength}) — "
+                "converting wouldn't help; the file's compression or layout is what the "
+                "tile sources are rejecting"
+            )
+    except Exception as e:
+        return False, f"tifffile couldn't read it either ({type(e).__name__}: {e}) — the file may be corrupt"
+
+
+def needs_pyramid(path: Path) -> bool:
+    """True if converting this file would make it viewable. See pyramid_check."""
+    return pyramid_check(path)[0]
 
 
 def convert(
@@ -68,7 +98,7 @@ def convert(
     dst: Path,
     tile: int = TILE,
     quality: int = JPEG_QUALITY,
-    progress: Optional[Callable[[str], None]] = None,
+    progress: Optional[Callable[[str, Optional[float]], None]] = None,
 ) -> dict:
     """
     Write a pyramidal tiled TIFF of `src` to `dst`. Returns a summary dict.
@@ -84,14 +114,16 @@ def convert(
     import tifffile
     from PIL import Image
 
-    say = progress or (lambda _m: None)
+    # progress(message, fraction) — fraction is 0..1, or None when unknown.
+    say = progress or (lambda _m, _f=None: None)
 
+    say("reading source image", 0.0)
     try:
         arr = tifffile.memmap(str(src))
-        say(f"memory-mapped {src.name} (uncompressed source)")
+        say("memory-mapped (uncompressed source)", 0.05)
     except Exception:
         arr = tifffile.imread(str(src))
-        say(f"decoded {src.name} into memory")
+        say("decoded source into memory", 0.05)
 
     # Normalize to something a tiled RGB/grayscale TIFF can hold.
     if arr.ndim == 3 and arr.shape[2] == 4:
@@ -104,7 +136,7 @@ def convert(
         # The viewer serves 8-bit JPEG regardless; scale rather than clip so a
         # 16-bit scan doesn't come out black.
         peak = float(arr.max()) or 1.0
-        say(f"scaling {arr.dtype} -> uint8 (peak {peak:.0f})")
+        say(f"scaling {arr.dtype} -> uint8", 0.08)
         arr = (arr.astype('float32') / peak * 255).astype('uint8')
 
     photometric = 'rgb' if arr.ndim == 3 else 'minisblack'
@@ -113,20 +145,52 @@ def convert(
         comp, comp_args = 'jpeg', {'level': quality}
     else:
         comp, comp_args = 'deflate', {'level': 6}
-    say(f"compression: {comp}" + ("" if use_jpeg else " (install imagecodecs for smaller JPEG output)"))
-
     h0, w0 = arr.shape[:2]
+    # Levels are written until the largest side fits in one tile — known up
+    # front, so the UI gets a real percentage rather than a spinner.
+    total_levels = 1 if max(h0, w0) <= tile else math.ceil(math.log2(max(h0, w0) / tile)) + 1
+    say(f"writing {total_levels} levels ({comp})", 0.1)
     partial = dst.with_suffix(dst.suffix + '.partial')
     dst.parent.mkdir(parents=True, exist_ok=True)
+
+    # Each level has a quarter the pixels of the one before, so level 1 alone is
+    # ~75% of the work. Weight progress by pixels, or the bar sits at 10% for
+    # most of the conversion and then leaps to done. Capped below 100 so it
+    # never reads as finished while the last levels are still being written.
+    total_work = sum(0.25 ** k for k in range(total_levels))
+    done_work = 0.0
 
     levels = 0
     with tifffile.TiffWriter(str(partial), bigtiff=True) as tw:
         level = arr
         while True:
             h, w = level.shape[:2]
-            say(f"level {levels}: {w}x{h}")
+            start = 0.1 + 0.9 * (done_work / total_work)
+
+            say(f"level {levels + 1} of {total_levels} ({w}x{h})", min(0.97, start))
+
+            def tile_rows(a=level):
+                """
+                Yield the level's tiles in row-major order. Feeding tifffile a
+                generator instead of the whole array keeps a memory-mapped
+                source lazy — tiles are read as they're consumed. tifffile pads
+                partial edge tiles itself.
+
+                Progress is reported per level, not per row: tifffile compresses
+                on a thread pool and drains this generator almost instantly, so
+                per-row reporting would race to ~76% and then sit there. Coarse
+                and true beats smooth and wrong; the UI shows elapsed time so a
+                long level still reads as "working".
+                """
+                H, W = a.shape[:2]
+                for y in range(0, H, tile):
+                    for x in range(0, W, tile):
+                        yield a[y:y + tile, x:x + tile]
+
             tw.write(
-                level,
+                tile_rows(),
+                shape=level.shape,
+                dtype=level.dtype,
                 tile=(tile, tile),
                 photometric=photometric,
                 compression=comp,
@@ -135,6 +199,7 @@ def convert(
                 # openslide's generic-tiff driver recognizes a pyramid.
                 subfiletype=1 if levels else 0,
             )
+            done_work += 0.25 ** levels
             levels += 1
             if max(h, w) <= tile:
                 break
@@ -142,6 +207,7 @@ def convert(
                 Image.fromarray(level).resize((max(1, w // 2), max(1, h // 2)), Image.BILINEAR)
             )
 
+    say("done", 1.0)
     partial.replace(dst)
     return {
         "source": str(src),

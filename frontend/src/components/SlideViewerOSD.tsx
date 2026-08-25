@@ -101,6 +101,12 @@ interface SlideViewerOSDProps {
   onClose: () => void
 }
 
+function formatElapsed(seconds: number) {
+  const m = Math.floor(seconds / 60)
+  const sec = String(seconds % 60).padStart(2, '0')
+  return `${m}:${sec}`
+}
+
 export function SlideViewerOSD({ slideHash, slideName, overlays: initialOverlays = [], highlightPatch, onImageClick, embedded = false, onClose }: SlideViewerOSDProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const viewerRef = useRef<any>(null)
@@ -110,7 +116,9 @@ export function SlideViewerOSD({ slideHash, slideName, overlays: initialOverlays
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   // Set while the backend is converting a plain TIFF into a viewable pyramid.
-  const [preparing, setPreparing] = useState<string | null>(null)
+  const [preparing, setPreparing] = useState<
+    { message: string; percent: number; filename?: string; elapsed: number } | null
+  >(null)
   const [dimensions, setDimensions] = useState<{ width: number; height: number } | null>(null)
   const [overlays, setOverlays] = useState<OverlayRuntime[]>(
     initialOverlays.map(spec => ({ ...spec, visible: spec.visible ?? true, opacity: spec.opacity ?? 0.55 }))
@@ -127,12 +135,20 @@ export function SlideViewerOSD({ slideHash, slideName, overlays: initialOverlays
         // Fetch the DZI manifest with auth, parse, hand parsed tile source to OSD
         // A plain TIFF has to be converted to a pyramid before it can be
         // tiled; the backend answers 503 with progress while that runs, so
-        // poll rather than failing the open.
+        // poll it to completion rather than failing the open. 503 must never
+        // reach the error path below — it means "not yet", not "broken".
         let res = await fetch(`${getApiBase()}/slides/${slideHash}/dzi.json`)
-        while (res.status === 503 && !disposed) {
+        while (res.status === 503) {
+          if (disposed) return
           const d = await res.json().catch(() => null)
-          setPreparing(d?.detail?.message || 'Preparing this slide for viewing…')
-          await new Promise(r => setTimeout(r, 2500))
+          const info = d?.detail
+          setPreparing({
+            message: info?.message || 'converting to a viewable format…',
+            percent: typeof info?.percent === 'number' ? info.percent : 0,
+            filename: info?.filename,
+            elapsed: typeof info?.elapsed_seconds === 'number' ? info.elapsed_seconds : 0,
+          })
+          await new Promise(r => setTimeout(r, 1500))
           if (disposed) return
           res = await fetch(`${getApiBase()}/slides/${slideHash}/dzi.json`)
         }
@@ -353,14 +369,32 @@ export function SlideViewerOSD({ slideHash, slideName, overlays: initialOverlays
         )}
 
         {preparing && !error && (
-          <div className="absolute inset-0 flex items-center justify-center bg-black/60 z-20">
-            <div className="flex items-center gap-3 rounded-lg bg-black/70 px-5 py-4 text-white max-w-lg">
-              <Loader2 className="h-5 w-5 shrink-0 animate-spin" />
-              <div>
-                <p className="text-sm font-medium">Preparing this slide</p>
-                <p className="text-xs text-white/70 break-words">{preparing}</p>
-                <p className="mt-1 text-xs text-white/50">One-time conversion — it opens instantly next time.</p>
+          <div className="absolute inset-0 flex items-center justify-center bg-black/70 z-20">
+            <div className="w-[26rem] max-w-[90%] rounded-lg bg-neutral-900/90 border border-white/10 px-5 py-4 text-white">
+              <div className="flex items-center gap-2">
+                <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
+                <p className="text-sm font-medium">Preparing this slide for viewing</p>
               </div>
+              {preparing.filename && (
+                <p className="mt-1 truncate text-xs text-white/60" title={preparing.filename}>{preparing.filename}</p>
+              )}
+              <div className="mt-3 h-1.5 w-full overflow-hidden rounded-full bg-white/15">
+                {/* Percent advances a pyramid level at a time, so the fill is
+                    animated — a still bar on a long level reads as frozen. */}
+                <div
+                  className="h-full animate-pulse rounded-full bg-blue-400 transition-all duration-500"
+                  style={{ width: `${Math.max(3, Math.min(100, preparing.percent))}%` }}
+                />
+              </div>
+              <div className="mt-2 flex items-baseline justify-between gap-3">
+                <p className="text-xs text-white/70 break-words">{preparing.message}</p>
+                <p className="shrink-0 text-xs tabular-nums text-white/50">
+                  {Math.round(preparing.percent)}% · {formatElapsed(preparing.elapsed)}
+                </p>
+              </div>
+              <p className="mt-2 text-xs text-white/40">
+                Plain TIFFs are converted once into a tiled pyramid — this slide opens instantly next time.
+              </p>
             </div>
           </div>
         )}

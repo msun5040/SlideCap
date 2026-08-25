@@ -41,7 +41,7 @@ def convert_one(src: Path, out: Path | None, replace: bool, force: bool) -> bool
 
     dst = out or src.with_suffix('.pyramid.tif')
     print(f"\nconvert {src.name}  ({src.stat().st_size / 1024 / 1024:.0f} MB)")
-    info = tiff_pyramid.convert(src, dst, progress=lambda m: print(f"  {m}"))
+    info = tiff_pyramid.convert(src, dst, progress=lambda m, frac=None: print(f"  [{frac * 100:3.0f}%] {m}" if frac is not None else f"  {m}"))
     print(f"  wrote {dst.name}  ({info['output_size_bytes'] / 1024 / 1024:.0f} MB, "
           f"{info['levels']} levels, {info['compression']})")
 

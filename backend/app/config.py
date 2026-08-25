@@ -137,6 +137,24 @@ class Settings(BaseSettings):
         return Path(self.NETWORK_ROOT) / "slides" / "external"
 
     @property
+    def pyramid_path(self) -> Path:
+        """
+        Where converted pyramidal copies of plain TIFFs live.
+
+        On the network drive, NOT in local data: the cluster mounts this drive
+        (CLUSTER_NETWORK_MOUNT), so an analysis can symlink straight to the
+        converted file. A server-local copy would be invisible to the cluster
+        and would have to be re-transferred for every job. `.pyramids` sits
+        beside the year folders and is skipped by the indexer (not a year dir).
+        """
+        return Path(self.NETWORK_ROOT) / "slides" / ".pyramids"
+
+    @property
+    def local_pyramid_path(self) -> Path:
+        """Fallback pyramid store, used when the network drive isn't writable."""
+        return self.local_data_path / "pyramid-cache"
+
+    @property
     def analyses_path(self) -> Path:
         return Path(self.NETWORK_ROOT) / "analyses"
 

@@ -15,6 +15,7 @@ import subprocess
 import zipfile
 import queue
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 from datetime import datetime
@@ -1156,8 +1157,48 @@ TILE_SOURCE_ORDER = ("tiff", "openslide", "vips", "gdal", "bioformats", "pil")
 
 
 def _pyramid_cache_path(slide_hash: str) -> Path:
-    """Where a converted pyramidal copy of a plain TIFF lives."""
-    return settings.local_data_path / "pyramid-cache" / f"{slide_hash}.tif"
+    """
+    Where a newly converted pyramidal copy of a plain TIFF should be written.
+
+    The network drive, so the cluster (which mounts it) can read the converted
+    file directly for analyses — see `settings.pyramid_path`. Falls back to
+    local storage only if the drive isn't writable, in which case analyses on
+    that slide have to transfer the file instead of symlinking it.
+    """
+    net = settings.pyramid_path
+    try:
+        net.mkdir(parents=True, exist_ok=True)
+        probe = net / ".writable"
+        probe.touch()
+        probe.unlink()
+        return net / f"{slide_hash}.tif"
+    except Exception as e:
+        print(f"[pyramid] {net} not writable ({e}); falling back to local cache")
+        return settings.local_pyramid_path / f"{slide_hash}.tif"
+
+
+def _find_pyramid(slide_hash: str) -> Optional[Path]:
+    """An existing converted pyramid for this slide, wherever it landed."""
+    for candidate in (settings.pyramid_path / f"{slide_hash}.tif",
+                      settings.local_pyramid_path / f"{slide_hash}.tif"):
+        try:
+            if candidate.exists():
+                return candidate
+        except Exception:
+            continue
+    return None
+
+
+def analysis_source_path(slide_hash: str, original: Path) -> Path:
+    """
+    The file an analysis should actually read for this slide.
+
+    Plain TIFFs are unreadable by openslide/tifffile-based tilers — which is
+    what the viewer hit, and what UNI and friends hit on the cluster. When a
+    converted pyramid exists, that's the real image; the original stays on disk
+    untouched as the source of record.
+    """
+    return _find_pyramid(slide_hash) or original
 
 
 # slide_hash -> {state: converting|ready|error, message, filename}. In-process
@@ -1169,13 +1210,114 @@ _pyramid_lock = threading.Lock()
 _pyramid_slot = threading.Semaphore(1)
 
 
+def prepare_job_sources(slides_to_process: list, job_id: int) -> tuple[list, dict[int, str]]:
+    """
+    Swap each job slide's local path for the file the cluster should actually
+    read, converting plain TIFFs on the way. Returns (updated_list, errors).
+
+    Runs inside the job's background thread, before transfer/symlink, so a
+    cohort of plain TIFFs "just works" instead of failing on the cluster. The
+    remote filename is left alone — only the *contents* change — so completion
+    detection and result mapping (which key off the slide stem) are unaffected.
+    """
+    updated, errors = [], {}
+    for js_id, slide_hash, local_path_str, remote_path in slides_to_process:
+        original = Path(local_path_str)
+        try:
+            resolved, err = ensure_analysis_source(slide_hash, original)
+        except Exception as e:
+            resolved, err = original, f"{original.name}: {type(e).__name__}: {e}"
+        if err:
+            errors[js_id] = err
+        if resolved != original:
+            print(f"[Job {job_id}] {original.name}: using pyramidal copy {resolved}")
+            _set_job_slide_status(js_id, "preparing")
+        updated.append((js_id, slide_hash, str(resolved), remote_path))
+    return updated, errors
+
+
+def _set_job_slide_status(js_id: int, status: str, error: Optional[str] = None) -> None:
+    """Update one JobSlide's status on its own short-lived session."""
+    db = get_session()
+    try:
+        js = db.query(JobSlide).filter_by(id=js_id).first()
+        if js:
+            js.status = status
+            if error:
+                js.error_message = error
+            db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
+def _convert_pyramid_blocking(slide_hash: str, filepath: Path) -> tuple[Optional[Path], Optional[str]]:
+    """
+    Convert a plain TIFF to a pyramid and return (path, error). Blocks until
+    done — call it from a background thread, never from a request handler.
+
+    Shared by the viewer (which wraps it in a thread and polls) and analysis
+    submission (which needs the converted file before it can ship anything to
+    the cluster). If a conversion for this slide is already running, waits for
+    it rather than doing the work twice.
+    """
+    while True:
+        with _pyramid_lock:
+            job = _pyramid_jobs.get(slide_hash)
+            running = bool(job and job["state"] == "converting")
+        if not running:
+            break
+        time.sleep(2)
+
+    existing = _find_pyramid(slide_hash)
+    if existing:
+        return existing, None
+
+    with _pyramid_lock:
+        job = {
+            "state": "converting",
+            "message": "starting one-time conversion…",
+            "percent": 0,
+            "filename": filepath.name,
+            "started_at": time.time(),
+        }
+        _pyramid_jobs[slide_hash] = job
+
+    dst = _pyramid_cache_path(slide_hash)
+    if not _pyramid_slot.acquire(blocking=False):
+        job.update(message="waiting — another slide is converting", percent=0)
+        _pyramid_slot.acquire()
+    try:
+        info = tiff_pyramid.convert(
+            filepath, dst,
+            progress=lambda m, frac=None: job.update(
+                message=m,
+                percent=round(frac * 100) if frac is not None else job.get("percent", 0),
+            ),
+        )
+        job.update(state="ready", percent=100,
+                   message=f"Ready ({info['levels']} levels, {info['compression']})")
+        # Drop any cached failure state so the next request opens the new file.
+        _ts_cache.pop(slide_hash, None)
+        _md_cache.pop(slide_hash, None)
+        print(f"[pyramid] {filepath.name}: converted -> {dst} "
+              f"({info['output_size_bytes'] / 1024 / 1024:.0f} MB, {info['levels']} levels)")
+        return dst, None
+    except Exception as e:
+        msg = f"{type(e).__name__}: {e}"
+        job.update(state="error", message=msg)
+        print(f"[pyramid] FAILED {filepath}: {msg}")
+        import traceback; traceback.print_exc()
+        return None, msg
+    finally:
+        _pyramid_slot.release()
+
+
 def _start_pyramid_conversion(slide_hash: str, filepath: Path) -> dict:
     """
-    Kick off (or join) a background conversion of a plain TIFF into a tiled
-    pyramidal one under the local pyramid cache. Returns the job state.
-
-    Runs in a thread because a big TIFF takes minutes; the DZI endpoint returns
-    503 while it's going so the viewer can show progress instead of hanging.
+    Kick off (or join) a background conversion of a plain TIFF. Returns the job
+    state so the DZI endpoint can report progress in its 503.
     """
     with _pyramid_lock:
         job = _pyramid_jobs.get(slide_hash)
@@ -1183,37 +1325,54 @@ def _start_pyramid_conversion(slide_hash: str, filepath: Path) -> dict:
             return job
         job = {
             "state": "converting",
-            "message": f"Preparing {filepath.name} for viewing (one-time conversion)…",
+            "message": "starting one-time conversion…",
+            "percent": 0,
             "filename": filepath.name,
+            "started_at": time.time(),
         }
         _pyramid_jobs[slide_hash] = job
 
-    def _run():
-        dst = _pyramid_cache_path(slide_hash)
-        if not _pyramid_slot.acquire(blocking=False):
-            job.update(message=f"Waiting to convert {filepath.name} (another conversion is running)…")
-            _pyramid_slot.acquire()
-        try:
-            info = tiff_pyramid.convert(
-                filepath, dst,
-                progress=lambda m: job.update(
-                    message=f"Preparing {filepath.name} for viewing — {m}"
-                ),
-            )
-            job.update(state="ready", message=f"Ready ({info['levels']} levels, {info['compression']})")
-            # Drop any cached failure state so the next request opens the new file.
-            _ts_cache.pop(slide_hash, None)
-            _md_cache.pop(slide_hash, None)
-            print(f"[pyramid] {filepath.name}: converted -> {dst.name} "
-                  f"({info['output_size_bytes'] / 1024 / 1024:.0f} MB, {info['levels']} levels)")
-        except Exception as e:
-            job.update(state="error", message=f"{type(e).__name__}: {e}")
-            print(f"[pyramid] FAILED {filepath}: {type(e).__name__}: {e}")
-        finally:
-            _pyramid_slot.release()
-
-    threading.Thread(target=_run, name=f"pyramid-{slide_hash[:8]}", daemon=True).start()
+    threading.Thread(
+        target=_convert_pyramid_blocking, args=(slide_hash, filepath),
+        name=f"pyramid-{slide_hash[:8]}", daemon=True,
+    ).start()
     return job
+
+
+def ensure_analysis_source(slide_hash: str, original: Path) -> tuple[Path, Optional[str]]:
+    """
+    The file an analysis should ship to the cluster, converting a plain TIFF
+    first if that's what it takes. Returns (path, error_or_None).
+
+    Blocking — background threads only.
+    """
+    existing = _find_pyramid(slide_hash)
+    if existing:
+        # A pyramid built before the store moved (or while the drive was
+        # unwritable) sits in local storage, which the cluster can't see.
+        # Copy it across rather than converting the whole thing again.
+        if not str(existing).startswith(str(settings.NETWORK_ROOT)):
+            target = _pyramid_cache_path(slide_hash)
+            if str(target).startswith(str(settings.NETWORK_ROOT)):
+                try:
+                    print(f"[pyramid] copying {existing.name} to the shared drive for cluster access")
+                    shutil.copy2(existing, target)
+                    return target, None
+                except Exception as e:
+                    print(f"[pyramid] copy to shared drive failed: {e}")
+        return existing, None
+
+    convertible, why = tiff_pyramid.pyramid_check(original)
+    if not convertible:
+        # Either it's already a format the cluster can read, or nothing we can
+        # do about it here — let the analysis fail with its own error.
+        return original, None
+
+    print(f"[pyramid] {original.name}: converting for analysis ({why})")
+    converted, err = _convert_pyramid_blocking(slide_hash, original)
+    if converted is None:
+        return original, f"{original.name}: {err}"
+    return converted, None
 
 
 def _get_ts(slide_hash: str, allow_convert: bool = True):
@@ -1239,8 +1398,7 @@ def _get_ts(slide_hash: str, allow_convert: bool = True):
         raise HTTPException(status_code=404, detail="Slide file not found")
 
     # Serve a previously converted pyramid instead of re-failing on the original.
-    pyramid = _pyramid_cache_path(slide_hash)
-    filepath = pyramid if pyramid.exists() else original
+    filepath = _find_pyramid(slide_hash) or original
 
     # Crucial: pass `encoding='JPEG'` BUT NOT `jpegQuality`. Setting a
     # quality forces re-encoding (~30 ms/tile); omitting it lets large_image
@@ -1277,7 +1435,8 @@ def _get_ts(slide_hash: str, allow_convert: bool = True):
     # Nothing could read it. If it's a plain TIFF we can fix that ourselves —
     # but only when the user actually opened the slide (allow_convert), never
     # off the back of a thumbnail in a grid of many.
-    if allow_convert and tiff_pyramid.needs_pyramid(original):
+    convertible, why = tiff_pyramid.pyramid_check(original)
+    if allow_convert and convertible:
         job = _pyramid_jobs.get(slide_hash)
         if job and job["state"] == "error":
             raise HTTPException(
@@ -1285,10 +1444,21 @@ def _get_ts(slide_hash: str, allow_convert: bool = True):
                 detail=f"Couldn't prepare {original.name} for viewing: {job['message']}",
             )
         job = _start_pyramid_conversion(slide_hash, original)
-        raise HTTPException(status_code=503, detail={"state": "converting", "message": job["message"]})
+        raise HTTPException(status_code=503, detail={
+            "state": "converting",
+            "message": job["message"],
+            "percent": job.get("percent", 0),
+            "filename": job.get("filename"),
+            # Percent moves a level at a time, so elapsed time is what tells the
+            # user a long level is still progressing rather than wedged.
+            "elapsed_seconds": round(time.time() - job.get("started_at", time.time())),
+        })
 
-    detail = f"Can't open {filepath.name} as a slide image. " + " | ".join(errors)
+    # Say why we didn't convert — otherwise this reads as "it just failed".
+    detail = (f"Can't open {filepath.name} as a slide image, and it wasn't auto-converted "
+              f"because {why}. Tile sources tried: " + " | ".join(errors))
     print(f"[tile-source] FAILED {filepath}:")
+    print(f"  no conversion: {why}")
     for line in errors:
         print(f"  {line}")
     raise HTTPException(status_code=500, detail=detail)
@@ -4440,9 +4610,14 @@ def submit_jobs(data: JobSubmitRequest, db: Session = Depends(get_db)):
     remote_output_batch_dir = f"{data.remote_output_dir}/{job_id}"
 
     def _run_submissions():
+        nonlocal slides_to_process
+        # Plain TIFFs can't be read by the analysis pipelines any more than by
+        # the viewer — convert them (once) before anything is shipped.
+        slides_to_process, prep_errors = prepare_job_sources(slides_to_process, job_id)
+
         n = len(slides_to_process)
         transfer_ok: list[int] = []
-        transfer_errors: dict[int, str] = {}
+        transfer_errors: dict[int, str] = dict(prep_errors)
 
         if direct_mount:
             # ── Direct mount: create symlinks on cluster instead of rsyncing ──
@@ -4452,12 +4627,26 @@ def submit_jobs(data: JobSubmitRequest, db: Session = Depends(get_db)):
                 # Create the batch WSI dir on the cluster
                 cluster_service.run_command(f"mkdir -p {remote_wsi_batch_dir}")
 
-                for js_id, _hash, local_path_str, _remote in slides_to_process:
+                for js_id, _hash, local_path_str, remote_path in slides_to_process:
+                    if js_id in transfer_errors:
+                        continue  # conversion failed for this slide
                     # Translate local server path to cluster mount path
+                    if not local_path_str.startswith(local_to_cluster_prefix[0]):
+                        # e.g. a pyramid that had to fall back to local storage:
+                        # the cluster can't see it, so a symlink would dangle.
+                        transfer_errors[js_id] = (
+                            f"{Path(local_path_str).name} is not on the shared drive "
+                            f"({local_to_cluster_prefix[0]}), so the cluster can't reach it"
+                        )
+                        continue
                     cluster_path = local_path_str.replace(
                         local_to_cluster_prefix[0], local_to_cluster_prefix[1]
                     )
-                    symlink_dest = f"{remote_wsi_batch_dir}/{Path(local_path_str).name}"
+                    # Name the link after the remote path we recorded, not the
+                    # local file: a converted pyramid is stored under the slide
+                    # hash, but the cluster must see the original filename so
+                    # done-glob matching and result mapping still line up.
+                    symlink_dest = remote_path or f"{remote_wsi_batch_dir}/{Path(local_path_str).name}"
 
                     # Create symlink on the cluster: batch_dir/slide.svs -> /ligonlab/.../slide.svs
                     _, stderr, rc = cluster_service.run_command(
@@ -4613,6 +4802,13 @@ def submit_jobs(data: JobSubmitRequest, db: Session = Depends(get_db)):
         """
         from concurrent.futures import as_completed
         from collections import defaultdict
+
+        nonlocal slides_to_process
+        # Same as the batch path: plain TIFFs get converted before transfer.
+        slides_to_process, prep_errors = prepare_job_sources(slides_to_process, job_id)
+        for _js_id, _msg in prep_errors.items():
+            _set_job_slide_status(_js_id, "failed", _msg)
+        slides_to_process = [t for t in slides_to_process if t[0] not in prep_errors]
 
         n = len(slides_to_process)
 
@@ -5281,7 +5477,10 @@ def retry_job(job_id: int, db: Session = Depends(get_db)):
         if not local_path:
             skipped.append(slide_hash[:12])
             continue
-        slides_to_process.append((js.id, slide_hash, str(local_path), js.remote_wsi_path or ""))
+        # Resolve to the pyramidal copy when one exists (see prepare_job_sources);
+        # a retry must ship the same file a fresh submit would.
+        slides_to_process.append((js.id, slide_hash, str(analysis_source_path(slide_hash, local_path)),
+                                  js.remote_wsi_path or ""))
 
     if not slides_to_process:
         raise HTTPException(status_code=400, detail="No local files found for failed slides")
@@ -5316,6 +5515,14 @@ def retry_job(job_id: int, db: Session = Depends(get_db)):
     remote_output_batch_dir = f"{job.remote_output_dir}/{job_id}"
 
     def _run_retry():
+        nonlocal slides_to_process
+        # A retry may be the first time this slide needs converting (e.g. the
+        # original submit failed before the pyramid existed).
+        slides_to_process, prep_errors = prepare_job_sources(slides_to_process, job_id)
+        for _js_id, _msg in prep_errors.items():
+            _set_job_slide_status(_js_id, "failed", _msg)
+        slides_to_process = [t for t in slides_to_process if t[0] not in prep_errors]
+
         n = len(slides_to_process)
 
         # Mark all as transferring upfront
