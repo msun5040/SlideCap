@@ -808,6 +808,44 @@ class ExternalSlideCreate(BaseModel):
     source: Optional[str] = None   # outside hospital / origin — stored as a tag
 
 
+def _resolve_external_file(filename: str) -> tuple[str, str]:
+    """
+    Map a user-supplied external filename to (relative_path, slide_hash).
+
+    Accepts either a folder-relative path ("GBM-project/slide1.svs", what the
+    picker sends) or a bare filename (older CSVs). A bare name is matched
+    against the external/ listing; if it exists in more than one folder we
+    can't tell which one is meant, so ask for the full path instead.
+    """
+    raw = (filename or '').strip().replace('\\', '/').lstrip('/')
+    while raw.startswith('./'):
+        raw = raw[2:]
+    if not raw:
+        raise HTTPException(status_code=400, detail="filename is required")
+    if '..' in raw.split('/'):
+        raise HTTPException(status_code=400, detail="filename must stay inside external/")
+
+    files = indexer.list_external_files() if indexer else []
+    for f in files:
+        if f["relative_path"] == raw:
+            return raw, f["slide_hash"]
+
+    if '/' not in raw:
+        matches = [f for f in files if f["filename"] == raw]
+        if len(matches) == 1:
+            return matches[0]["relative_path"], matches[0]["slide_hash"]
+        if len(matches) > 1:
+            folders = ", ".join(m["folder"] or "(root)" for m in matches)
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{raw}' exists in multiple folders ({folders}) — use the full path, e.g. {matches[0]['relative_path']}",
+            )
+
+    # Not on disk (yet) — register against the path as given so a later scan
+    # picks it up. Matches the previous permissive behaviour.
+    return raw, indexer.hasher.hash_slide_stem(SlideIndexer.external_key(raw))
+
+
 def _register_external_slide(db: Session, data: ExternalSlideCreate) -> Slide:
     """Create/update an external Slide backed by a synthetic Case keyed on name."""
     if not data.name.strip():
@@ -825,8 +863,7 @@ def _register_external_slide(db: Session, data: ExternalSlideCreate) -> Slide:
         db.add(case)
         db.flush()
 
-    stem = Path(data.filename).stem
-    slide_hash = indexer.hasher.hash_slide_stem(stem)
+    _rel_path, slide_hash = _resolve_external_file(data.filename)
     fp = indexer.get_filepath(slide_hash)
     size = fp.stat().st_size if fp and fp.exists() else None
 
@@ -866,7 +903,12 @@ def list_unregistered_external(db: Session = Depends(get_db)):
         raise HTTPException(status_code=503, detail="Indexer not initialized")
     files = indexer.list_external_files()
     known = {h for (h,) in db.query(Slide.slide_hash).filter(Slide.is_external == True).all()}  # noqa: E712
-    return [f for f in files if f["slide_hash"] not in known]
+    # A file registered before folder-aware hashing is stored under its bare
+    # stem — hide it too, so registered slides never reappear in the picker.
+    return [
+        f for f in files
+        if f["slide_hash"] not in known and f["legacy_slide_hash"] not in known
+    ]
 
 
 @app.post("/external/slides")

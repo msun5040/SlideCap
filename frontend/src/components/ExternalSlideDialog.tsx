@@ -1,20 +1,29 @@
-import { useState, useEffect } from 'react'
-import { Loader2, FileUp } from 'lucide-react'
+import { useState, useEffect, useMemo } from 'react'
+import { Loader2, FileUp, ChevronDown, ChevronRight, Folder, FileImage, Check, Search } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription,
 } from '@/components/ui/dialog'
-import {
-  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
-} from '@/components/ui/select'
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { getApiBase } from '@/api'
 
 interface ExternalFile {
   filename: string
+  relative_path: string   // path within external/, e.g. "GBM-project/slide1.svs"
+  folder: string          // '' for files sitting directly in external/
   stem: string
   slide_hash: string
   file_size_bytes: number
+}
+
+const ROOT_LABEL = 'external/ (top level)'
+
+function formatSize(bytes: number) {
+  if (!bytes) return ''
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(0)} MB`
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`
 }
 
 interface Props {
@@ -33,8 +42,11 @@ export function ExternalSlideDialog({ open, onClose, onRegistered }: Props) {
   const [loading, setLoading] = useState(false)
   const [msg, setMsg] = useState<string | null>(null)
 
-  // single-register form
+  // single-register form — `filename` is the path relative to external/
   const [filename, setFilename] = useState('')
+  const [pickerOpen, setPickerOpen] = useState(false)
+  const [fileQuery, setFileQuery] = useState('')
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
   const [name, setName] = useState('')
   const [block, setBlock] = useState('')
   const [stain, setStain] = useState('')
@@ -55,7 +67,36 @@ export function ExternalSlideDialog({ open, onClose, onRegistered }: Props) {
     } catch (e) { console.error(e) } finally { setLoading(false) }
   }
 
-  useEffect(() => { if (open) { loadFiles(); setMsg(null) } }, [open])
+  useEffect(() => { if (open) { loadFiles(); setMsg(null); setFileQuery(''); setCollapsed(new Set()) } }, [open])
+
+  // Unregistered files grouped by their folder inside external/. Root-level
+  // files come first, then folders alphabetically.
+  const grouped = useMemo(() => {
+    const q = fileQuery.trim().toLowerCase()
+    const shown = q ? files.filter(f => f.relative_path.toLowerCase().includes(q)) : files
+    const map = new Map<string, ExternalFile[]>()
+    for (const f of shown) {
+      const key = f.folder || ''
+      if (!map.has(key)) map.set(key, [])
+      map.get(key)!.push(f)
+    }
+    return [...map.entries()].sort(([a], [b]) => (a === '' ? -1 : b === '' ? 1 : a.localeCompare(b)))
+  }, [files, fileQuery])
+
+  const toggleFolder = (folder: string) => {
+    setCollapsed(prev => {
+      const next = new Set(prev)
+      next.has(folder) ? next.delete(folder) : next.add(folder)
+      return next
+    })
+  }
+
+  const pickFile = (f: ExternalFile) => {
+    setFilename(f.relative_path)
+    setPickerOpen(false)
+    // Pre-fill the name from the filename stem if the user hasn't typed one.
+    if (!name.trim()) setName(f.filename.replace(/\.[^.]+$/, ''))
+  }
 
   const registerOne = async () => {
     if (!filename || !name.trim()) { setMsg('Pick a file and enter a name.'); return }
@@ -125,7 +166,8 @@ export function ExternalSlideDialog({ open, onClose, onRegistered }: Props) {
           <DialogTitle>External (non-clinical) slides</DialogTitle>
           <DialogDescription>
             Register outside-hospital scans (no accession). Files placed in the network drive's
-            <code className="mx-1 text-[11px] bg-muted px-1 rounded">slides/external/</code> folder appear below.
+            <code className="mx-1 text-[11px] bg-muted px-1 rounded">slides/external/</code> folder appear below,
+            including any subfolders you organize them into (one per project, say).
           </DialogDescription>
         </DialogHeader>
 
@@ -136,20 +178,91 @@ export function ExternalSlideDialog({ open, onClose, onRegistered }: Props) {
           <div className="text-sm font-medium">Register a file</div>
           <div className="flex items-center gap-2 text-sm">
             <span className="text-muted-foreground w-20">File</span>
-            <Select value={filename} onValueChange={setFilename}>
-              <SelectTrigger className="flex-1">
-                <SelectValue placeholder={loading ? 'Loading…' : files.length ? 'Choose an unregistered file…' : 'No unregistered files'} />
-              </SelectTrigger>
-              <SelectContent>
-                {files.map(f => <SelectItem key={f.slide_hash} value={f.filename}>{f.filename}</SelectItem>)}
-              </SelectContent>
-            </Select>
+            <Popover open={pickerOpen} onOpenChange={setPickerOpen}>
+              <PopoverTrigger asChild>
+                <Button variant="outline" className="flex-1 justify-between font-normal" disabled={loading}>
+                  {filename ? (
+                    <span className="truncate text-left">
+                      {filename.includes('/') && (
+                        <span className="text-muted-foreground">{filename.slice(0, filename.lastIndexOf('/') + 1)}</span>
+                      )}
+                      {filename.slice(filename.lastIndexOf('/') + 1)}
+                    </span>
+                  ) : (
+                    <span className="text-muted-foreground">
+                      {loading ? 'Loading…' : files.length ? 'Choose an unregistered file…' : 'No unregistered files'}
+                    </span>
+                  )}
+                  <ChevronDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                </Button>
+              </PopoverTrigger>
+              <PopoverContent className="w-[480px] p-0" align="start">
+                <div className="flex items-center gap-2 border-b px-3 py-2">
+                  <Search className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                  <input
+                    autoFocus
+                    className="flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
+                    placeholder="Filter by file or folder…"
+                    value={fileQuery}
+                    onChange={e => setFileQuery(e.target.value)}
+                  />
+                  <span className="text-[11px] text-muted-foreground tabular-nums shrink-0">
+                    {grouped.reduce((n, [, fs]) => n + fs.length, 0)} unregistered
+                  </span>
+                </div>
+                <div className="max-h-72 overflow-auto py-1">
+                  {grouped.length === 0 && (
+                    <div className="px-3 py-6 text-center text-sm text-muted-foreground">
+                      {files.length ? 'No files match that filter.' : 'No unregistered files in external/.'}
+                    </div>
+                  )}
+                  {grouped.map(([folder, folderFiles]) => {
+                    const isCollapsed = collapsed.has(folder)
+                    return (
+                      <div key={folder || '__root__'}>
+                        <button
+                          type="button"
+                          onClick={() => toggleFolder(folder)}
+                          className="flex w-full items-center gap-1.5 px-2 py-1 text-left hover:bg-muted/60"
+                        >
+                          {isCollapsed
+                            ? <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                            : <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />}
+                          <Folder className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                          <span className="truncate text-xs font-medium" title={folder || ROOT_LABEL}>
+                            {folder || ROOT_LABEL}
+                          </span>
+                          <span className="ml-auto shrink-0 text-[11px] text-muted-foreground tabular-nums">
+                            {folderFiles.length}
+                          </span>
+                        </button>
+                        {!isCollapsed && folderFiles.map(f => (
+                          <button
+                            type="button"
+                            key={f.slide_hash}
+                            onClick={() => pickFile(f)}
+                            className="flex w-full items-center gap-1.5 py-1 pl-8 pr-2 text-left hover:bg-muted"
+                          >
+                            <FileImage className="h-3.5 w-3.5 shrink-0 text-blue-500" />
+                            <span className="truncate font-mono text-xs" title={f.relative_path}>{f.filename}</span>
+                            <span className="ml-auto shrink-0 text-[11px] text-muted-foreground tabular-nums">
+                              {formatSize(f.file_size_bytes)}
+                            </span>
+                            {filename === f.relative_path && <Check className="h-3.5 w-3.5 shrink-0 text-primary" />}
+                          </button>
+                        ))}
+                      </div>
+                    )
+                  })}
+                </div>
+              </PopoverContent>
+            </Popover>
           </div>
           <div className="grid grid-cols-2 gap-2">
             <Input placeholder="Name (required) — e.g. OSH-2024-001" value={name} onChange={e => setName(e.target.value)} />
             <Input placeholder="Source / hospital (optional)" value={source} onChange={e => setSource(e.target.value)} />
             <Input placeholder="Block (e.g. A1)" value={block} onChange={e => setBlock(e.target.value)} />
-            <Input placeholder="Stain (e.g. HE)" value={stain} onChange={e => setStain(e.target.value)} />
+            <Input placeholder="Stain (e.g. HNE)" value={stain} onChange={e => setStain(e.target.value)} />
             <Input placeholder="Slide # (optional)" value={slideNum} onChange={e => setSlideNum(e.target.value)} />
             <Input placeholder="Year (e.g. 2024)" value={year} onChange={e => setYear(e.target.value)} />
           </div>
@@ -163,10 +276,11 @@ export function ExternalSlideDialog({ open, onClose, onRegistered }: Props) {
           <div className="text-sm font-medium">Bulk import (CSV)</div>
           <p className="text-xs text-muted-foreground">
             Header row then one row per slide. Columns: <code className="text-[11px] bg-muted px-1 rounded">filename,name,block,stain,slide_number,year,source</code> (filename + name required).
+            For files in subfolders use the path relative to <code className="text-[11px] bg-muted px-1 rounded">external/</code>, e.g. <code className="text-[11px] bg-muted px-1 rounded">GBM-project/OSH001.svs</code>.
           </p>
           <textarea
             className="w-full rounded-md border bg-background px-3 py-2 text-sm font-mono min-h-[100px]"
-            placeholder={'filename,name,block,stain,year,source\nOSH001.svs,OSH-2024-001,A1,HE,2024,Mercy Hospital'}
+            placeholder={'filename,name,block,stain,year,source\nGBM-project/OSH001.svs,OSH-2024-001,A1,HNE,2024,Mercy Hospital'}
             value={csv}
             onChange={e => setCsv(e.target.value)}
           />

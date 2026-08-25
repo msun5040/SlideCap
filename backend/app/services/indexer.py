@@ -431,34 +431,80 @@ class SlideIndexer:
 
     EXTERNAL_EXTS = {'.svs', '.tif', '.tiff', '.ndpi', '.mrxs'}
 
+    @staticmethod
+    def external_key(rel_path) -> str:
+        """
+        Hash key for an external file, given its path relative to external/.
+
+        Folder-qualified ("projectA/slide1") so the same filename living in two
+        project folders stays two distinct slides. Files sitting directly in
+        external/ keep their bare stem, so hashes registered before folders
+        were supported are unchanged.
+        """
+        rel = Path(str(rel_path).replace('\\', '/'))
+        parent = rel.parent.as_posix()
+        return rel.stem if parent in ('.', '') else f"{parent}/{rel.stem}"
+
     def _scan_external_paths(self) -> int:
         """Add external-folder files to the path cache. Returns count added."""
         external_dir = self.root / 'external'
         if not external_dir.is_dir():
             return 0
         added = 0
-        for filepath in external_dir.rglob('*'):
+        # Sorted so the legacy bare-stem alias below always lands on the same
+        # file when two folders happen to hold the same filename.
+        for filepath in sorted(external_dir.rglob('*')):
             if not filepath.is_file() or filepath.suffix.lower() not in self.EXTERNAL_EXTS:
                 continue
-            slide_hash = self.hasher.hash_slide_stem(filepath.stem)
+            rel = filepath.relative_to(external_dir)
+            key = self.external_key(rel)
+            slide_hash = self.hasher.hash_slide_stem(key)
             if slide_hash not in self.slide_hash_to_path:
                 self.slide_hash_to_path[slide_hash] = filepath
                 added += 1
+            # Legacy alias: subfolder files used to be keyed on the bare stem.
+            # Keep those older hashes resolving to the same file.
+            if key != rel.stem:
+                self.slide_hash_to_path.setdefault(
+                    self.hasher.hash_slide_stem(rel.stem), filepath
+                )
         return added
 
     def list_external_files(self) -> list[dict]:
-        """List files in the external/ folder with their slide_hash (for registration)."""
+        """
+        List files in the external/ folder (recursively) with their slide_hash.
+
+        Each entry carries its folder-relative path so the registration UI can
+        show the folder structure and distinguish same-named files.
+        """
         external_dir = self.root / 'external'
         out: list[dict] = []
         if not external_dir.is_dir():
             return out
+        seen_stems: set[str] = set()
         for filepath in sorted(external_dir.rglob('*')):
             if not filepath.is_file() or filepath.suffix.lower() not in self.EXTERNAL_EXTS:
                 continue
+            rel = filepath.relative_to(external_dir)
+            folder = rel.parent.as_posix()
+            key = self.external_key(rel)
+            # Hash this file would have had before folders were supported, used
+            # to hide already-registered legacy slides from the picker. Only the
+            # first file with a given bare stem carries it — the same one
+            # _scan_external_paths aliases — so a duplicate filename in another
+            # folder isn't wrongly treated as registered.
+            legacy = None
+            if rel.stem not in seen_stems:
+                seen_stems.add(rel.stem)
+                if key != rel.stem:
+                    legacy = self.hasher.hash_slide_stem(rel.stem)
             out.append({
                 "filename": filepath.name,
-                "stem": filepath.stem,
-                "slide_hash": self.hasher.hash_slide_stem(filepath.stem),
+                "relative_path": rel.as_posix(),
+                "folder": "" if folder == "." else folder,
+                "stem": key,
+                "slide_hash": self.hasher.hash_slide_stem(key),
+                "legacy_slide_hash": legacy,
                 "file_size_bytes": filepath.stat().st_size,
             })
         return out
