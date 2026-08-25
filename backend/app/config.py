@@ -136,6 +136,11 @@ class Settings(BaseSettings):
         # Non-clinical / outside-hospital scans (no accession). Registered manually.
         return Path(self.NETWORK_ROOT) / "slides" / "external"
 
+    # Microns per pixel to stamp on converted pyramids whose source TIFF says
+    # nothing about resolution. Analyses like UNI refuse to run without MPP.
+    # Leave unset to convert without it (and get a warning in the log).
+    DEFAULT_MPP: Optional[float] = None
+
     @property
     def pyramid_path(self) -> Path:
         """

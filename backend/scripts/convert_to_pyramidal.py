@@ -25,23 +25,31 @@ from app.services import tiff_pyramid  # noqa: E402
 
 
 def verify(path: Path) -> str:
-    """Open the converted file the same way the viewer will."""
+    """Open the converted file the way the viewer and the analyses will."""
     import large_image
     from large_image.tilesource import loadTileSources
     loadTileSources()
     ts = large_image.open(str(path), encoding='JPEG')
     md = ts.getMetadata()
-    return f"{md['sizeX']}x{md['sizeY']}, {md['levels']} levels, tile {md.get('tileWidth')}"
+    out = f"{md['sizeX']}x{md['sizeY']}, {md['levels']} levels, tile {md.get('tileWidth')}"
+    try:
+        import openslide
+        mpp = openslide.open_slide(str(path)).properties.get('openslide.mpp-x')
+        out += f", openslide.mpp-x={mpp}" if mpp else ", NO MPP (UNI will refuse this file)"
+    except Exception:
+        pass
+    return out
 
 
-def convert_one(src: Path, out: Path | None, replace: bool, force: bool) -> bool:
+def convert_one(src: Path, out: Path | None, replace: bool, force: bool,
+                mpp: float | None = None) -> bool:
     if not force and not tiff_pyramid.needs_pyramid(src):
         print(f"skip  {src.name} (already tiled + pyramidal, or not a plain TIFF)")
         return False
 
     dst = out or src.with_suffix('.pyramid.tif')
     print(f"\nconvert {src.name}  ({src.stat().st_size / 1024 / 1024:.0f} MB)")
-    info = tiff_pyramid.convert(src, dst, progress=lambda m, frac=None: print(f"  [{frac * 100:3.0f}%] {m}" if frac is not None else f"  {m}"))
+    info = tiff_pyramid.convert(src, dst, mpp=mpp, progress=lambda m, frac=None: print(f"  [{frac * 100:3.0f}%] {m}" if frac is not None else f"  {m}"))
     print(f"  wrote {dst.name}  ({info['output_size_bytes'] / 1024 / 1024:.0f} MB, "
           f"{info['levels']} levels, {info['compression']})")
 
@@ -66,6 +74,9 @@ def main() -> int:
     ap.add_argument('--replace', action='store_true',
                     help='swap the converted file in for the original (original kept as *.orig.tif)')
     ap.add_argument('--force', action='store_true', help='convert even if it looks fine already')
+    ap.add_argument('--mpp', type=float, default=None,
+                    help='microns per pixel to stamp on the output; only needed when the source '
+                         'carries no resolution metadata (UNI and similar refuse files without MPP)')
     args = ap.parse_args()
 
     target = Path(args.path)
@@ -75,7 +86,7 @@ def main() -> int:
 
     if target.is_file():
         return 0 if convert_one(target, Path(args.output) if args.output else None,
-                                args.replace, args.force) else 1
+                                args.replace, args.force, args.mpp) else 1
 
     if args.output:
         print("-o only applies to a single file")
@@ -89,7 +100,7 @@ def main() -> int:
         return 0
 
     print(f"{len(files)} TIFF(s) under {target}")
-    converted = sum(convert_one(f, None, args.replace, args.force) for f in files)
+    converted = sum(convert_one(f, None, args.replace, args.force, args.mpp) for f in files)
     print(f"\nconverted {converted} of {len(files)}")
     return 0
 

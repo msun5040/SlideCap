@@ -42,6 +42,63 @@ def jpeg_available() -> bool:
         return False
 
 
+def read_mpp(path: Path) -> tuple[Optional[float], Optional[float]]:
+    """
+    Microns per pixel (x, y) for a TIFF, or (None, None) if it says nothing.
+
+    Analysis pipelines (UNI included) refuse to run without MPP — OpenSlide
+    only exposes `openslide.mpp-x` when the file carries resolution metadata,
+    so a converted pyramid has to preserve whatever the source knew. Checks the
+    standard TIFF resolution tags, then OME-XML, then ImageJ's metadata.
+    """
+    try:
+        import tifffile
+    except ImportError:
+        return None, None
+
+    def _rational(v):
+        if isinstance(v, tuple) and len(v) == 2 and v[1]:
+            return v[0] / v[1]
+        try:
+            return float(v)
+        except Exception:
+            return None
+
+    try:
+        with tifffile.TiffFile(str(path)) as tf:
+            page = tf.pages[0]
+            tags = page.tags
+
+            # 1. OME-XML physical pixel size (always in a real unit)
+            if tf.is_ome and tf.ome_metadata:
+                import re as _re
+                x = _re.search(r'PhysicalSizeX="([\d.eE+-]+)"', tf.ome_metadata)
+                y = _re.search(r'PhysicalSizeY="([\d.eE+-]+)"', tf.ome_metadata)
+                if x:
+                    return float(x.group(1)), float(y.group(1)) if y else float(x.group(1))
+
+            xres = _rational(tags['XResolution'].value) if 'XResolution' in tags else None
+            yres = _rational(tags['YResolution'].value) if 'YResolution' in tags else None
+            unit = int(tags['ResolutionUnit'].value) if 'ResolutionUnit' in tags else 1
+
+            # 2. ImageJ writes pixels-per-unit with ResolutionUnit=none and
+            #    names the unit in its own metadata block.
+            ij = getattr(tf, 'imagej_metadata', None) or {}
+            ij_unit = str(ij.get('unit', '')).lower()
+            if xres and unit == 1 and ij_unit in ('micron', 'microns', 'um', '\u00b5m'):
+                return 1.0 / xres, (1.0 / yres if yres else 1.0 / xres)
+
+            # 3. Standard TIFF resolution tags. unit 2 = inch, 3 = centimeter.
+            if xres and unit in (2, 3):
+                per_cm_x = xres / 2.54 if unit == 2 else xres
+                per_cm_y = (yres / 2.54 if unit == 2 else yres) if yres else per_cm_x
+                if per_cm_x > 0 and per_cm_y > 0:
+                    return 1e4 / per_cm_x, 1e4 / per_cm_y
+    except Exception:
+        pass
+    return None, None
+
+
 def pyramid_check(path: Path) -> tuple[bool, str]:
     """
     Decide whether converting this file would make it viewable.
@@ -98,6 +155,7 @@ def convert(
     dst: Path,
     tile: int = TILE,
     quality: int = JPEG_QUALITY,
+    mpp: Optional[float] = None,
     progress: Optional[Callable[[str, Optional[float]], None]] = None,
 ) -> dict:
     """
@@ -145,6 +203,15 @@ def convert(
         comp, comp_args = 'jpeg', {'level': quality}
     else:
         comp, comp_args = 'deflate', {'level': 6}
+    # Carry the source's microns-per-pixel into the copy, or OpenSlide reports
+    # no MPP and analyses like UNI abort ("Unable to extract MPP from slide
+    # metadata"). An explicit `mpp` argument wins; otherwise use the source's.
+    mpp_x, mpp_y = (mpp, mpp) if mpp else read_mpp(src)
+    if mpp_x:
+        say(f"microns per pixel: {mpp_x:.4g}", None)
+    else:
+        say("WARNING: source has no microns-per-pixel metadata", None)
+
     h0, w0 = arr.shape[:2]
     # Levels are written until the largest side fits in one tile — known up
     # front, so the UI gets a real percentage rather than a spinner.
@@ -187,6 +254,16 @@ def convert(
                     for x in range(0, W, tile):
                         yield a[y:y + tile, x:x + tile]
 
+            # Resolution is per level: each level covers the same tissue with
+            # half the pixels, so its pixels-per-cm halves too.
+            res_kwargs = {}
+            if mpp_x and mpp_y:
+                scale = 2 ** levels
+                res_kwargs = {
+                    "resolution": (1e4 / (mpp_x * scale), 1e4 / (mpp_y * scale)),
+                    "resolutionunit": "CENTIMETER",
+                }
+
             tw.write(
                 tile_rows(),
                 shape=level.shape,
@@ -195,6 +272,7 @@ def convert(
                 photometric=photometric,
                 compression=comp,
                 compressionargs=comp_args,
+                **res_kwargs,
                 # Levels after the first are reduced-resolution pages — how
                 # openslide's generic-tiff driver recognizes a pyramid.
                 subfiletype=1 if levels else 0,
@@ -217,5 +295,7 @@ def convert(
         "levels": levels,
         "tile_size": tile,
         "compression": comp,
+        "mpp_x": mpp_x,
+        "mpp_y": mpp_y,
         "output_size_bytes": dst.stat().st_size,
     }

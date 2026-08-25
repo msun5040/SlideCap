@@ -1291,6 +1291,7 @@ def _convert_pyramid_blocking(slide_hash: str, filepath: Path) -> tuple[Optional
     try:
         info = tiff_pyramid.convert(
             filepath, dst,
+            mpp=_mpp_for(filepath),
             progress=lambda m, frac=None: job.update(
                 message=m,
                 percent=round(frac * 100) if frac is not None else job.get("percent", 0),
@@ -1302,7 +1303,13 @@ def _convert_pyramid_blocking(slide_hash: str, filepath: Path) -> tuple[Optional
         _ts_cache.pop(slide_hash, None)
         _md_cache.pop(slide_hash, None)
         print(f"[pyramid] {filepath.name}: converted -> {dst} "
-              f"({info['output_size_bytes'] / 1024 / 1024:.0f} MB, {info['levels']} levels)")
+              f"({info['output_size_bytes'] / 1024 / 1024:.0f} MB, {info['levels']} levels, "
+              f"mpp={info.get('mpp_x')})")
+        if not info.get("mpp_x"):
+            print(f"[pyramid] WARNING: {filepath.name} has no microns-per-pixel metadata. "
+                  f"Analyses that need it (UNI: 'Unable to extract MPP from slide metadata') "
+                  f"will fail. Set DEFAULT_MPP in config, or convert with "
+                  f"scripts/convert_to_pyramidal.py --mpp <value>.")
         return dst, None
     except Exception as e:
         msg = f"{type(e).__name__}: {e}"
@@ -1339,6 +1346,25 @@ def _start_pyramid_conversion(slide_hash: str, filepath: Path) -> dict:
     return job
 
 
+def _mpp_for(original: Path) -> Optional[float]:
+    """
+    MPP to stamp on a conversion: the source's own if it has one, else the
+    configured DEFAULT_MPP. None means the file will have no MPP and
+    resolution-dependent analyses will refuse it.
+    """
+    src_mpp, _ = tiff_pyramid.read_mpp(original)
+    if src_mpp:
+        return None  # convert() reads it straight from the source
+    return settings.DEFAULT_MPP
+
+
+def _pyramid_missing_mpp(pyramid: Path, original: Path) -> bool:
+    """True if this pyramid has no MPP but we now know how to give it one."""
+    if tiff_pyramid.read_mpp(pyramid)[0]:
+        return False
+    return bool(tiff_pyramid.read_mpp(original)[0] or settings.DEFAULT_MPP)
+
+
 def ensure_analysis_source(slide_hash: str, original: Path) -> tuple[Path, Optional[str]]:
     """
     The file an analysis should ship to the cluster, converting a plain TIFF
@@ -1347,6 +1373,19 @@ def ensure_analysis_source(slide_hash: str, original: Path) -> tuple[Path, Optio
     Blocking — background threads only.
     """
     existing = _find_pyramid(slide_hash)
+    if existing and _pyramid_missing_mpp(existing, original):
+        # Built before MPP was carried through. UNI and friends abort with
+        # "Unable to extract MPP from slide metadata" on such a file, so
+        # rebuild it rather than shipping a copy that can't be analysed.
+        print(f"[pyramid] {existing.name}: no microns-per-pixel metadata — reconverting")
+        try:
+            existing.unlink()
+        except Exception as e:
+            print(f"[pyramid] couldn't remove stale pyramid {existing}: {e}")
+        _ts_cache.pop(slide_hash, None)
+        _md_cache.pop(slide_hash, None)
+        existing = None
+
     if existing:
         # A pyramid built before the store moved (or while the drive was
         # unwritable) sits in local storage, which the cluster can't see.

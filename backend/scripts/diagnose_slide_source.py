@@ -43,13 +43,27 @@ def describe_tiff(path: Path) -> None:
                 print("  ⚠ NO PYRAMID (single resolution level) — viewing will be slow even if it opens.")
     except Exception as e:
         print(f"  tifffile could not read it: {type(e).__name__}: {e}")
+        return
+
+    # MPP decides whether the analyses can use the file at all.
+    try:
+        from app.services.tiff_pyramid import read_mpp
+        mpp_x, mpp_y = read_mpp(path)
+        if mpp_x:
+            print(f"  microns per pixel: {mpp_x:.4g} x {mpp_y:.4g}")
+        else:
+            print("  ⚠ NO MPP metadata — UNI aborts with 'Unable to extract MPP from slide "
+                  "metadata'. Set DEFAULT_MPP in config, or convert with --mpp <value>.")
+    except Exception as e:
+        print(f"  could not read resolution metadata: {type(e).__name__}: {e}")
 
 
 def try_sources(path: Path) -> None:
     print("\n── large_image sources ──")
     try:
         import large_image
-        from large_image.tilesource import AvailableTileSources
+        from large_image.tilesource import AvailableTileSources, loadTileSources
+        loadTileSources()  # entry points load lazily; without this the list is empty
     except Exception as e:
         print(f"  large_image not installed: {e}")
         return
