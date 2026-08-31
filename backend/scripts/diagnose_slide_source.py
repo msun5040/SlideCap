@@ -54,8 +54,34 @@ def describe_tiff(path: Path) -> None:
         else:
             print("  ⚠ NO MPP metadata — UNI aborts with 'Unable to extract MPP from slide "
                   "metadata'. Set DEFAULT_MPP in config, or convert with --mpp <value>.")
+            _suggest_mpp(path)
     except Exception as e:
         print(f"  could not read resolution metadata: {type(e).__name__}: {e}")
+
+
+def _suggest_mpp(path: Path) -> None:
+    """
+    Print what physical area the image would cover at candidate MPP values.
+
+    A file with no resolution metadata can't tell us its scale, and neither can
+    Windows' "96 dpi" (that's the placeholder shown when the tag is absent, not
+    a measurement). But the person who acquired it knows roughly how much tissue
+    is in frame, so listing the field of view per candidate makes the right
+    value recognizable.
+    """
+    try:
+        import tifffile
+        with tifffile.TiffFile(str(path)) as tf:
+            page = tf.pages[0]
+            w, h = page.imagewidth, page.imagelength
+    except Exception:
+        return
+    print(f"\n    Which MPP? {w}x{h} px would cover:")
+    print(f"      {'MPP (um/px)':>12}   {'objective':<12} field of view")
+    for mpp, mag in ((0.25, '40x'), (0.5, '20x'), (1.0, '10x'), (2.0, '5x'), (4.0, '2.5x')):
+        print(f"      {mpp:>12}   {mag:<12} {w * mpp / 1000:.2f} x {h * mpp / 1000:.2f} mm")
+    print("    Pick the row matching how much tissue is actually in the image.")
+    print("    Camera on a microscope: MPP = camera pixel size (um) / objective magnification.")
 
 
 def try_sources(path: Path) -> None:

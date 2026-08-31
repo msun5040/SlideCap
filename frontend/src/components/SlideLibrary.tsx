@@ -41,6 +41,7 @@ import { useSortable } from '@/hooks/useSortable'
 
 import { getApiBase, normalizeAccession, isDemo } from '@/api'
 import { displaySlide } from '@/lib/display'
+import { saveBlob } from '@/lib/download'
 
 // Preset colors for tags
 const PRESET_COLORS = [
@@ -503,13 +504,7 @@ export function SlideLibrary() {
     try {
       const res = await fetch(`${getApiBase()}/jobs/${jobId}/download-zip`)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const blob = await res.blob()
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = `job_${jobId}_results.zip`
-      a.click()
-      URL.revokeObjectURL(url)
+      saveBlob(await res.blob(), `job_${jobId}_results.zip`)
     } catch (e) { console.error('Download failed:', e) }
     finally { setDownloadingJob(null) }
   }, [])

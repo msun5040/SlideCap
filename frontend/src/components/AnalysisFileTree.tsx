@@ -11,6 +11,7 @@ import {
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { getApiBase } from '@/api'
+import { saveBlob } from '@/lib/download'
 
 export interface FileTreeNode {
   name: string
@@ -88,13 +89,7 @@ export function AnalysisFileTree({ jobId, slideHash }: Props) {
     try {
       const res = await fetch(url)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const blob = await res.blob()
-      const objUrl = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = objUrl
-      a.download = filename
-      a.click()
-      URL.revokeObjectURL(objUrl)
+      saveBlob(await res.blob(), filename)
     } catch (e) {
       console.error('Download failed:', e)
     }

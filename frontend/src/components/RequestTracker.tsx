@@ -33,6 +33,7 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { toneFor } from '@/lib/status'
+import { saveBlob } from '@/lib/download'
 import {
   Dialog,
   DialogContent,
@@ -1240,13 +1241,7 @@ function SheetView({ sheetId, onBack }: { sheetId: number; onBack: () => void })
     try {
       const res = await fetch(`${getApiBase()}/request-sheets/${sheetId}/export.csv`)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const blob = await res.blob()
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = `request-sheet-${sheetId}.csv`
-      a.click()
-      URL.revokeObjectURL(url)
+      saveBlob(await res.blob(), `request-sheet-${sheetId}.csv`)
     } catch (e) {
       console.error('Export failed:', e)
     }

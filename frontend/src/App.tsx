@@ -45,6 +45,7 @@ import { ParserSettingsDialog } from '@/components/ParserSettingsDialog'
 import { LoadingSpinner } from '@/components/LoadingSpinner'
 import { setApiBase, getApiBase, getAuthToken, clearAuthToken, installAuthInterceptor, setAppMode, isDemo } from '@/api'
 import { SlideDetailsProvider } from '@/components/SlideDetailsContext'
+import { saveBlob } from '@/lib/download'
 
 interface SortStatus {
   running: boolean
@@ -234,13 +235,7 @@ export default function App() {
     try {
       const res = await fetch(`${getApiBase()}/export/slides.csv`)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const blob = await res.blob()
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = 'slides.csv'
-      a.click()
-      URL.revokeObjectURL(url)
+      saveBlob(await res.blob(), 'slides.csv')
       setMenuAction({ type: 'Export slides', status: 'done', message: 'Exported slides.csv' })
       setTimeout(() => setMenuAction(null), 3000)
     } catch (e: any) {

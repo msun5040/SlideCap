@@ -45,6 +45,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { getApiBase, normalizeAccession } from '@/api'
 import { copyToClipboard } from '@/lib/clipboard'
+import { saveBlob } from '@/lib/download'
 import { AnalysisFilePicker, type PickTarget } from '@/components/AnalysisFilePicker'
 import type { Slide, Cohort, CohortDetail, RequestSheet, RequestSheetDetail } from '@/types/slide'
 
@@ -600,17 +601,18 @@ export function SlidePull() {
   }
 
   const downloadPullList = () => {
-    const csv = generatePullList()
-    const blob = new Blob([csv], { type: 'text/csv' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `data-pull-${new Date().toISOString().slice(0, 10)}.csv`
-    a.click()
-    URL.revokeObjectURL(url)
+    const blob = new Blob([generatePullList()], { type: 'text/csv' })
+    saveBlob(blob, `data-pull-${new Date().toISOString().slice(0, 10)}.csv`)
   }
 
   // ── Unified export ────────────────────────────────────────────
+  // Export-to-directory runs *on the SlideCap host*, not in the browser. A
+  // relative (or client-local) path gets resolved against the server's working
+  // directory, so the pull silently lands on the server instead of the machine
+  // the user is sitting at. Require an absolute path and say where it points.
+  const isAbsoluteHostPath = (p: string) =>
+    p.startsWith('/') || /^[A-Za-z]:[\\/]/.test(p) || p.startsWith('\\\\')
+
   const openExportDialog = () => {
     setExportError('')
     setExportReport(null)
@@ -629,13 +631,7 @@ export function SlidePull() {
       const detail = await res.json().catch(() => null)
       throw new Error(detail?.detail || `Download failed (${res.status})`)
     }
-    const blob = await res.blob()
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = filename
-    a.click()
-    URL.revokeObjectURL(url)
+    saveBlob(await res.blob(), filename)
   }
 
   const runExport = async () => {
@@ -660,8 +656,19 @@ export function SlidePull() {
     setAnalysisReport(null)
     try {
       if (exportMode === 'directory') {
-        if (!exportDir.trim()) {
+        const dir = exportDir.trim()
+        if (!dir) {
           setExportError('Output directory is required.')
+          setExporting(false)
+          return
+        }
+        if (!isAbsoluteHostPath(dir)) {
+          setExportError(
+            `"${dir}" is not an absolute path. This export writes on the SlideCap server, ` +
+            'so a relative path would land somewhere unexpected under the server\'s working ' +
+            'directory. Enter a full path the server can reach (e.g. a share it has mounted), ' +
+            'or switch to Download ZIP to save the files to this computer.'
+          )
           setExporting(false)
           return
         }
@@ -671,7 +678,7 @@ export function SlidePull() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               slide_hashes: slideHashes,
-              output_dir: exportDir.trim(),
+              output_dir: dir,
               bin_size: Math.max(1, exportBinSize | 0),
               method: exportMethod,
               skip_existing: exportSkipExisting,
@@ -689,7 +696,7 @@ export function SlidePull() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               items: analysisItems,
-              output_dir: exportDir.trim(),
+              output_dir: dir,
               method: exportMethod,
               skip_existing: exportSkipExisting,
             }),
@@ -930,7 +937,7 @@ export function SlidePull() {
                   <div className="flex items-center gap-1.5 text-[13px] font-medium">
                     <FolderOutput className="h-3.5 w-3.5" />Hardlink to directory
                   </div>
-                  <p className="text-[11px] text-muted-foreground mt-0.5">Write into a folder on the network drive (no copy).</p>
+                  <p className="text-[11px] text-muted-foreground mt-0.5">Write into a folder <span className="font-medium">on the SlideCap server</span> (no copy).</p>
                 </button>
                 <button
                   type="button"
@@ -942,7 +949,7 @@ export function SlidePull() {
                   <div className="flex items-center gap-1.5 text-[13px] font-medium">
                     <Package className="h-3.5 w-3.5" />Download ZIP
                   </div>
-                  <p className="text-[11px] text-muted-foreground mt-0.5">Download the files to this computer.</p>
+                  <p className="text-[11px] text-muted-foreground mt-0.5">Download the files to <span className="font-medium">this computer</span>, through the browser.</p>
                 </button>
               </div>
 
@@ -1007,7 +1014,9 @@ export function SlidePull() {
                       disabled={exporting}
                     />
                     <p className="text-[11px] text-muted-foreground">
-                      Absolute path on the SlideCap host. Slides go into {exportBinSize}-slide <span className="font-mono">pull-NNN/</span> bins; analysis files into <span className="font-mono">analysis-files/&lt;case&gt;/</span>.
+                      Absolute path <span className="font-medium">on the SlideCap server</span> — not on this computer. A path
+                      only your machine can see (or a relative one) will land in the wrong place; use Download ZIP for a local copy.
+                      Slides go into {exportBinSize}-slide <span className="font-mono">pull-NNN/</span> bins; analysis files into <span className="font-mono">analysis-files/&lt;case&gt;/</span>.
                     </p>
                   </div>
                   <div className="grid grid-cols-2 gap-3">

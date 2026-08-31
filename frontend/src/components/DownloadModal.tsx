@@ -14,6 +14,7 @@ import {
 } from '@/components/ui/dialog'
 
 import { getApiBase } from '@/api'
+import { saveBlob } from '@/lib/download'
 
 interface SlideGroup {
   slide_hash: string
@@ -254,13 +255,7 @@ export function DownloadModal({ open, onOpenChange, slideHashes, jobId, postproc
         }),
       })
       if (res.ok) {
-        const blob = await res.blob()
-        const url = URL.createObjectURL(blob)
-        const a = document.createElement('a')
-        a.href = url
-        a.download = `job_${jobId}_bundle.zip`
-        a.click()
-        URL.revokeObjectURL(url)
+        saveBlob(await res.blob(), `job_${jobId}_bundle.zip`)
         onOpenChange(false)
       } else {
         const err = await res.json().catch(() => ({ detail: 'Download failed' }))

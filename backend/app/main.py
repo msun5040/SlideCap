@@ -1252,38 +1252,12 @@ def _set_job_slide_status(js_id: int, status: str, error: Optional[str] = None) 
         db.close()
 
 
-def _convert_pyramid_blocking(slide_hash: str, filepath: Path) -> tuple[Optional[Path], Optional[str]]:
+def _run_pyramid_conversion(slide_hash: str, filepath: Path,
+                            job: dict) -> tuple[Optional[Path], Optional[str]]:
     """
-    Convert a plain TIFF to a pyramid and return (path, error). Blocks until
-    done — call it from a background thread, never from a request handler.
-
-    Shared by the viewer (which wraps it in a thread and polls) and analysis
-    submission (which needs the converted file before it can ship anything to
-    the cluster). If a conversion for this slide is already running, waits for
-    it rather than doing the work twice.
+    Do the conversion. Assumes the caller has already registered `job` in
+    `_pyramid_jobs` as the in-flight conversion for this slide.
     """
-    while True:
-        with _pyramid_lock:
-            job = _pyramid_jobs.get(slide_hash)
-            running = bool(job and job["state"] == "converting")
-        if not running:
-            break
-        time.sleep(2)
-
-    existing = _find_pyramid(slide_hash)
-    if existing:
-        return existing, None
-
-    with _pyramid_lock:
-        job = {
-            "state": "converting",
-            "message": "starting one-time conversion…",
-            "percent": 0,
-            "filename": filepath.name,
-            "started_at": time.time(),
-        }
-        _pyramid_jobs[slide_hash] = job
-
     dst = _pyramid_cache_path(slide_hash)
     if not _pyramid_slot.acquire(blocking=False):
         job.update(message="waiting — another slide is converting", percent=0)
@@ -1321,26 +1295,58 @@ def _convert_pyramid_blocking(slide_hash: str, filepath: Path) -> tuple[Optional
         _pyramid_slot.release()
 
 
+def _new_pyramid_job(filepath: Path) -> dict:
+    return {
+        "state": "converting",
+        "message": "starting one-time conversion…",
+        "percent": 0,
+        "filename": filepath.name,
+        "started_at": time.time(),
+    }
+
+
+def _convert_pyramid_blocking(slide_hash: str, filepath: Path) -> tuple[Optional[Path], Optional[str]]:
+    """
+    Convert a plain TIFF to a pyramid and return (path, error). Blocks until
+    done — background threads only, never a request handler.
+
+    If another thread is already converting this slide (say the viewer got
+    there first), waits for it and returns its result instead of duplicating
+    the work.
+    """
+    job = None
+    while job is None:
+        with _pyramid_lock:
+            current = _pyramid_jobs.get(slide_hash)
+            if not (current and current["state"] == "converting"):
+                existing = _find_pyramid(slide_hash)
+                if existing:
+                    return existing, None
+                job = _new_pyramid_job(filepath)
+                _pyramid_jobs[slide_hash] = job
+        if job is None:
+            time.sleep(2)
+
+    return _run_pyramid_conversion(slide_hash, filepath, job)
+
+
 def _start_pyramid_conversion(slide_hash: str, filepath: Path) -> dict:
     """
-    Kick off (or join) a background conversion of a plain TIFF. Returns the job
-    state so the DZI endpoint can report progress in its 503.
+    Kick off (or join) a background conversion. Returns the job state so the
+    DZI endpoint can report progress in its 503.
     """
     with _pyramid_lock:
         job = _pyramid_jobs.get(slide_hash)
         if job and job["state"] == "converting":
             return job
-        job = {
-            "state": "converting",
-            "message": "starting one-time conversion…",
-            "percent": 0,
-            "filename": filepath.name,
-            "started_at": time.time(),
-        }
+        job = _new_pyramid_job(filepath)
         _pyramid_jobs[slide_hash] = job
 
+    # Hand the already-registered job straight to the worker: routing this
+    # through _convert_pyramid_blocking would make it wait on the very job
+    # we just registered.
     threading.Thread(
-        target=_convert_pyramid_blocking, args=(slide_hash, filepath),
+        target=_run_pyramid_conversion, args=(slide_hash, filepath, job),
         name=f"pyramid-{slide_hash[:8]}", daemon=True,
     ).start()
     return job
@@ -1358,11 +1364,21 @@ def _mpp_for(original: Path) -> Optional[float]:
     return settings.DEFAULT_MPP
 
 
-def _pyramid_missing_mpp(pyramid: Path, original: Path) -> bool:
-    """True if this pyramid has no MPP but we now know how to give it one."""
-    if tiff_pyramid.read_mpp(pyramid)[0]:
+def _pyramid_mpp_stale(pyramid: Path, original: Path) -> bool:
+    """
+    True if this pyramid's MPP doesn't match what we'd stamp today — either it
+    has none and we now have a value, or DEFAULT_MPP has since been corrected.
+    A wrong MPP doesn't error, it silently rescales what an analysis sees, so
+    it's worth rebuilding rather than trusting an old file.
+    """
+    desired = tiff_pyramid.read_mpp(original)[0] or settings.DEFAULT_MPP
+    if not desired:
         return False
-    return bool(tiff_pyramid.read_mpp(original)[0] or settings.DEFAULT_MPP)
+    current = tiff_pyramid.read_mpp(pyramid)[0]
+    if not current:
+        return True
+    # Resolution tags are rationals, so allow for round-trip rounding.
+    return abs(current - desired) / desired > 1e-3
 
 
 def ensure_analysis_source(slide_hash: str, original: Path) -> tuple[Path, Optional[str]]:
@@ -1373,11 +1389,11 @@ def ensure_analysis_source(slide_hash: str, original: Path) -> tuple[Path, Optio
     Blocking — background threads only.
     """
     existing = _find_pyramid(slide_hash)
-    if existing and _pyramid_missing_mpp(existing, original):
-        # Built before MPP was carried through. UNI and friends abort with
-        # "Unable to extract MPP from slide metadata" on such a file, so
-        # rebuild it rather than shipping a copy that can't be analysed.
-        print(f"[pyramid] {existing.name}: no microns-per-pixel metadata — reconverting")
+    if existing and _pyramid_mpp_stale(existing, original):
+        # Either built before MPP was carried through (UNI aborts with "Unable
+        # to extract MPP from slide metadata" on such a file), or built under a
+        # DEFAULT_MPP that has since changed. Rebuild rather than ship it.
+        print(f"[pyramid] {existing.name}: microns-per-pixel missing or out of date — reconverting")
         try:
             existing.unlink()
         except Exception as e:
