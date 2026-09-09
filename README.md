@@ -123,6 +123,63 @@ Organize slides by year:
 - **Salt stored on network drive**: Database alone cannot reveal patient IDs
 - **Local processing**: No cloud uploads required
 
+### HTTPS (needed for multi-user access)
+
+Browsers treat a plain-http origin that isn't `localhost` as untrustworthy and
+quietly withhold capabilities from it. Two bite us directly:
+
+- Chromium **blocks `.zip` downloads** from such an origin. Chrome shows a
+  "Keep" prompt; browsers that don't surface it (Arc, for one) leave a Data Pull
+  export sitting at 100% forever, fully written but never finalized.
+- `navigator.clipboard` is undefined, which is why copies go through
+  `frontend/src/lib/clipboard.ts`.
+
+So anyone reaching SlideCap over the network — i.e. every user but the one sat
+at the server — should be served over https. Install
+[mkcert](https://github.com/FiloSottile/mkcert), then:
+
+```bash
+scripts/make-certs.sh              # or scripts\make-certs.bat on Windows
+export SSL_CERTFILE="$PWD/certs/slidecap.pem"
+export SSL_KEYFILE="$PWD/certs/slidecap-key.pem"
+```
+
+Both halves read those two variables — `backend/run_server.py` passes them to
+uvicorn, and `frontend/vite.config.js` serves the dev server over TLS. Start
+them as usual and browse to `https://<hostname>:5173`. On Windows,
+`scripts/run-dev-windows.bat` picks up `certs/` automatically if it exists.
+
+#### Trusting the certificate on other machines
+
+mkcert signs with a CA it invents on the server, so other machines don't know it
+yet and will show a certificate warning until told to trust it. This is a
+one-time, per-workstation step — do it yourself when setting a machine up
+rather than asking users to:
+
+```bash
+mkcert -CAROOT                     # on the SERVER: prints the CA folder
+```
+
+Copy `rootCA.pem` from that folder to the workstation, then there:
+
+```bash
+mkcert -install                    # installs mkcert's CA into the OS trust store
+# or, without installing mkcert:
+#   Windows: certutil -addstore -f ROOT rootCA.pem   (as Administrator)
+#   macOS:   sudo security add-trusted-cert -d -r trustRoot \
+#              -k /Library/Keychains/System.keychain rootCA.pem
+```
+
+After that the machine gets a clean padlock and downloads work normally.
+
+If you'd rather not visit each workstation, get the certificate from an
+authority the machines already trust instead — your institution's internal CA
+(already distributed via Group Policy on managed machines), or a public cert
+from Let's Encrypt if the server has a real DNS name. Either drops in as
+`SSL_CERTFILE`/`SSL_KEYFILE` with no code change and needs no per-machine setup.
+
+`certs/` and `*.pem` are gitignored — never commit a private key.
+
 ## API Endpoints
 
 | Method | Endpoint | Description |

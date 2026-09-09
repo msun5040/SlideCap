@@ -83,8 +83,10 @@ export function LauncherScreen({ onReady }: LauncherScreenProps) {
         setError(result.error || 'Failed to start backend')
       }
     } else {
+      // Match the page's scheme — an https page calling http:// is mixed
+      // content and gets blocked before the request is even made.
+      const backendUrl = `${window.location.protocol}//${window.location.hostname}:8000`
       try {
-        const backendUrl = `http://${window.location.hostname}:8000`
         const res = await fetch(`${backendUrl}/health`, {
           signal: AbortSignal.timeout(5000),
         })
@@ -97,7 +99,7 @@ export function LauncherScreen({ onReady }: LauncherScreenProps) {
         }
       } catch {
         setPhase('error')
-        setError(`Cannot connect to backend at http://${window.location.hostname}:8000`)
+        setError(`Cannot connect to backend at ${backendUrl}`)
       }
     }
   }

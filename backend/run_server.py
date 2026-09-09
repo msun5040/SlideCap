@@ -19,8 +19,16 @@ if __name__ == "__main__":
     host = os.environ.get("HOST", settings.HOST)
     port = int(os.environ.get("PORT", str(settings.PORT)))
 
-    print(f"Starting SlideCap backend on {host}:{port}")
+    ssl_options = settings.ssl_options
+    scheme = "https" if ssl_options else "http"
+
+    print(f"Starting SlideCap backend on {scheme}://{host}:{port}")
     print(f"Network root: {settings.NETWORK_ROOT}")
+    if not ssl_options:
+        # Not fatal, but it costs real functionality — see Settings.ssl_options.
+        print("WARNING: serving over plain http. Browsers block .zip downloads "
+              "and clipboard access from a non-localhost http origin; set "
+              "SSL_CERTFILE/SSL_KEYFILE to serve over https.")
 
     uvicorn.run(
         "app.main:app",
@@ -28,4 +36,5 @@ if __name__ == "__main__":
         port=port,
         reload=False,
         log_level="info",
+        **ssl_options,
     )

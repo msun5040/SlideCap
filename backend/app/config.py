@@ -78,6 +78,47 @@ class Settings(BaseSettings):
     HOST: str = "0.0.0.0"
     PORT: int = 8000
     
+    # ── TLS ────────────────────────────────────────────────────────────
+    # Serve over https when both of these point at a cert/key pair. Worth doing
+    # on a LAN deployment even though nothing leaves the building: browsers
+    # treat a plain-http origin that isn't localhost as untrustworthy and
+    # silently withhold capabilities from it. Two we hit in practice —
+    # Chromium blocks .zip downloads from such an origin (a Data Pull export
+    # then sits at 100% and never finishes in browsers that don't show the
+    # "Keep" prompt), and navigator.clipboard is undefined there.
+    #
+    # Generate a pair with scripts/make-certs.sh (or .bat), which wraps mkcert
+    # so workstations that trust the local CA get a clean padlock. Paths are
+    # relative to the backend/ directory unless absolute.
+    SSL_CERTFILE: Optional[str] = None
+    SSL_KEYFILE: Optional[str] = None
+
+    @property
+    def ssl_options(self) -> dict:
+        """uvicorn ssl kwargs, or {} when TLS isn't configured."""
+        if not self.SSL_CERTFILE and not self.SSL_KEYFILE:
+            return {}
+        if not (self.SSL_CERTFILE and self.SSL_KEYFILE):
+            raise ValueError(
+                "SSL_CERTFILE and SSL_KEYFILE must be set together (got only "
+                f"{'SSL_CERTFILE' if self.SSL_CERTFILE else 'SSL_KEYFILE'}). "
+                "Serving http with half a TLS config set would look like https "
+                "was on when it isn't."
+            )
+        cert = Path(self.SSL_CERTFILE).expanduser()
+        key = Path(self.SSL_KEYFILE).expanduser()
+        missing = [str(p) for p in (cert, key) if not p.is_file()]
+        if missing:
+            # Explicit failure. Falling back to http here would silently
+            # reintroduce the very download/clipboard breakage TLS is meant to
+            # fix, and it'd look like the app simply doesn't work.
+            raise FileNotFoundError(
+                "SSL_CERTFILE/SSL_KEYFILE are set but missing: "
+                + ", ".join(missing)
+                + " — run scripts/make-certs.sh, or unset both to serve over http."
+            )
+        return {"ssl_certfile": str(cert), "ssl_keyfile": str(key)}
+
     # Authentication settings
     AUTH_SECRET_KEY: Optional[str] = None  # Auto-generated if not set
     AUTH_TOKEN_EXPIRY_DAYS: int = 30

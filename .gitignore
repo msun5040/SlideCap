@@ -217,3 +217,7 @@ backend/build/
 .salt
 .slidecap/
 pull-history.jsonl
+# TLS certificates and private keys (scripts/make-certs.sh) — never commit
+certs/
+*.pem
+*-key.pem

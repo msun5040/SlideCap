@@ -1,7 +1,14 @@
 // Centralized API base URL - uses current hostname so it works over the network.
 // Port can be overridden via VITE_API_PORT (e.g. demo build targets 8001).
+//
+// The scheme follows the page's own protocol rather than being hardcoded. Two
+// reasons it has to: a page served over https calling http:// is mixed content
+// and gets blocked outright, and over plain http Chromium refuses .zip
+// downloads from a non-localhost origin ("insecure download blocked"), which
+// leaves a Data Pull export stalled at 100% forever in browsers that don't
+// surface the Keep prompt. Serve both halves over https and neither happens.
 const _apiPort = (import.meta.env.VITE_API_PORT as string | undefined) ?? '8000'
-let _apiBase = `http://${window.location.hostname}:${_apiPort}`
+let _apiBase = `${window.location.protocol}//${window.location.hostname}:${_apiPort}`
 
 export function setApiBase(url: string) {
   _apiBase = url
