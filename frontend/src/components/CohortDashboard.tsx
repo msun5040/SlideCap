@@ -24,6 +24,7 @@ import type { Cohort } from '@/types/slide'
 
 import { getApiBase } from '@/api'
 import { SortableHeader } from '@/components/SortableHeader'
+import { SearchableSelect } from '@/components/ui/searchable-select'
 import { useSortable } from '@/hooks/useSortable'
 
 export function CohortDashboard() {
@@ -40,13 +41,26 @@ export function CohortDashboard() {
   const [newCohortDescription, setNewCohortDescription] = useState('')
   const [selectedFile, setSelectedFile] = useState<File | null>(null)
   const [tagName, setTagName] = useState('')
+  const [availableTags, setAvailableTags] = useState<{ id: number; name: string; color?: string; slide_count?: number }[]>([])
   const [isCreating, setIsCreating] = useState(false)
   const [createResult, setCreateResult] = useState<{ success: boolean; message: string } | null>(null)
   const { sorted: sortedCohorts, sortConfig: cohortSortConfig, handleSort: handleCohortSort } = useSortable(cohorts)
 
   useEffect(() => {
     fetchCohorts()
+    fetchTags()
   }, [])
+
+  // Tags are picked from a list rather than typed: from-tag matches by exact
+  // name, so a typo silently produced an empty cohort.
+  const fetchTags = async () => {
+    try {
+      const response = await fetch(`${getApiBase()}/tags`)
+      if (response.ok) setAvailableTags(await response.json())
+    } catch (error) {
+      console.error('Failed to fetch tags:', error)
+    }
+  }
 
   const fetchCohorts = async () => {
     setLoading(true)
@@ -440,11 +454,22 @@ export function CohortDashboard() {
 
               {createMode === 'tag' && (
                 <div className="space-y-2">
-                  <label className="text-sm font-medium">Tag Name</label>
-                  <Input
-                    placeholder="Enter tag name..."
+                  <label className="text-sm font-medium">Tag</label>
+                  <SearchableSelect
+                    className="w-full h-10"
                     value={tagName}
-                    onChange={(e) => setTagName(e.target.value)}
+                    onChange={setTagName}
+                    placeholder="Choose a tag..."
+                    searchPlaceholder="Search tags..."
+                    emptyText="No tags with slides yet"
+                    options={availableTags
+                      .filter(t => (t.slide_count ?? 0) > 0)
+                      .map(t => ({
+                        value: t.name,
+                        label: t.name,
+                        color: t.color,
+                        hint: t.slide_count != null ? `${t.slide_count} slides` : undefined,
+                      }))}
                   />
                 </div>
               )}

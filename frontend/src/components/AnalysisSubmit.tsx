@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useMemo } from 'react'
+import { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import {
   Search, Send, Users, AlertTriangle, Loader2, CheckCircle, XCircle,
   ChevronDown, ChevronRight, Tag, Hash, Stethoscope, FolderOpen, Microscope,
@@ -28,6 +28,10 @@ import { signalClusterDisconnected } from '@/components/ClusterConnect'
 import { SlideViewerOSD } from '@/components/SlideViewerOSD'
 
 import { getApiBase, normalizeAccession, isDemo } from '@/api'
+import {
+  useSlideAnalyses, completedNames, AnalysisBadges, SlideFilterBar,
+  slidePasses, toggleInSet,
+} from '@/components/SlideAnalysisFilters'
 import { displaySlide, displayCase } from '@/lib/display'
 import { SortableHeader } from '@/components/SortableHeader'
 import { useSortable } from '@/hooks/useSortable'
@@ -145,8 +149,45 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
   const [loadingStudy, setLoadingStudy] = useState(false)
   const [studySelectedHashes, setStudySelectedHashes] = useState<Set<string>>(new Set())
 
-  const { sorted: sortedSearchResults, sortConfig: searchSortConfig, handleSort: handleSearchSort } = useSortable(searchResults)
-  const { sorted: sortedTagSlides, sortConfig: tagSortConfig, handleSort: handleTagSort } = useSortable(tagSlides)
+  // ── Prior-analysis display + filters for the search / tag / study pickers ──
+  // Cohort mode already had these; the other three modes showed no analysis
+  // history at all, so you couldn't tell what had already been run.
+  const [pickerStainFilter, setPickerStainFilter] = useState<Set<string>>(new Set())
+  const [pickerAnalysisFilter, setPickerAnalysisFilter] = useState<Set<string>>(new Set())
+  const clearPickerFilters = () => {
+    setPickerStainFilter(new Set())
+    setPickerAnalysisFilter(new Set())
+  }
+  // Reset when switching mode or source — a filter left over from another list
+  // silently hiding rows is the kind of thing you notice ten minutes later.
+  useEffect(() => { clearPickerFilters() }, [mode, selectedTagName, selectedStudyId])
+
+  const studySlides = useMemo(() => studyDetail?.slides || [], [studyDetail])
+  const pickerSlides: { slide_hash: string; stain_type?: string | null }[] = useMemo(() => {
+    if (mode === 'search') return searchResults
+    if (mode === 'tag') return tagSlides
+    if (mode === 'study') return studySlides
+    return []
+  }, [mode, searchResults, tagSlides, studySlides])
+
+  const pickerHashes = useMemo(() => pickerSlides.map(s => s.slide_hash), [pickerSlides])
+  const { analyses: pickerAnalyses } = useSlideAnalyses(pickerHashes)
+
+  const passesPickerFilter = useCallback(
+    (s: { slide_hash: string; stain_type?: string | null }) =>
+      slidePasses(s, pickerAnalyses, pickerStainFilter, pickerAnalysisFilter),
+    [pickerAnalyses, pickerStainFilter, pickerAnalysisFilter],
+  )
+
+  const filteredSearchResults = useMemo(
+    () => searchResults.filter(passesPickerFilter), [searchResults, passesPickerFilter])
+  const filteredTagSlides = useMemo(
+    () => tagSlides.filter(passesPickerFilter), [tagSlides, passesPickerFilter])
+  const filteredStudySlides = useMemo(
+    () => studySlides.filter(passesPickerFilter), [studySlides, passesPickerFilter])
+
+  const { sorted: sortedSearchResults, sortConfig: searchSortConfig, handleSort: handleSearchSort } = useSortable(filteredSearchResults)
+  const { sorted: sortedTagSlides, sortConfig: tagSortConfig, handleSort: handleTagSort } = useSortable(filteredTagSlides)
 
   // ── Step 2 — analysis + cluster config ──────────────────────────────
   const [analyses, setAnalyses] = useState<Analysis[]>([])
@@ -513,8 +554,10 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
   }
 
   const toggleAllSearchSlides = () => {
-    if (selectedHashes.size >= searchResults.length) setSelectedHashes(new Set())
-    else setSelectedHashes(new Set(searchResults.map(s => s.slide_hash)))
+    // Filtered list, not the raw one — selecting slides the filter is hiding
+    // would quietly submit work you can't see.
+    if (selectedHashes.size >= filteredSearchResults.length) setSelectedHashes(new Set())
+    else setSelectedHashes(new Set(filteredSearchResults.map(s => s.slide_hash)))
   }
 
   // ── Tag slide toggle ─────────────────────────────────────────────────
@@ -528,8 +571,8 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
   }
 
   const toggleAllTagSlides = () => {
-    if (tagSelectedHashes.size >= tagSlides.length) setTagSelectedHashes(new Set())
-    else setTagSelectedHashes(new Set(tagSlides.map(s => s.slide_hash)))
+    if (tagSelectedHashes.size >= filteredTagSlides.length) setTagSelectedHashes(new Set())
+    else setTagSelectedHashes(new Set(filteredTagSlides.map(s => s.slide_hash)))
   }
 
   // ── Study slide toggle ──────────────────────────────────────────────
@@ -544,8 +587,8 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
 
   const toggleAllStudySlides = () => {
     if (!studyDetail) return
-    if (studySelectedHashes.size >= studyDetail.slides.length) setStudySelectedHashes(new Set())
-    else setStudySelectedHashes(new Set(studyDetail.slides.map(s => s.slide_hash)))
+    if (studySelectedHashes.size >= filteredStudySlides.length) setStudySelectedHashes(new Set())
+    else setStudySelectedHashes(new Set(filteredStudySlides.map(s => s.slide_hash)))
   }
 
   // ── Cohort slide selection (specific scope) ──────────────────────────
@@ -1126,6 +1169,19 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
               </div>
 
               {searchResults.length > 0 && (
+                  <SlideFilterBar
+                    slides={searchResults}
+                    analyses={pickerAnalyses}
+                    stainFilter={pickerStainFilter}
+                    analysisFilter={pickerAnalysisFilter}
+                    onToggleStain={st => setPickerStainFilter(prev => toggleInSet(prev, st))}
+                    onToggleAnalysis={n => setPickerAnalysisFilter(prev => toggleInSet(prev, n))}
+                    onClear={clearPickerFilters}
+                    summary={`${filteredSearchResults.length} of ${searchResults.length} shown`}
+                  />
+              )}
+
+              {searchResults.length > 0 && (
                 <div className="rounded-lg border max-h-100 overflow-auto">
                   <Table>
                     <TableHeader>
@@ -1133,7 +1189,7 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
                         <TableHead className="w-10">
                           <input
                             type="checkbox"
-                            checked={selectedHashes.size === searchResults.length && searchResults.length > 0}
+                            checked={selectedHashes.size === filteredSearchResults.length && filteredSearchResults.length > 0}
                             onChange={toggleAllSearchSlides}
                             className="h-4 w-4"
                           />
@@ -1154,6 +1210,7 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
                         <TableHead><SortableHeader label="Block" sortKey="block_id" sortConfig={searchSortConfig} onSort={handleSearchSort} /></TableHead>
                         <TableHead><SortableHeader label="Stain" sortKey="stain_type" sortConfig={searchSortConfig} onSort={handleSearchSort} /></TableHead>
                         <TableHead><SortableHeader label="Year" sortKey="year" sortConfig={searchSortConfig} onSort={handleSearchSort} /></TableHead>
+                        <TableHead>Analyses</TableHead>
                       </TableRow>
                     </TableHeader>
                     <TableBody>
@@ -1174,6 +1231,7 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
                           <TableCell>{s.block_id}</TableCell>
                           <TableCell>{s.stain_type}</TableCell>
                           <TableCell>{s.year}</TableCell>
+                          <TableCell><AnalysisBadges names={completedNames(pickerAnalyses, s.slide_hash)} /></TableCell>
                         </TableRow>
                       ))}
                     </TableBody>
@@ -1545,20 +1603,32 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
                       <div className="flex items-center justify-between">
                         <span className="text-sm text-muted-foreground">{tagSlides.length} slide{tagSlides.length !== 1 ? 's' : ''} with flag "{selectedTagName}"</span>
                         <button className="text-xs text-primary hover:underline" onClick={toggleAllTagSlides}>
-                          {tagSelectedHashes.size >= tagSlides.length ? 'Deselect all' : 'Select all'}
+                          {tagSelectedHashes.size >= filteredTagSlides.length ? 'Deselect all' : 'Select all'}
                         </button>
                       </div>
+                      <SlideFilterBar
+                        slides={tagSlides}
+                        analyses={pickerAnalyses}
+                        stainFilter={pickerStainFilter}
+                        analysisFilter={pickerAnalysisFilter}
+                        onToggleStain={st => setPickerStainFilter(prev => toggleInSet(prev, st))}
+                        onToggleAnalysis={n => setPickerAnalysisFilter(prev => toggleInSet(prev, n))}
+                        onClear={clearPickerFilters}
+                        summary={`${filteredTagSlides.length} of ${tagSlides.length} shown`}
+                      />
+
                       <div className="rounded-lg border max-h-[350px] overflow-auto">
                         <Table>
                           <TableHeader>
                             <TableRow>
                               <TableHead className="w-10">
-                                <input type="checkbox" checked={tagSelectedHashes.size === tagSlides.length && tagSlides.length > 0} onChange={toggleAllTagSlides} className="h-4 w-4" />
+                                <input type="checkbox" checked={tagSelectedHashes.size === filteredTagSlides.length && filteredTagSlides.length > 0} onChange={toggleAllTagSlides} className="h-4 w-4" />
                               </TableHead>
                               <TableHead>Slide</TableHead>
                               <TableHead><SortableHeader label="Block" sortKey="block_id" sortConfig={tagSortConfig} onSort={handleTagSort} /></TableHead>
                               <TableHead><SortableHeader label="Stain" sortKey="stain_type" sortConfig={tagSortConfig} onSort={handleTagSort} /></TableHead>
                               <TableHead><SortableHeader label="Year" sortKey="year" sortConfig={tagSortConfig} onSort={handleTagSort} /></TableHead>
+                              <TableHead>Analyses</TableHead>
                             </TableRow>
                           </TableHeader>
                           <TableBody>
@@ -1571,6 +1641,7 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
                                 <TableCell>{s.block_id}</TableCell>
                                 <TableCell>{s.stain_type}</TableCell>
                                 <TableCell>{s.year}</TableCell>
+                                <TableCell><AnalysisBadges names={completedNames(pickerAnalyses, s.slide_hash)} /></TableCell>
                               </TableRow>
                             ))}
                           </TableBody>
@@ -1660,21 +1731,33 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
                         </div>
                       )}
 
+                      <SlideFilterBar
+                        slides={studySlides}
+                        analyses={pickerAnalyses}
+                        stainFilter={pickerStainFilter}
+                        analysisFilter={pickerAnalysisFilter}
+                        onToggleStain={st => setPickerStainFilter(prev => toggleInSet(prev, st))}
+                        onToggleAnalysis={n => setPickerAnalysisFilter(prev => toggleInSet(prev, n))}
+                        onClear={clearPickerFilters}
+                        summary={`${filteredStudySlides.length} of ${studySlides.length} shown`}
+                      />
+
                       <div className="rounded-lg border max-h-[350px] overflow-auto">
                         <Table>
                           <TableHeader>
                             <TableRow>
                               <TableHead className="w-10">
-                                <input type="checkbox" checked={studySelectedHashes.size === studyDetail.slides.length && studyDetail.slides.length > 0} onChange={toggleAllStudySlides} className="h-4 w-4" />
+                                <input type="checkbox" checked={studySelectedHashes.size === filteredStudySlides.length && filteredStudySlides.length > 0} onChange={toggleAllStudySlides} className="h-4 w-4" />
                               </TableHead>
                               <TableHead>Slide</TableHead>
                               <TableHead>Block</TableHead>
                               <TableHead>Stain</TableHead>
                               <TableHead>Size</TableHead>
+                              <TableHead>Analyses</TableHead>
                             </TableRow>
                           </TableHeader>
                           <TableBody>
-                            {studyDetail.slides.map(s => (
+                            {filteredStudySlides.map(s => (
                               <TableRow key={s.slide_hash} className="cursor-pointer" onClick={() => toggleStudySlide(s.slide_hash)}>
                                 <TableCell>
                                   <input type="checkbox" checked={studySelectedHashes.has(s.slide_hash)} onChange={() => toggleStudySlide(s.slide_hash)} className="h-4 w-4" />
@@ -1685,6 +1768,7 @@ export function AnalysisSubmit({ clusterConnected = false }: AnalysisSubmitProps
                                 <TableCell className="text-xs text-muted-foreground tabular-nums">
                                   {s.file_size_bytes ? `${(s.file_size_bytes / (1024*1024)).toFixed(0)} MB` : '—'}
                                 </TableCell>
+                                <TableCell><AnalysisBadges names={completedNames(pickerAnalyses, s.slide_hash)} /></TableCell>
                               </TableRow>
                             ))}
                           </TableBody>

@@ -42,6 +42,8 @@ import { displaySlide, displayCase } from '@/lib/display'
 import { SortableHeader } from '@/components/SortableHeader'
 import { useSlideDetails } from '@/components/SlideDetailsContext'
 import { useSortable } from '@/hooks/useSortable'
+import { useStainTypes } from '@/hooks/useStainTypes'
+import { SearchableSelect } from '@/components/ui/searchable-select'
 const SLIDE_FLAG_TAG = 'flagged'
 
 // Above this slide count, the per-slide stain dots are replaced by a compact
@@ -125,13 +127,22 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
   const [yearFilter, setYearFilter] = useState<string>('all')
   const [stainFilter, setStainFilter] = useState<string>('all')
   const [tagFilter, setTagFilter] = useState<string>('all')
+  const [analysisFilter, setAnalysisFilter] = useState<string>('all')
+  const { stainTypes } = useStainTypes()
+  const [availableAnalyses, setAvailableAnalyses] = useState<string[]>([])
   // Include external (non-clinical) slides by default so they can be added to
   // cohorts too. exclude = clinical only, only = external only.
   const [externalFilter, setExternalFilter] = useState<'exclude' | 'include' | 'only'>('include')
   const [availableTags, setAvailableTags] = useState<{ id: number; name: string; color?: string; slide_count?: number }[]>([])
   const [resultsTruncated, setResultsTruncated] = useState(false)
   const [selectedHashes, setSelectedHashes] = useState<Set<string>>(new Set())
-  const { sorted: sortedSearchResults, sortConfig: cbSearchSortConfig, handleSort: handleCbSearchSort } = useSortable(searchResults)
+  // Analysis is filtered client-side: /search has no analysis parameter, but
+  // every result already carries the names of its completed analyses.
+  const filteredSearchResults = useMemo(() => {
+    if (analysisFilter === 'all') return searchResults
+    return searchResults.filter(s => (s.completed_analyses || []).includes(analysisFilter))
+  }, [searchResults, analysisFilter])
+  const { sorted: sortedSearchResults, sortConfig: cbSearchSortConfig, handleSort: handleCbSearchSort } = useSortable(filteredSearchResults)
 
   // ── Cases tab: multi-select ──────────────────────────────────────────
   const [collapsedCases, setCollapsedCases] = useState<Set<string>>(new Set())
@@ -472,6 +483,24 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
       } catch (e) { console.error(e) }
     }
     fetchTags()
+  }, [])
+
+  // Registered analyses drive the analysis filter's options. Taken from the
+  // registry rather than from whatever the current results happen to contain,
+  // so the choices don't shift under you between searches.
+  useEffect(() => {
+    const fetchAnalyses = async () => {
+      try {
+        const res = await fetch(`${getApiBase()}/analyses`)
+        if (res.ok) {
+          const data = await res.json()
+          setAvailableAnalyses(
+            Array.from(new Set<string>((data || []).map((a: { name: string }) => a.name))).sort()
+          )
+        }
+      } catch (e) { console.error(e) }
+    }
+    fetchAnalyses()
   }, [])
 
   // Sync the auto-tag selection from the cohort whenever its saved set changes
@@ -991,8 +1020,10 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
   }
 
   const toggleSelectAllSearch = () => {
-    if (selectedHashes.size === searchResults.length) setSelectedHashes(new Set())
-    else setSelectedHashes(new Set(searchResults.map(s => s.slide_hash)))
+    // Acts on the filtered set — selecting slides the analysis filter is
+    // currently hiding would be a nasty surprise on the next Add.
+    if (selectedHashes.size === filteredSearchResults.length) setSelectedHashes(new Set())
+    else setSelectedHashes(new Set(filteredSearchResults.map(s => s.slide_hash)))
   }
 
   // ── Helpers ──────────────────────────────────────────────────────────
@@ -1010,7 +1041,6 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
   }
 
   const years = ['2024', '2023', '2022', '2021', '2020']
-  const stainTypes = ['HE', 'IHC', 'Special']
 
   // ── Guards ───────────────────────────────────────────────────────────
   // Only show the full-screen loader on the FIRST load (no cohort yet).
@@ -1978,16 +2008,28 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                       {years.map(y => <SelectItem key={y} value={y}>{y}</SelectItem>)}
                     </SelectContent>
                   </Select>
-                  <Select value={stainFilter} onValueChange={setStainFilter}>
-                    <SelectTrigger className="w-28 h-8 text-xs">
-                      <Filter className="mr-1.5 h-3 w-3" />
-                      <SelectValue placeholder="Stain" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="all">All Stains</SelectItem>
-                      {stainTypes.map(s => <SelectItem key={s} value={s}>{s}</SelectItem>)}
-                    </SelectContent>
-                  </Select>
+                  <SearchableSelect
+                    className="w-32 h-8 text-xs px-2"
+                    value={stainFilter}
+                    onChange={setStainFilter}
+                    searchPlaceholder="Search stains..."
+                    emptyText="No stains in the library"
+                    options={[
+                      { value: 'all', label: 'All Stains' },
+                      ...stainTypes.map(st => ({ value: st, label: st })),
+                    ]}
+                  />
+                  <SearchableSelect
+                    className="w-36 h-8 text-xs px-2"
+                    value={analysisFilter}
+                    onChange={setAnalysisFilter}
+                    searchPlaceholder="Search analyses..."
+                    emptyText="No analyses registered"
+                    options={[
+                      { value: 'all', label: 'All Analyses' },
+                      ...availableAnalyses.map(a => ({ value: a, label: a })),
+                    ]}
+                  />
                   <Select value={tagFilter} onValueChange={setTagFilter}>
                     <SelectTrigger className="w-28 h-8 text-xs">
                       <SelectValue placeholder="Tag" />
@@ -2039,7 +2081,10 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
               {/* Results info */}
               {searchResults.length > 0 && (
                 <div className="px-3 py-1.5 text-xs text-muted-foreground border-b border-gray-300 shrink-0">
-                  {searchResults.length} result{searchResults.length !== 1 ? 's' : ''}
+                  {filteredSearchResults.length} result{filteredSearchResults.length !== 1 ? 's' : ''}
+                  {analysisFilter !== 'all' && filteredSearchResults.length !== searchResults.length && (
+                    <span className="ml-1">of {searchResults.length}</span>
+                  )}
                   {resultsTruncated && <span className="text-orange-600 ml-1">(limit reached)</span>}
                 </div>
               )}
@@ -2051,7 +2096,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                     <TableRow>
                       <TableHead className="w-10">
                         <Checkbox
-                          checked={searchResults.length > 0 && selectedHashes.size === searchResults.length}
+                          checked={filteredSearchResults.length > 0 && selectedHashes.size === filteredSearchResults.length}
                           onCheckedChange={toggleSelectAllSearch}
                         />
                       </TableHead>
@@ -2064,7 +2109,11 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                     {sortedSearchResults.length === 0 ? (
                       <TableRow>
                         <TableCell colSpan={4} className="h-24 text-center text-muted-foreground text-sm">
-                          {searchLoading ? 'Searching…' : 'Search to find slides to add.'}
+                          {searchLoading
+                            ? 'Searching…'
+                            : searchResults.length > 0
+                              ? `No results with the ${analysisFilter} analysis. Clear the analysis filter to see all ${searchResults.length}.`
+                              : 'Search to find slides to add.'}
                         </TableCell>
                       </TableRow>
                     ) : (

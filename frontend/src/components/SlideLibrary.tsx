@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { Search, Filter, Tag as TagIcon, Eye, Tags, X, Plus, Settings, Trash2, ChevronDown, FileDown, Upload, Pencil, Check, FileText, Download, Loader2, Layers, ScatterChart } from 'lucide-react'
+import { Search, Filter, Tag as TagIcon, Eye, Tags, X, Plus, Settings, Trash2, ChevronDown, FileDown, Upload, Pencil, Check, FileText, Download, Loader2, Layers, ScatterChart, Users } from 'lucide-react'
 import { ScatterViewerOverlay } from '@/components/ScatterViewerOverlay'
 import type { AnalysisKind } from '@/types/slide'
 import { Button } from '@/components/ui/button'
@@ -38,6 +38,8 @@ import { DownloadModal } from '@/components/DownloadModal'
 import { CopyableText } from '@/components/CopyableText'
 import { SortableHeader } from '@/components/SortableHeader'
 import { useSortable } from '@/hooks/useSortable'
+import { useStainTypes } from '@/hooks/useStainTypes'
+import { SearchableSelect } from '@/components/ui/searchable-select'
 
 import { getApiBase, normalizeAccession, isDemo } from '@/api'
 import { displaySlide } from '@/lib/display'
@@ -77,6 +79,15 @@ export function SlideLibrary() {
   // Bulk selection state
   const [selectedSlides, setSelectedSlides] = useState<Set<string>>(new Set())
   const [isBulkTagDialogOpen, setIsBulkTagDialogOpen] = useState(false)
+  const [isCohortDialogOpen, setIsCohortDialogOpen] = useState(false)
+  const [cohortMode, setCohortMode] = useState<'new' | 'existing'>('new')
+  const [cohortName, setCohortName] = useState('')
+  const [cohortDescription, setCohortDescription] = useState('')
+  const [existingCohortId, setExistingCohortId] = useState('')
+  const [cohorts, setCohorts] = useState<{ id: number; name: string; slide_count?: number }[]>([])
+  const [isAddingToCohort, setIsAddingToCohort] = useState(false)
+  const [cohortError, setCohortError] = useState('')
+  const [cohortResult, setCohortResult] = useState('')
   const [isBulkRemoveTagDialogOpen, setIsBulkRemoveTagDialogOpen] = useState(false)
   const [bulkTagInput, setBulkTagInput] = useState('')
   const [bulkRemoveTagInput, setBulkRemoveTagInput] = useState('')
@@ -346,12 +357,11 @@ export function SlideLibrary() {
     }
   }
 
+  // Options come from the index (useStainTypes), so a filter value is always a
+  // stain that really exists — match it exactly rather than bucketing.
   const matchesStainFilter = (stain: string, filter: string): boolean => {
     if (filter === 'all') return true
-    if (filter === 'HE') return stain === 'HE'
-    if (filter === 'IHC') return stain.startsWith('IHC')
-    if (filter === 'Special') return stain !== 'HE' && !stain.startsWith('IHC')
-    return true
+    return (stain || '').toLowerCase() === filter.toLowerCase()
   }
 
   const filteredSlides = slides.filter((slide) => {
@@ -425,6 +435,94 @@ export function SlideLibrary() {
 
   const clearSelection = () => {
     setSelectedSlides(new Set())
+  }
+
+  // ── Add selection to a cohort ─────────────────────────────────────────
+  const openCohortDialog = async () => {
+    setCohortError('')
+    setCohortResult('')
+    setCohortName('')
+    setCohortDescription('')
+    setExistingCohortId('')
+    setCohortMode('new')
+    setIsCohortDialogOpen(true)
+    try {
+      const res = await fetch(`${getApiBase()}/cohorts`)
+      if (res.ok) setCohorts(await res.json())
+      else setCohortError('Could not load existing cohorts.')
+    } catch (e) {
+      console.error('Failed to load cohorts:', e)
+      setCohortError('Could not load existing cohorts.')
+    }
+  }
+
+  const addSelectionToCohort = async () => {
+    const hashes = Array.from(selectedSlides)
+    if (hashes.length === 0) return
+    setCohortError('')
+    setCohortResult('')
+    setIsAddingToCohort(true)
+    try {
+      let cohortId: number
+      let label: string
+
+      if (cohortMode === 'new') {
+        if (!cohortName.trim()) {
+          setCohortError('Cohort name is required.')
+          return
+        }
+        const res = await fetch(`${getApiBase()}/cohorts`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: cohortName.trim(),
+            description: cohortDescription.trim() || null,
+          }),
+        })
+        if (!res.ok) {
+          const detail = await res.json().catch(() => null)
+          throw new Error(detail?.detail || `Could not create cohort (${res.status})`)
+        }
+        const created = await res.json()
+        cohortId = created.id
+        label = created.name
+      } else {
+        if (!existingCohortId) {
+          setCohortError('Pick a cohort to add to.')
+          return
+        }
+        cohortId = Number(existingCohortId)
+        label = cohorts.find(c => c.id === cohortId)?.name || 'cohort'
+      }
+
+      const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/slides`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ slide_hashes: hashes }),
+      })
+      if (!res.ok) {
+        const detail = await res.json().catch(() => null)
+        throw new Error(detail?.detail || `Could not add slides (${res.status})`)
+      }
+      const result = await res.json()
+
+      // The endpoint returns `added` as a count and skips slides already in the
+      // cohort, so report what actually landed rather than how many were picked.
+      const added: number = result.added ?? 0
+      const notFound: number = (result.not_found || []).length
+      const skipped = hashes.length - added - notFound
+      setCohortResult(
+        `Added ${added} slide${added === 1 ? '' : 's'} to "${label}"` +
+        (skipped > 0 ? ` — ${skipped} already in it` : '') +
+        (notFound > 0 ? ` — ${notFound} not found` : '') + '.'
+      )
+      setSelectedSlides(new Set())
+    } catch (e: any) {
+      console.error('Add to cohort failed:', e)
+      setCohortError(e.message || 'Could not add slides to the cohort.')
+    } finally {
+      setIsAddingToCohort(false)
+    }
   }
 
   const openDownloadWithAnalysis = async () => {
@@ -856,7 +954,7 @@ export function SlideLibrary() {
   }
 
   const years = ['2024', '2023', '2022', '2021', '2020']
-  const stainTypes = ['HE', 'IHC', 'Special']
+  const { stainTypes } = useStainTypes()
 
   return (
     <div className="h-full flex flex-col gap-6 min-h-0">
@@ -880,20 +978,17 @@ export function SlideLibrary() {
           />
         </div>
         <div className="flex flex-wrap gap-2">
-          <Select value={stainFilter} onValueChange={setStainFilter}>
-            <SelectTrigger className="w-35">
-              <Filter className="mr-2 h-4 w-4" />
-              <SelectValue placeholder="Stain" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">All Stains</SelectItem>
-              {stainTypes.map((stain) => (
-                <SelectItem key={stain} value={stain}>
-                  {stain}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+          <SearchableSelect
+            className="w-35 h-10"
+            value={stainFilter}
+            onChange={setStainFilter}
+            searchPlaceholder="Search stains..."
+            emptyText="No stains in the library"
+            options={[
+              { value: 'all', label: 'All Stains' },
+              ...stainTypes.map(st => ({ value: st, label: st })),
+            ]}
+          />
 
           <Select value={yearFilter} onValueChange={setYearFilter}>
             <SelectTrigger className="w-30">
@@ -1015,6 +1110,14 @@ export function SlideLibrary() {
             >
               <X className="mr-1 h-4 w-4" />
               Remove Tag
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={openCohortDialog}
+            >
+              <Users className="mr-1 h-4 w-4" />
+              Add to Cohort
             </Button>
             <Button
               variant="outline"
@@ -1542,6 +1645,112 @@ export function SlideLibrary() {
               </div>
             </div>
           )}
+        </DialogContent>
+      </Dialog>
+
+      {/* Add selection to a cohort — new or existing */}
+      <Dialog open={isCohortDialogOpen} onOpenChange={setIsCohortDialogOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Add to Cohort</DialogTitle>
+            <DialogDescription>
+              {selectedSlides.size} slide{selectedSlides.size === 1 ? '' : 's'} selected.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4 py-2">
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => { setCohortMode('new'); setCohortError(''); setCohortResult('') }}
+                className={`flex-1 rounded-md border p-2.5 text-left transition-colors ${
+                  cohortMode === 'new' ? 'border-primary bg-primary/5' : 'border-gray-300 hover:bg-muted/30'
+                }`}
+              >
+                <div className="flex items-center gap-1.5 text-[13px] font-medium">
+                  <Plus className="h-3.5 w-3.5" />New cohort
+                </div>
+                <p className="mt-0.5 text-[11px] text-muted-foreground">Create one from this selection.</p>
+              </button>
+              <button
+                type="button"
+                onClick={() => { setCohortMode('existing'); setCohortError(''); setCohortResult('') }}
+                className={`flex-1 rounded-md border p-2.5 text-left transition-colors ${
+                  cohortMode === 'existing' ? 'border-primary bg-primary/5' : 'border-gray-300 hover:bg-muted/30'
+                }`}
+              >
+                <div className="flex items-center gap-1.5 text-[13px] font-medium">
+                  <Users className="h-3.5 w-3.5" />Existing cohort
+                </div>
+                <p className="mt-0.5 text-[11px] text-muted-foreground">Add to one you already have.</p>
+              </button>
+            </div>
+
+            {cohortMode === 'new' ? (
+              <div className="space-y-3">
+                <div className="space-y-1.5">
+                  <label className="text-sm font-medium">Cohort name</label>
+                  <Input
+                    value={cohortName}
+                    onChange={e => setCohortName(e.target.value)}
+                    placeholder="e.g. GBM recurrence 2026"
+                    disabled={isAddingToCohort}
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <label className="text-sm font-medium">Description (optional)</label>
+                  <Input
+                    value={cohortDescription}
+                    onChange={e => setCohortDescription(e.target.value)}
+                    placeholder="What is this cohort for?"
+                    disabled={isAddingToCohort}
+                  />
+                </div>
+              </div>
+            ) : (
+              <div className="space-y-1.5">
+                <label className="text-sm font-medium">Cohort</label>
+                <SearchableSelect
+                  className="w-full h-10"
+                  value={existingCohortId}
+                  onChange={setExistingCohortId}
+                  placeholder="Choose a cohort..."
+                  searchPlaceholder="Search cohorts..."
+                  emptyText="No cohorts yet"
+                  disabled={isAddingToCohort}
+                  options={cohorts.map(c => ({
+                    value: String(c.id),
+                    label: c.name,
+                    hint: c.slide_count != null ? `${c.slide_count} slides` : undefined,
+                  }))}
+                />
+              </div>
+            )}
+
+            {cohortError && (
+              <div className="rounded-md border border-red-300 bg-red-50 p-2.5 text-[12px] text-red-700">{cohortError}</div>
+            )}
+            {cohortResult && (
+              <div className="rounded-md border border-emerald-300 bg-emerald-50 p-2.5 text-[12px] text-emerald-800">{cohortResult}</div>
+            )}
+          </div>
+
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" onClick={() => setIsCohortDialogOpen(false)}>
+              {cohortResult ? 'Close' : 'Cancel'}
+            </Button>
+            <Button
+              onClick={addSelectionToCohort}
+              disabled={
+                isAddingToCohort ||
+                selectedSlides.size === 0 ||
+                (cohortMode === 'new' ? !cohortName.trim() : !existingCohortId)
+              }
+            >
+              {isAddingToCohort && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />}
+              {cohortMode === 'new' ? 'Create & Add' : 'Add to Cohort'}
+            </Button>
+          </div>
         </DialogContent>
       </Dialog>
 
