@@ -157,7 +157,8 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
   // ── Cohort-specific flags ────────────────────────────────────────────
   const [cohortFlags, setCohortFlags] = useState<CohortFlag[]>([])
   const [loadingFlags, setLoadingFlags] = useState(false)
-  const [flagToolbarMode, setFlagToolbarMode] = useState<'idle' | 'apply' | 'new'>('idle')
+  const [flagToolbarMode, setFlagToolbarMode] = useState<'idle' | 'apply' | 'new' | 'confirm-remove'>('idle')
+  const [removingCases, setRemovingCases] = useState(false)
   const [flagDropdownValue, setFlagDropdownValue] = useState<string>('')
   const [newFlagName, setNewFlagName] = useState('')
   const [flagApplying, setFlagApplying] = useState(false)
@@ -366,7 +367,11 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
 
   const analysisHistory = useMemo(() => {
     const jobMap = new Map<number, { analysis_name: string; statuses: string[]; slideCount: number }>()
-    for (const slideEntries of Object.values(slideAnalysisStatus)) {
+    // Only count slides still in the cohort. slideAnalysisStatus is fetched
+    // separately and isn't re-fetched on removal, so without this filter a
+    // removed slide keeps inflating the counts ("6/6 slides" on a 2-slide cohort).
+    for (const [slideHash, slideEntries] of Object.entries(slideAnalysisStatus)) {
+      if (!cohortHashSet.has(slideHash)) continue
       for (const entry of Object.values(slideEntries)) {
         if (!jobMap.has(entry.job_id)) {
           jobMap.set(entry.job_id, { analysis_name: entry.analysis_name, statuses: [], slideCount: 0 })
@@ -383,7 +388,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
       const overall = failed > 0 && completed === 0 ? 'failed' : running > 0 ? 'running' : completed === info.slideCount ? 'completed' : 'partial'
       return { job_id, analysis_name: info.analysis_name, completed, failed, running, total: info.slideCount, status: overall }
     })
-  }, [slideAnalysisStatus])
+  }, [slideAnalysisStatus, cohortHashSet])
 
   // Per-case aggregate analysis status (for case header badges)
   const getCaseAnalysisStatuses = useCallback((slides: CohortSlide[]) => {
@@ -962,6 +967,61 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
     } catch (e) { setCohort(prev); console.error('Remove slide error:', e) }
   }
 
+  // Remove every selected case in one pass.
+  //
+  // Done as a single request rather than looping removeCase, so a 40-case
+  // removal is one round trip and one optimistic update instead of 40 — and so
+  // a failure halfway through can't leave the cohort half-removed.
+  const removeSelectedCases = async () => {
+    if (!cohort || selectedCaseHashes.size === 0) return
+    const groups = caseGroups.filter(g => selectedCaseHashes.has(g.case_hash))
+    if (groups.length === 0) return
+
+    const hashes = groups.flatMap(g => g.slides.map(s => s.slide_hash))
+    const phIds = groups.flatMap(g => (g.placeholders ?? []).map(p => p.id))
+    const hashSet = new Set(hashes)
+
+    setRemovingCases(true)
+    const prev = cohort
+    setCohort({
+      ...cohort,
+      slides: cohort.slides.filter(s => !hashSet.has(s.slide_hash)),
+      placeholders: (cohort.placeholders ?? []).filter(p => !phIds.includes(p.id)),
+    })
+
+    try {
+      // Unfollow first, or followed cases walk straight back in at the next index.
+      const followed = groups
+        .map(g => g.case_hash)
+        .filter(h => h && followedCaseHashes.has(h))
+      if (followed.length > 0) await followCases(followed, false)
+
+      await Promise.all(phIds.map(id =>
+        fetch(`${getApiBase()}/cohorts/${cohortId}/placeholders/${id}`, { method: 'DELETE' })))
+
+      if (hashSet.size > 0) {
+        const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/slides`, {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ slide_hashes: [...hashSet] }),
+        })
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }))
+          throw new Error(err.detail || 'Remove failed')
+        }
+        const data = await res.json()
+        setCohort(p => p ? { ...p, slide_count: data.total_slides, case_count: data.total_cases } : p)
+      }
+      setSelectedCaseHashes(new Set())
+      setFlagToolbarMode('idle')
+    } catch (e) {
+      setCohort(prev)
+      console.error('Bulk remove failed:', e)
+    } finally {
+      setRemovingCases(false)
+    }
+  }
+
   // Remove a whole case from the cohort — its real slides AND any "needs scan"
   // placeholder slides (so placeholder-only cases can be removed too).
   const removeCase = async (group: CaseGroup) => {
@@ -1328,6 +1388,16 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                               <Plus className="h-3 w-3 mr-1" />
                               New flag
                             </Button>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="h-6 px-2 text-xs text-destructive hover:bg-destructive/10"
+                              onClick={() => setFlagToolbarMode('confirm-remove')}
+                              title="Remove the selected cases from this cohort"
+                            >
+                              <Trash2 className="h-3 w-3 mr-1" />
+                              Remove
+                            </Button>
                           </>
                         )}
 
@@ -1358,6 +1428,37 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                             </button>
                           </div>
                         )}
+
+                        {flagToolbarMode === 'confirm-remove' && (() => {
+                          const groups = caseGroups.filter(g => selectedCaseHashes.has(g.case_hash))
+                          const slideCount = groups.reduce((n, g) => n + g.slides.length, 0)
+                          const followedCount = groups.filter(g => followedCaseHashes.has(g.case_hash)).length
+                          return (
+                            <div className="flex items-center gap-1.5">
+                              <span className="text-xs">
+                                Remove {groups.length} case{groups.length === 1 ? '' : 's'} ({slideCount} slide{slideCount === 1 ? '' : 's'}) from this cohort?
+                                {followedCount > 0 && (
+                                  <span className="text-muted-foreground">
+                                    {' '}{followedCount} followed case{followedCount === 1 ? '' : 's'} will also be unfollowed.
+                                  </span>
+                                )}
+                              </span>
+                              <Button
+                                size="sm"
+                                variant="destructive"
+                                className="h-6 px-2 text-xs"
+                                onClick={removeSelectedCases}
+                                disabled={removingCases}
+                              >
+                                {removingCases ? <Loader2 className="h-3 w-3 animate-spin" /> : 'Remove'}
+                              </Button>
+                              <button className="text-muted-foreground hover:text-foreground"
+                                      onClick={() => setFlagToolbarMode('idle')}>
+                                <X className="h-3.5 w-3.5" />
+                              </button>
+                            </div>
+                          )
+                        })()}
 
                         {flagToolbarMode === 'new' && (
                           <div className="flex items-center gap-1.5">
@@ -1595,7 +1696,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
 
                                 {/* Remove */}
                                 <button
-                                  className="shrink-0 opacity-0 group-hover/case:opacity-100 text-muted-foreground hover:text-destructive transition-opacity"
+                                  className="shrink-0 text-muted-foreground/50 hover:text-destructive transition-colors"
                                   onClick={() => removeCase(group)}
                                   title="Remove case from cohort"
                                 >
@@ -1675,9 +1776,9 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                                         </button>
                                         {/* Remove slide */}
                                         <button
-                                          className="shrink-0 opacity-0 group-hover/slide:opacity-100 text-muted-foreground hover:text-destructive transition-opacity"
+                                          className="shrink-0 text-muted-foreground/50 hover:text-destructive transition-colors"
                                           onClick={(e) => { e.stopPropagation(); removeSlide(slide.slide_hash) }}
-                                          title="Remove slide"
+                                          title="Remove slide from cohort"
                                         >
                                           <X className="h-3 w-3" />
                                         </button>
