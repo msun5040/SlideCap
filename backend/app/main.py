@@ -1837,7 +1837,7 @@ def get_slide_region(
     Reuses the cached large_image source, so this costs one region read rather
     than re-opening the slide.
     """
-    ts = _get_tile_source(slide_hash)
+    ts = _get_ts(slide_hash)
     try:
         data, _mime = ts.getRegion(
             region={"left": x, "top": y, "right": x + size, "bottom": y + size,

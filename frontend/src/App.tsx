@@ -4,6 +4,7 @@ import {
   Microscope,
   Users,
   FlaskConical,
+  ChartScatter,
   ClipboardList,
   Package,
   PanelLeftClose,
@@ -37,6 +38,7 @@ import { Dashboard } from '@/components/Dashboard'
 import { SlideLibrary } from '@/components/SlideLibrary'
 import { CohortDashboard } from '@/components/CohortDashboard'
 import { AnalysisDashboard } from '@/components/AnalysisDashboard'
+import { AnalysisWorkspace } from '@/components/AnalysisWorkspace'
 import { RequestTracker } from '@/components/RequestTracker'
 import { SlidePull } from '@/components/SlidePull'
 import { LauncherScreen } from '@/components/LauncherScreen'
@@ -58,7 +60,7 @@ interface SortStatus {
   errors: string[]
 }
 
-type View = 'dashboard' | 'slides' | 'cohorts' | 'requests' | 'pull' | 'analysis'
+type View = 'dashboard' | 'slides' | 'cohorts' | 'requests' | 'pull' | 'analysis' | 'workspace'
 
 // Re-export for backward compat
 export { getApiBase as getAPI } from '@/api'
@@ -267,6 +269,7 @@ export default function App() {
     { id: 'requests' as View, label: 'Requests', icon: ClipboardList },
     { id: 'pull' as View, label: 'Data Pull', icon: Package },
     { id: 'analysis' as View, label: 'Analysis', icon: FlaskConical },
+    { id: 'workspace' as View, label: 'Workspace', icon: ChartScatter },
   ]
 
   const viewClass = (view: View) =>
@@ -588,6 +591,9 @@ export default function App() {
                 </div>
                 <div className={viewClass('analysis')}>
                   <AnalysisDashboard />
+                </div>
+                <div className={`${viewClass('workspace')} h-full min-h-0`}>
+                  <AnalysisWorkspace />
                 </div>
               </>
             )}

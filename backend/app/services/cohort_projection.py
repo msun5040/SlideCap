@@ -398,6 +398,11 @@ def write_artifact(path: Path, xy, slide_idx, patch_x, patch_y, sources, method,
         ],
     }
     header_bytes = json.dumps(header).encode("utf-8")
+    # Pad so the column block starts 8-byte aligned. Typed-array views in the
+    # browser require the byte offset to be a multiple of the element size, and
+    # the header length is otherwise arbitrary. Trailing spaces stay valid JSON.
+    pad = (-(len(MAGIC) + 4 + len(header_bytes))) % 8
+    header_bytes += b" " * pad
 
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "wb") as fh:
