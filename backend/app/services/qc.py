@@ -16,7 +16,13 @@ from pathlib import Path
 from typing import Optional
 
 # Bump when the checks/thresholds change so cached results can be re-evaluated.
-QC_VERSION = "v2"
+QC_VERSION = "v3"   # v3 adds the level-0 corruption probe
+
+# Corruption probe: how many level-0 windows to read, and how big.
+# 8 x 512px is well under a second on a local disk and enough to catch a
+# truncated file; it is not a full integrity scan.
+PROBE_REGIONS = 8
+PROBE_SIZE = 512
 
 # ── Absolute tissue AREA thresholds (mm²) ──
 # Percentage-of-slide is a poor gate: a valid needle biopsy is only a few % of a
@@ -45,8 +51,9 @@ def _worst(statuses: list[str]) -> str:
     return max(statuses, key=lambda s: _STATUS_RANK.get(s, 1))
 
 
-def _tissue_fraction(filepath: Path) -> Optional[float]:
-    """Fraction (0–100) of a downscaled whole-slide thumbnail that is tissue.
+def _thumbnail_tissue(filepath: Path):
+    """
+    Tissue fraction plus a handful of level-0 coordinates that land on tissue.
 
     Detection is saturation-based (more robust than a plain grayscale cutoff):
     glass background is near-grey/white = low saturation, while stained tissue
@@ -54,31 +61,163 @@ def _tissue_fraction(filepath: Path) -> Optional[float]:
     any reasonably dark pixel, so faint/pale sections aren't missed. Near-black
     scanner borders are excluded. Good enough to flag blank slides + estimate
     area; not a substitute for a real tissue mask.
+
+    Returns (tissue_pct, sample_points) or (None, []). The points feed the
+    corruption probe below — reading where tissue actually is, because that's
+    where an analysis will read.
     """
     try:
         import numpy as np
         from openslide import open_slide
 
         slide = open_slide(str(filepath))
+        w0, h0 = slide.dimensions
         thumb = slide.get_thumbnail((1024, 1024)).convert("RGB")
         arr = np.asarray(thumb).astype(np.float32)
         if arr.size == 0:
-            return None
+            return None, []
         mx = arr.max(axis=2)
         mn = arr.min(axis=2)
         sat = np.where(mx > 0, (mx - mn) / np.maximum(mx, 1.0), 0.0)  # 0..1
         gray = arr.mean(axis=2)
         # tissue = colourful (stained) OR moderately dark — but not near-black
         tissue = ((sat > 0.10) | (gray < 210)) & (gray > 15)
-        return float(tissue.mean() * 100.0)
+        pct = float(tissue.mean() * 100.0)
+
+        # Spread the probe points over tissue rather than clustering them: take
+        # every Nth tissue pixel from the flattened mask.
+        th, tw = tissue.shape
+        ys, xs = np.nonzero(tissue)
+        points: list = []
+        if len(xs) > 0:
+            step = max(1, len(xs) // PROBE_REGIONS)
+            for i in range(0, len(xs), step):
+                if len(points) >= PROBE_REGIONS:
+                    break
+                # thumbnail px -> level-0 px
+                points.append((int(xs[i] * w0 / tw), int(ys[i] * h0 / th)))
+        # Always probe the far corner too. Tiles are laid out roughly in raster
+        # order, so a partially-written file loses the bottom-right first — and
+        # tissue-spread points may never reach it.
+        points.append((max(0, w0 - PROBE_SIZE), max(0, h0 - PROBE_SIZE)))
+        return pct, points
     except Exception:
+        return None, []
+
+
+def _truncation_check(filepath: Path) -> Optional[str]:
+    """
+    Is the file shorter than its own tile table says it should be?
+
+    An interrupted copy to the network drive is the common way a slide goes bad,
+    and it's detectable without decoding anything: walk the TIFF tile offsets and
+    byte counts, take the furthest byte any tile claims to occupy, and compare
+    against the actual file size. Deterministic, ~instant, and it catches the
+    whole truncation class rather than whichever tiles a sampling probe happens
+    to land on.
+
+    Returns an error string when truncated, else None (including when the file
+    isn't a TIFF we can parse — the region probe still covers that case).
+    """
+    try:
+        import tifffile
+    except ImportError:
         return None
+    try:
+        size = filepath.stat().st_size
+        needed = 0
+        with tifffile.TiffFile(str(filepath)) as tf:
+            for page in tf.pages:
+                offs = page.tags.get("TileOffsets") or page.tags.get("StripOffsets")
+                cnts = page.tags.get("TileByteCounts") or page.tags.get("StripByteCounts")
+                if not offs or not cnts:
+                    continue
+                o = offs.value if isinstance(offs.value, (list, tuple)) else [offs.value]
+                c = cnts.value if isinstance(cnts.value, (list, tuple)) else [cnts.value]
+                for a, b in zip(o, c):
+                    end = int(a) + int(b)
+                    if end > needed:
+                        needed = end
+        if needed and size < needed:
+            short = needed - size
+            return (f"file is truncated — tile table needs {needed:,} bytes but the "
+                    f"file is {size:,} ({short:,} bytes missing). Re-copy the slide.")
+    except Exception:
+        # Unparseable as TIFF, or an exotic layout — not our call to fail it here.
+        return None
+    return None
+
+
+def _probe_regions(filepath: Path, points: list) -> tuple:
+    """
+    Read small level-0 regions to catch corruption that metadata checks miss.
+
+    This exists because of a real failure: a slide passed QC, was transferred,
+    took a GPU slot, and then died mid-segmentation with
+
+        OpenSlideError: Corrupt JPEG data: premature end of data segment
+
+    killing the whole batch. Nothing earlier in QC touches those bytes —
+    `large_image.open` reads metadata, and `get_thumbnail` is served from a
+    low-res pyramid level that can be perfectly intact while a level-0 tile is
+    truncated.
+
+    Deliberately uses openslide's read_region, the same call the analysis
+    pipeline makes (trident OpenSlideWSI.read_region), so a slide that will
+    break there breaks here instead — on cheap CPU, before the transfer.
+
+    Limits worth knowing: this samples, it does not verify the whole file, and
+    openslide only raises on damage its decoder chokes on. Measured behaviour —
+    a truncated file raises, but tile bytes that were overwritten in place
+    decode to garbage without error. `_truncation_check` covers the first case
+    deterministically; nothing cheap covers the second.
+
+    Returns (status, detail).
+    """
+    if not points:
+        return "warn", "no tissue found to probe"
+    try:
+        from openslide import open_slide
+        from openslide.lowlevel import OpenSlideError
+    except ImportError:
+        return "warn", "openslide unavailable — could not probe for corruption"
+
+    try:
+        slide = open_slide(str(filepath))
+        w0, h0 = slide.dimensions
+    except Exception as e:
+        return "fail", f"could not open for probing: {type(e).__name__}: {e}"[:200]
+
+    read = 0
+    for (x, y) in points:
+        # Keep the window inside the slide, or openslide pads rather than reads.
+        px = max(0, min(x, w0 - PROBE_SIZE))
+        py = max(0, min(y, h0 - PROBE_SIZE))
+        try:
+            slide.read_region((px, py), 0, (PROBE_SIZE, PROBE_SIZE))
+            read += 1
+        except OpenSlideError as e:
+            return "fail", f"corrupt image data at level-0 ({px}, {py}): {e}"[:200]
+        except Exception as e:
+            return "fail", f"unreadable region at ({px}, {py}): {type(e).__name__}: {e}"[:200]
+    return "pass", f"{read} level-0 regions read cleanly"
 
 
 def run_qc(slide_hash: str, filepath: Path) -> dict:
     """Run all universal checks. Returns {status, metrics, checks, qc_version}."""
     checks: list[dict] = []
     metrics: dict = {}
+
+    # ── 0. Truncation, before anything tries to decode.
+    #        A short file usually fails to open anyway, but the decoder's message
+    #        for that is "decoder error -2", which tells nobody anything. Checking
+    #        the tile table first turns it into "N bytes missing, re-copy the
+    #        slide" — and catches the nastier case where the header survives and
+    #        only trailing tiles are gone, which opens fine and dies later on a GPU.
+    truncated = _truncation_check(filepath)
+    if truncated:
+        checks.append({"name": "image_data", "status": "fail", "detail": truncated})
+        return {"status": "fail", "metrics": metrics, "checks": checks, "qc_version": QC_VERSION}
 
     # ── 1. File openable + dimensions (via large_image, same lib the viewer uses)
     try:
@@ -113,7 +252,7 @@ def run_qc(slide_hash: str, filepath: Path) -> dict:
 
     # ── 3. Tissue — gate on absolute AREA (mm²), not % of slide, so small
     #        biopsies aren't penalised for sitting on a big glass slide.
-    tissue_pct = _tissue_fraction(filepath)
+    tissue_pct, probe_points = _thumbnail_tissue(filepath)
     metrics["tissue_pct"] = round(tissue_pct, 2) if tissue_pct is not None else None
     area_mm2 = None
     if tissue_pct is not None and mpp and w and h:
@@ -137,6 +276,13 @@ def run_qc(slide_hash: str, filepath: Path) -> dict:
             checks.append({"name": "tissue", "status": "fail", "detail": f"{tissue_pct:.1f}% tissue, no MPP — effectively blank"})
         else:
             checks.append({"name": "tissue", "status": "pass", "detail": f"{tissue_pct:.1f}% tissue (no MPP for area)"})
+
+    # ── 4. Image-data integrity — read real level-0 regions.
+    #        Everything above this point reads metadata or a low-res pyramid
+    #        level, which stays readable on a file whose full-resolution tiles
+    #        are truncated. This is the check that catches that.
+    probe_status, probe_detail = _probe_regions(filepath, probe_points)
+    checks.append({"name": "image_data", "status": probe_status, "detail": probe_detail})
 
     status = _worst([c["status"] for c in checks])
     return {"status": status, "metrics": metrics, "checks": checks, "qc_version": QC_VERSION}

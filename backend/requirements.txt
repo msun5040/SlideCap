@@ -18,6 +18,9 @@ openslide-bin>=4.0.0
 # Tile serving (imported unconditionally by main.py)
 large-image[tiff]>=1.27.0
 
+# TIFF tag parsing — pyramid conversion (tiff_pyramid) and the QC truncation check
+tifffile>=2024.1.0
+
 # JWT session tokens
 pyjwt>=2.8.0
 

@@ -2022,8 +2022,14 @@ class QCManualRequest(BaseModel):
 
 
 def _qc_payload(q: SlideQC, slide_hash: str) -> dict:
+    # The on-disk path matters when QC fails: a truncated or unreadable slide is
+    # fixed by re-copying that file, and the hash alone doesn't tell you which
+    # file to go and get.
+    fp = indexer.get_filepath(slide_hash) if indexer else None
     return {
         "slide_hash": slide_hash,
+        "filename": fp.name if fp else None,
+        "filepath": str(fp) if fp else None,
         "status": q.effective_status,
         "auto_status": q.auto_status,
         "manual_status": q.manual_status,

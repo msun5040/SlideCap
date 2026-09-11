@@ -2,15 +2,19 @@ import { useState, useEffect, useRef, useMemo } from 'react'
 import {
   Loader2, Clock, AlertTriangle, CheckCircle2, X, RefreshCw, RotateCw,
   Upload, Cpu, Sparkles, PackageCheck, Check, Layers, ChevronRight, ChevronDown,
+  FileSearch,
 } from 'lucide-react'
 import { signalClusterDisconnected } from '@/components/ClusterConnect'
 import { getApiBase, isDemo } from '@/api'
+import { CopyableText } from '@/components/CopyableText'
 import type { AnalysisJob } from '@/types/slide'
 
 // ── Detail-slide shape (richer than the list JobSlide) ─────────────────
 interface DetailSlide {
   id: number
   slide_id?: string
+  slide_hash?: string | null
+  filename?: string | null
   accession_number?: string | null
   block_id?: string | null
   stain_type?: string | null
@@ -150,6 +154,16 @@ export function AnalysisInstrument() {
   const [expandedFails, setExpandedFails] = useState<Set<number>>(new Set())
   const [gpus, setGpus] = useState<{ index: number; name: string; memory_used_mb?: number; memory_total_mb?: number }[]>([])
   const [retryGpu, setRetryGpu] = useState<number | null>(null)
+  // Local file verification for the open job. A batch analysis aborts on the
+  // first unreadable slide and the cluster traceback names the exception but not
+  // the slide, so this re-reads each file here and points at the one to re-copy.
+  const [checkingFiles, setCheckingFiles] = useState(false)
+  const [fileCheck, setFileCheck] = useState<Record<string, {
+    status: string
+    filename?: string | null
+    filepath?: string | null
+    checks?: { name: string; status: string; detail: string }[] | null
+  }> | null>(null)
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const toggleFail = (id: number) => setExpandedFails(prev => {
@@ -171,6 +185,39 @@ export function AnalysisInstrument() {
       if (res.ok) setDetail(await res.json())
     } catch (e) { console.error('Failed to fetch job detail:', e) }
   }
+
+  /**
+   * Re-read each of this job's slide files locally and report unreadable ones.
+   *
+   * force:true on purpose — the question is whether the file is good *now*, so a
+   * cached pass from before it was re-copied is the wrong answer.
+   */
+  const checkJobFiles = async () => {
+    const hashes = (detail?.slides || [])
+      .map(s => s.slide_hash)
+      .filter((h): h is string => !!h)
+    if (hashes.length === 0) return
+    setCheckingFiles(true)
+    setFileCheck(null)
+    try {
+      const res = await fetch(`${getApiBase()}/qc/run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ slide_hashes: hashes, force: true }),
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json()
+      setFileCheck(data.results || {})
+    } catch (e) {
+      console.error('Slide file check failed:', e)
+      setFileCheck({})
+    } finally {
+      setCheckingFiles(false)
+    }
+  }
+
+  // Results belong to one job; drop them when the selection moves.
+  useEffect(() => { setFileCheck(null) }, [selectedId])
 
   useEffect(() => { fetchJobs() }, [])
 
@@ -445,8 +492,19 @@ export function AnalysisInstrument() {
               {/* per-slide heatmap */}
               <div className="px-6 pt-5">
                 <div className="flex items-center justify-between mb-3">
-                  <span className="text-[13px] font-bold tracking-tight">
+                  <span className="flex items-center gap-2 text-[13px] font-bold tracking-tight">
                     Per-slide progress · {detail.slide_count} slides
+                    <button
+                      onClick={checkJobFiles}
+                      disabled={checkingFiles}
+                      title="Re-read each slide file on this server and report any that are truncated or unreadable"
+                      className="inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[11px] font-medium text-muted-foreground hover:bg-muted disabled:opacity-50"
+                    >
+                      {checkingFiles
+                        ? <Loader2 className="h-3 w-3 animate-spin" />
+                        : <FileSearch className="h-3 w-3" />}
+                      Check files
+                    </button>
                   </span>
                   <span className="flex gap-3.5 text-[11px] text-muted-foreground">
                     <Legend cls="bg-emerald-600" label={`Done ${detail.completed_count}`} />
@@ -481,6 +539,48 @@ export function AnalysisInstrument() {
                   })}
                 </div>
               </div>
+
+              {/* File-check results — which slide to re-copy */}
+              {fileCheck && (() => {
+                const bad = Object.entries(fileCheck).filter(([, r]) => r.status === 'fail')
+                if (bad.length === 0) {
+                  return (
+                    <div className="mx-6 mt-4 rounded-md border border-emerald-200 bg-emerald-50/60 px-4 py-2.5 text-[12px] text-emerald-800">
+                      All {Object.keys(fileCheck).length} slide files read cleanly here — whatever
+                      stopped the run, it wasn't a damaged file on this server.
+                    </div>
+                  )
+                }
+                return (
+                  <div className="mx-6 mt-4 rounded-md border border-red-200 bg-red-50/60 overflow-hidden">
+                    <div className="flex items-center gap-2 border-b border-red-200 px-4 py-2.5 text-xs font-bold text-red-700">
+                      <AlertTriangle className="h-4 w-4" />
+                      {bad.length} slide file{bad.length !== 1 ? 's' : ''} unreadable — re-copy
+                      {bad.length !== 1 ? ' them' : ' it'} and resubmit
+                    </div>
+                    <div className="divide-y divide-red-100">
+                      {bad.map(([hash, r]) => {
+                        const reason = (r.checks || []).find(c => c.status === 'fail')
+                        return (
+                          <div key={hash} className="px-4 py-2.5">
+                            <div className="text-[12px] font-semibold">
+                              {r.filename || hash.slice(0, 12) + '…'}
+                            </div>
+                            {reason && (
+                              <div className="text-[11px] text-red-700">{reason.detail}</div>
+                            )}
+                            {r.filepath && (
+                              <div className="mt-1">
+                                <CopyableText text={r.filepath} className="text-[11px]" />
+                              </div>
+                            )}
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </div>
+                )
+              })()}
 
               {/* failed list */}
               {failedSlides.length > 0 && (
