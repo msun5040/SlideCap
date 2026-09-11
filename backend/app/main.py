@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException, Query, Depends, UploadFile, File, Re
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from io import BytesIO
 import csv
 import io
@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import text as sa_text, func, or_
 
 from .config import settings
-from .db import init_db, get_db, get_session, Case, Slide, Tag, Project, Cohort, CohortFlag, CohortPatient, CohortPatientCase, CohortPlaceholder, Analysis, AnalysisJob, JobSlide, SlideQC, RequestSheet, RequestRow, RequestStatus, Study, StudyGroup, init_lock, get_lock, Patient, ExternalMapping, generate_slidecap_id
+from .db import init_db, get_db, get_session, Case, Slide, Tag, Project, Cohort, CohortFlag, CohortGroupScheme, CohortGroup, CohortProjection, CohortPatient, CohortPatientCase, CohortPlaceholder, Analysis, AnalysisJob, JobSlide, SlideQC, RequestSheet, RequestRow, RequestStatus, Study, StudyGroup, init_lock, get_lock, Patient, ExternalMapping, generate_slidecap_id
 from .services import SlideHasher, SlideIndexer, ClusterService, JobStatusPoller
 from .services import tiff_pyramid
 from .auth import AuthMiddleware, create_challenge, verify_challenge, create_token, verify_token, cleanup_expired_challenges
@@ -1818,6 +1818,47 @@ def _generate_tile_bytes(slide_hash: str, level: int, col: int, row: int) -> byt
     return ts.getTile(x, y, z)
 
 
+@app.get("/slides/{slide_hash}/region.jpeg")
+def get_slide_region(
+    slide_hash: str,
+    x: int = Query(..., description="Region left edge, level-0 pixels"),
+    y: int = Query(..., description="Region top edge, level-0 pixels"),
+    size: int = Query(..., gt=0, le=8192, description="Region width/height, level-0 pixels"),
+    out: int = Query(512, gt=0, le=2048, description="Output size in pixels"),
+):
+    """
+    Crop an arbitrary square region of a slide at level-0 coordinates.
+
+    Exists for the cohort projection workspace: clicking a point has to show the
+    actual tissue of that patch, and patch coordinates are already level-0
+    top-left pixels, so they drop straight in. DZI tiles can't serve this — a
+    patch rarely aligns to a tile grid.
+
+    Reuses the cached large_image source, so this costs one region read rather
+    than re-opening the slide.
+    """
+    ts = _get_tile_source(slide_hash)
+    try:
+        data, _mime = ts.getRegion(
+            region={"left": x, "top": y, "right": x + size, "bottom": y + size,
+                    "units": "base_pixels"},
+            output={"maxWidth": out, "maxHeight": out},
+            encoding="JPEG",
+        )
+    except Exception as e:
+        # Out-of-bounds coordinates are the common cause and are worth naming,
+        # since a bad patch_size/coordinate pairing shows up here first.
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not read region ({x},{y},{size}px) from slide: {type(e).__name__}: {e}",
+        )
+    return Response(
+        content=data,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "private, max-age=86400"},
+    )
+
+
 @app.get("/slides/{slide_hash}/tiles/{level}/{col}_{row}.jpeg")
 def get_slide_tile(slide_hash: str, level: int, col: int, row: int):
     """
@@ -2471,6 +2512,55 @@ class CohortFlagCreate(BaseModel):
 class CohortFlagPatch(BaseModel):
     add_case_hashes: List[str] = []
     remove_case_hashes: List[str] = []
+
+
+class CohortGroupSpec(BaseModel):
+    """A group supplied inline when creating a scheme."""
+    name: str
+    color: Optional[str] = None
+    sort_order: Optional[int] = None
+
+
+class CohortGroupSchemeCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    sort_order: Optional[int] = None
+    groups: List[CohortGroupSpec] = []
+
+
+class CohortGroupSchemeUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    sort_order: Optional[int] = None
+
+
+class CohortGroupCreate(BaseModel):
+    name: str
+    color: Optional[str] = None
+    sort_order: Optional[int] = None
+
+
+class CohortGroupUpdate(BaseModel):
+    name: Optional[str] = None
+    color: Optional[str] = None
+    sort_order: Optional[int] = None
+
+
+class CohortProjectionCreate(BaseModel):
+    method: str = "umap"
+    # None = any completed analysis for the slide (most recent wins).
+    analysis_id: Optional[int] = None
+    # None = every slide in the cohort that has usable output.
+    slide_hashes: Optional[List[str]] = None
+    params: Dict[str, Any] = {}
+
+
+class CohortGroupSlides(BaseModel):
+    add_slide_hashes: List[str] = []
+    remove_slide_hashes: List[str] = []
+    # Assigning to one group pulls the slide out of its siblings by default —
+    # a scheme is normally a partition ("Pre" or "Post", not both).
+    exclusive: bool = True
 
 
 @app.get("/cohorts")
@@ -5095,6 +5185,507 @@ def delete_cohort_flag(cohort_id: int, flag_id: int, db: Session = Depends(get_d
         raise HTTPException(status_code=404, detail="Flag not found")
     db.delete(flag)
     db.commit()
+    return {"status": "ok"}
+
+
+# ============================================================
+# Cohort group schemes — user-defined labels used to colour cohort projections
+#
+# A scheme is one axis of labelling ("Timepoint", "Treatment arm"); its groups
+# are the values ("Pre", "Post"). Membership is slide-level so pre/post slides
+# from the same accession can differ. These never influence a projection's
+# maths — they're joined in at plot time, which is why re-labelling a cohort
+# doesn't invalidate an existing projection.
+# ============================================================
+
+def _serialize_group(g: CohortGroup) -> dict:
+    return {
+        "id": g.id,
+        "name": g.name,
+        "color": g.color,
+        "sort_order": g.sort_order,
+        "slide_count": len(g.slides),
+        "slide_hashes": [s.slide_hash for s in g.slides],
+    }
+
+
+def _serialize_scheme(sch: CohortGroupScheme) -> dict:
+    return {
+        "id": sch.id,
+        "cohort_id": sch.cohort_id,
+        "name": sch.name,
+        "description": sch.description,
+        "sort_order": sch.sort_order,
+        "groups": [_serialize_group(g) for g in sch.groups],
+    }
+
+
+def _get_scheme_or_404(db: Session, cohort_id: int, scheme_id: int) -> CohortGroupScheme:
+    sch = db.query(CohortGroupScheme).filter_by(id=scheme_id, cohort_id=cohort_id).first()
+    if not sch:
+        raise HTTPException(status_code=404, detail="Group scheme not found")
+    return sch
+
+
+def _get_group_or_404(db: Session, cohort_id: int, group_id: int) -> CohortGroup:
+    """Fetch a group, verifying it belongs to this cohort via its scheme."""
+    g = (
+        db.query(CohortGroup)
+        .join(CohortGroupScheme, CohortGroup.scheme_id == CohortGroupScheme.id)
+        .filter(CohortGroup.id == group_id, CohortGroupScheme.cohort_id == cohort_id)
+        .first()
+    )
+    if not g:
+        raise HTTPException(status_code=404, detail="Group not found")
+    return g
+
+
+@app.get("/cohorts/{cohort_id}/group-schemes")
+def list_cohort_group_schemes(cohort_id: int, db: Session = Depends(get_db)):
+    """All labelling schemes for a cohort, each with its groups and membership."""
+    schemes = (
+        db.query(CohortGroupScheme)
+        .filter_by(cohort_id=cohort_id)
+        .order_by(CohortGroupScheme.sort_order, CohortGroupScheme.id)
+        .all()
+    )
+    return [_serialize_scheme(s) for s in schemes]
+
+
+@app.post("/cohorts/{cohort_id}/group-schemes")
+def create_cohort_group_scheme(cohort_id: int, data: CohortGroupSchemeCreate,
+                               db: Session = Depends(get_db)):
+    cohort = db.query(Cohort).filter_by(id=cohort_id).first()
+    if not cohort:
+        raise HTTPException(status_code=404, detail="Cohort not found")
+    name = data.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Scheme name cannot be empty")
+
+    with get_lock().write_lock():
+        # Append to the end unless told otherwise.
+        if data.sort_order is None:
+            existing = db.query(CohortGroupScheme).filter_by(cohort_id=cohort_id).count()
+            sort_order = existing
+        else:
+            sort_order = data.sort_order
+        sch = CohortGroupScheme(cohort_id=cohort_id, name=name,
+                                description=(data.description or None),
+                                sort_order=sort_order)
+        db.add(sch)
+        db.flush()
+        for i, g in enumerate(data.groups or []):
+            gname = (g.name or "").strip()
+            if not gname:
+                continue
+            db.add(CohortGroup(scheme_id=sch.id, name=gname, color=g.color,
+                               sort_order=g.sort_order if g.sort_order is not None else i))
+        db.commit()
+    db.refresh(sch)
+    return _serialize_scheme(sch)
+
+
+@app.patch("/cohorts/{cohort_id}/group-schemes/{scheme_id}")
+def update_cohort_group_scheme(cohort_id: int, scheme_id: int, data: CohortGroupSchemeUpdate,
+                               db: Session = Depends(get_db)):
+    sch = _get_scheme_or_404(db, cohort_id, scheme_id)
+    with get_lock().write_lock():
+        if data.name is not None:
+            name = data.name.strip()
+            if not name:
+                raise HTTPException(status_code=400, detail="Scheme name cannot be empty")
+            sch.name = name
+        if data.description is not None:
+            sch.description = data.description or None
+        if data.sort_order is not None:
+            sch.sort_order = data.sort_order
+        db.commit()
+    db.refresh(sch)
+    return _serialize_scheme(sch)
+
+
+@app.delete("/cohorts/{cohort_id}/group-schemes/{scheme_id}")
+def delete_cohort_group_scheme(cohort_id: int, scheme_id: int, db: Session = Depends(get_db)):
+    """Delete a scheme and its groups. Slides are untouched — only labels go."""
+    sch = _get_scheme_or_404(db, cohort_id, scheme_id)
+    with get_lock().write_lock():
+        db.delete(sch)
+        db.commit()
+    return {"status": "ok"}
+
+
+@app.post("/cohorts/{cohort_id}/group-schemes/{scheme_id}/groups")
+def create_cohort_group(cohort_id: int, scheme_id: int, data: CohortGroupCreate,
+                        db: Session = Depends(get_db)):
+    sch = _get_scheme_or_404(db, cohort_id, scheme_id)
+    name = data.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Group name cannot be empty")
+    with get_lock().write_lock():
+        sort_order = data.sort_order if data.sort_order is not None else len(sch.groups)
+        g = CohortGroup(scheme_id=sch.id, name=name, color=data.color, sort_order=sort_order)
+        db.add(g)
+        db.commit()
+    db.refresh(g)
+    return _serialize_group(g)
+
+
+@app.patch("/cohorts/{cohort_id}/groups/{group_id}")
+def update_cohort_group(cohort_id: int, group_id: int, data: CohortGroupUpdate,
+                        db: Session = Depends(get_db)):
+    g = _get_group_or_404(db, cohort_id, group_id)
+    with get_lock().write_lock():
+        if data.name is not None:
+            name = data.name.strip()
+            if not name:
+                raise HTTPException(status_code=400, detail="Group name cannot be empty")
+            g.name = name
+        if data.color is not None:
+            g.color = data.color or None
+        if data.sort_order is not None:
+            g.sort_order = data.sort_order
+        db.commit()
+    db.refresh(g)
+    return _serialize_group(g)
+
+
+@app.delete("/cohorts/{cohort_id}/groups/{group_id}")
+def delete_cohort_group(cohort_id: int, group_id: int, db: Session = Depends(get_db)):
+    g = _get_group_or_404(db, cohort_id, group_id)
+    with get_lock().write_lock():
+        db.delete(g)
+        db.commit()
+    return {"status": "ok"}
+
+
+@app.put("/cohorts/{cohort_id}/groups/{group_id}/slides")
+def set_cohort_group_slides(cohort_id: int, group_id: int, data: CohortGroupSlides,
+                            db: Session = Depends(get_db)):
+    """
+    Add/remove slides in a group.
+
+    `exclusive` (default true) removes the given slides from every *other* group
+    in the same scheme first, so assigning a slide to "Post" takes it out of
+    "Pre" without the caller having to do two calls. Set it false to allow a
+    slide to sit in several groups of one scheme.
+    """
+    g = _get_group_or_404(db, cohort_id, group_id)
+
+    add_hashes = list(dict.fromkeys(data.add_slide_hashes))
+    remove_hashes = set(data.remove_slide_hashes)
+
+    wanted = set(add_hashes) | remove_hashes
+    slides_by_hash = {}
+    if wanted:
+        slides_by_hash = {
+            s.slide_hash: s
+            for s in db.query(Slide).filter(Slide.slide_hash.in_(list(wanted))).all()
+        }
+    not_found = sorted(wanted - set(slides_by_hash))
+
+    with get_lock().write_lock():
+        current = {s.slide_hash: s for s in g.slides}
+
+        if data.exclusive and add_hashes:
+            siblings = [sib for sib in g.scheme.groups if sib.id != g.id]
+            for sib in siblings:
+                keep = [s for s in sib.slides if s.slide_hash not in set(add_hashes)]
+                if len(keep) != len(sib.slides):
+                    sib.slides = keep
+
+        for h in add_hashes:
+            s = slides_by_hash.get(h)
+            if s is not None and h not in current:
+                g.slides.append(s)
+                current[h] = s
+        if remove_hashes:
+            g.slides = [s for s in g.slides if s.slide_hash not in remove_hashes]
+        db.commit()
+
+    db.refresh(g)
+    result = _serialize_group(g)
+    result["not_found"] = not_found
+    return result
+
+
+# ============================================================
+# Cohort projections — 2D embedding of every patch across a cohort
+#
+# The compute is minutes-long, so the endpoint starts a daemon thread and the
+# row itself carries progress for the UI to poll (same shape as the slide-sort
+# and pyramid-conversion paths). Nothing here reads group labels: a projection
+# is the geometry, groups only colour it afterwards.
+# ============================================================
+
+PROJECTION_DIR_NAME = "cohort-projections"
+
+
+def _projection_root() -> Path:
+    """Artifacts live on local disk — they're derived, rebuildable, and the
+    network drive is the wrong place for hundreds of MB of scratch."""
+    p = settings.local_data_path / PROJECTION_DIR_NAME
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _serialize_projection(pr: CohortProjection, db: Session = None) -> dict:
+    return {
+        "id": pr.id,
+        "cohort_id": pr.cohort_id,
+        "analysis_id": pr.analysis_id,
+        "analysis_name": pr.analysis.name if pr.analysis else None,
+        "method": pr.method,
+        "params": pr.get_params(),
+        "slide_hashes": pr.get_slide_hashes(),
+        "slide_count": len(pr.get_slide_hashes()),
+        "status": pr.status,
+        "progress_pct": pr.progress_pct or 0,
+        "progress_stage": pr.progress_stage,
+        "error_message": pr.error_message,
+        "point_count": pr.point_count,
+        "feature_dim": pr.feature_dim,
+        "created_at": pr.created_at.isoformat() if pr.created_at else None,
+        "started_at": pr.started_at.isoformat() if pr.started_at else None,
+        "completed_at": pr.completed_at.isoformat() if pr.completed_at else None,
+    }
+
+
+def _collect_projection_sources(db: Session, cohort: Cohort, analysis_id: Optional[int],
+                                slide_hashes: Optional[List[str]]):
+    """
+    Resolve cohort slides to on-disk UNI inputs.
+
+    Returns (sources, skipped) where skipped explains per-slide why a slide
+    couldn't contribute — a partially-analysed cohort is normal, and silently
+    dropping slides from a cohort-wide plot would be misleading.
+    """
+    from .services.cohort_projection import SlideSource
+    from .analyses import uni as uni_mod
+
+    wanted = set(slide_hashes) if slide_hashes else None
+    slides = [s for s in cohort.slides if (wanted is None or s.slide_hash in wanted)]
+    slide_ids = {s.id: s for s in slides}
+    if not slide_ids:
+        return [], []
+
+    q = (
+        db.query(JobSlide)
+        .join(AnalysisJob, JobSlide.job_id == AnalysisJob.id)
+        .options(joinedload(JobSlide.job).joinedload(AnalysisJob.analysis),
+                 joinedload(JobSlide.slide))
+        .filter(JobSlide.slide_id.in_(list(slide_ids.keys())),
+                JobSlide.status == "completed")
+    )
+    if analysis_id is not None:
+        q = q.filter(AnalysisJob.analysis_id == analysis_id)
+
+    # Most recent completed run wins when a slide has been analysed more than once.
+    best: dict = {}
+    for js in q.all():
+        prev = best.get(js.slide_id)
+        if prev is None or (js.completed_at or datetime.min) > (prev.completed_at or datetime.min):
+            best[js.slide_id] = js
+
+    sources, skipped = [], []
+    for sid, slide in slide_ids.items():
+        js = best.get(sid)
+        if js is None:
+            skipped.append({"slide_hash": slide.slide_hash, "reason": "no completed analysis"})
+            continue
+        output_dir = _resolve_job_slide_output(js)
+        if not output_dir:
+            skipped.append({"slide_hash": slide.slide_hash, "reason": "output directory not found"})
+            continue
+        stem = Path(js.filename).stem if js.filename else None
+        if not stem:
+            skipped.append({"slide_hash": slide.slide_hash, "reason": "no filename recorded"})
+            continue
+        try:
+            features_h5, patches_h5 = uni_mod._find_uni_files(output_dir, stem)
+        except FileNotFoundError as e:
+            skipped.append({"slide_hash": slide.slide_hash, "reason": str(e)})
+            continue
+        sources.append(SlideSource(
+            slide_hash=slide.slide_hash,
+            features_h5=features_h5,
+            patches_h5=patches_h5,
+            display_name=slide.display_name or stem,
+        ))
+
+    # Stable order so slide_idx in the artifact is reproducible run to run.
+    sources.sort(key=lambda s: s.slide_hash)
+    return sources, skipped
+
+
+def _run_projection_background(projection_id: int, sources, method: str, params: dict) -> None:
+    """
+    Worker thread. Uses short-lived sessions per update so a multi-minute compute
+    never holds a DB session or the write lock open.
+    """
+    from .services.cohort_projection import build_projection, ProjectionError
+
+    def _update(**fields):
+        db = get_session()
+        try:
+            pr = db.query(CohortProjection).filter_by(id=projection_id).first()
+            if pr:
+                for k, v in fields.items():
+                    setattr(pr, k, v)
+                db.commit()
+        except Exception as e:
+            print(f"[cohort-projection] status update failed: {e}")
+        finally:
+            db.close()
+
+    # Throttle DB writes: progress fires per chunk, which is far more often
+    # than anyone polls.
+    last = {"pct": -1, "t": 0.0}
+
+    def progress(pct: int, stage: str):
+        now = time.time()
+        if pct >= 100 or pct - last["pct"] >= 2 or now - last["t"] > 3:
+            last["pct"], last["t"] = pct, now
+            _update(progress_pct=pct, progress_stage=stage)
+
+    _update(status="running", started_at=datetime.now(), progress_pct=0,
+            progress_stage="Starting")
+    root = _projection_root()
+    out_path = root / f"projection-{projection_id}.scproj"
+    work_dir = root / f"work-{projection_id}"
+
+    try:
+        result = build_projection(
+            sources, out_path, work_dir, method=method, params=params, progress=progress,
+        )
+        _update(status="completed",
+                completed_at=datetime.now(),
+                progress_pct=100,
+                progress_stage="Done",
+                artifact_path=f"{PROJECTION_DIR_NAME}/{out_path.name}",
+                point_count=result.point_count,
+                feature_dim=result.feature_dim,
+                params_json=json.dumps(params),
+                error_message=None)
+        print(f"[cohort-projection] #{projection_id} done: {result.point_count:,} points "
+              f"in {result.elapsed_seconds:.0f}s")
+    except ProjectionError as e:
+        _update(status="failed", completed_at=datetime.now(), error_message=str(e))
+        print(f"[cohort-projection] #{projection_id} failed: {e}")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        _update(status="failed", completed_at=datetime.now(),
+                error_message=f"{type(e).__name__}: {e}")
+    finally:
+        try:
+            shutil.rmtree(work_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+@app.get("/cohorts/{cohort_id}/projections")
+def list_cohort_projections(cohort_id: int, db: Session = Depends(get_db)):
+    rows = (
+        db.query(CohortProjection)
+        .options(joinedload(CohortProjection.analysis))
+        .filter_by(cohort_id=cohort_id)
+        .order_by(CohortProjection.created_at.desc())
+        .all()
+    )
+    return [_serialize_projection(p) for p in rows]
+
+
+@app.post("/cohorts/{cohort_id}/projections")
+def create_cohort_projection(cohort_id: int, data: CohortProjectionCreate,
+                             db: Session = Depends(get_db)):
+    """Start a projection. Returns immediately; poll the row for progress."""
+    cohort = db.query(Cohort).options(joinedload(Cohort.slides)).filter_by(id=cohort_id).first()
+    if not cohort:
+        raise HTTPException(status_code=404, detail="Cohort not found")
+    if data.method not in ("umap", "pca"):
+        raise HTTPException(status_code=400,
+                            detail=f"Unsupported method {data.method!r}. Use 'umap' or 'pca'.")
+
+    sources, skipped = _collect_projection_sources(
+        db, cohort, data.analysis_id, data.slide_hashes)
+    if not sources:
+        detail = "No slides in this cohort have completed analysis output to project."
+        if skipped:
+            detail += f" {len(skipped)} slide(s) skipped; first reason: {skipped[0]['reason']}"
+        raise HTTPException(status_code=400, detail=detail)
+
+    params = dict(data.params or {})
+    with get_lock().write_lock():
+        pr = CohortProjection(
+            cohort_id=cohort_id,
+            analysis_id=data.analysis_id,
+            method=data.method,
+            status="pending",
+            progress_pct=0,
+            progress_stage="Queued",
+        )
+        pr.set_params(params)
+        pr.set_slide_hashes([s.slide_hash for s in sources])
+        db.add(pr)
+        db.commit()
+        db.refresh(pr)
+
+    threading.Thread(
+        target=_run_projection_background,
+        args=(pr.id, sources, data.method, params),
+        name=f"projection-{pr.id}",
+        daemon=True,
+    ).start()
+
+    result = _serialize_projection(pr)
+    result["skipped"] = skipped
+    return result
+
+
+@app.get("/projections/{projection_id}")
+def get_cohort_projection(projection_id: int, db: Session = Depends(get_db)):
+    pr = (db.query(CohortProjection)
+            .options(joinedload(CohortProjection.analysis))
+            .filter_by(id=projection_id).first())
+    if not pr:
+        raise HTTPException(status_code=404, detail="Projection not found")
+    return _serialize_projection(pr)
+
+
+@app.get("/projections/{projection_id}/points")
+def get_cohort_projection_points(projection_id: int, db: Session = Depends(get_db)):
+    """The binary artifact: header + columnar arrays. See cohort_projection.py."""
+    pr = db.query(CohortProjection).filter_by(id=projection_id).first()
+    if not pr:
+        raise HTTPException(status_code=404, detail="Projection not found")
+    if pr.status != "completed" or not pr.artifact_path:
+        raise HTTPException(status_code=409,
+                            detail=f"Projection is {pr.status}, not ready to read.")
+    path = settings.local_data_path / pr.artifact_path
+    if not path.exists():
+        raise HTTPException(status_code=404,
+                            detail="Projection artifact is missing; re-run the projection.")
+    return FileResponse(
+        str(path),
+        media_type="application/octet-stream",
+        headers={"Cache-Control": "private, max-age=86400"},
+    )
+
+
+@app.delete("/projections/{projection_id}")
+def delete_cohort_projection(projection_id: int, db: Session = Depends(get_db)):
+    pr = db.query(CohortProjection).filter_by(id=projection_id).first()
+    if not pr:
+        raise HTTPException(status_code=404, detail="Projection not found")
+    artifact = settings.local_data_path / pr.artifact_path if pr.artifact_path else None
+    with get_lock().write_lock():
+        db.delete(pr)
+        db.commit()
+    if artifact:
+        try:
+            artifact.unlink(missing_ok=True)
+        except OSError as e:
+            print(f"[cohort-projection] could not remove {artifact}: {e}")
     return {"status": "ok"}
 
 

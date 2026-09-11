@@ -174,11 +174,25 @@ def _project(features, method: str, params: Dict[str, Any]):
     """Return (N, 2) float array. Methods: 'umap', 'pca'."""
     import numpy as np
     if method == "pca":
-        from sklearn.decomposition import PCA
+        try:
+            from sklearn.decomposition import PCA
+        except ImportError:
+            # RuntimeError (not ImportError) so the render endpoint's handler
+            # turns this into a 500 carrying the fix, the way h5py already does.
+            raise RuntimeError(
+                "scikit-learn is required for the PCA renderer. Install with "
+                "`pip install scikit-learn` in the backend's Python env."
+            )
         # PCA is stable + fast; no hyperparameters worth exposing.
         return PCA(n_components=2, random_state=0).fit_transform(features)
     elif method == "umap":
-        import umap
+        try:
+            import umap
+        except ImportError:
+            raise RuntimeError(
+                "umap-learn is required for the UMAP renderer. Install with "
+                "`pip install umap-learn` in the backend's Python env."
+            )
         n_neighbors = int(params.get("n_neighbors", 15))
         min_dist = float(params.get("min_dist", 0.1))
         # n_neighbors must be < n_samples; clamp so tiny slides don't crash.

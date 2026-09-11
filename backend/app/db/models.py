@@ -200,6 +200,16 @@ cohort_auto_tags = Table(
     Column('tag_id', Integer, ForeignKey('tags.id', ondelete='CASCADE'), primary_key=True),
 )
 
+# Slide membership in a within-cohort group (see CohortGroup). Slide-level rather
+# than case-level so a single accession's pre- and post-treatment slides can land
+# in different groups.
+cohort_group_slides = Table(
+    'cohort_group_slides', Base.metadata,
+    Column('group_id', Integer, ForeignKey('cohort_groups.id', ondelete='CASCADE'), primary_key=True),
+    Column('slide_id', Integer, ForeignKey('slides.id', ondelete='CASCADE'), primary_key=True),
+    Column('added_at', DateTime, default=datetime.utcnow)
+)
+
 
 # ============================================================
 # Core Models
@@ -374,6 +384,11 @@ class Cohort(Base):
     patients = relationship('CohortPatient', back_populates='cohort', cascade='all, delete-orphan')
     flags = relationship('CohortFlag', back_populates='cohort', cascade='all, delete-orphan')
     placeholders = relationship('CohortPlaceholder', back_populates='cohort', cascade='all, delete-orphan')
+    group_schemes = relationship('CohortGroupScheme', back_populates='cohort',
+                                 cascade='all, delete-orphan',
+                                 order_by='CohortGroupScheme.sort_order')
+    projections = relationship('CohortProjection', back_populates='cohort',
+                               cascade='all, delete-orphan')
 
     @property
     def slide_count(self) -> int:
@@ -466,6 +481,145 @@ class CohortFlag(Base):
     def set_case_hashes(self, hashes: list):
         import json
         self.case_hashes_json = json.dumps(list(set(hashes)))
+
+
+class CohortGroupScheme(Base):
+    """
+    One axis of user-defined labelling within a cohort — e.g. "Timepoint" or
+    "Treatment arm". A cohort can hold several independent schemes, because the
+    questions you want to colour a plot by are rarely a single partition.
+
+    Schemes exist purely to label slides. They never influence a projection's
+    maths; a CohortProjection is computed before any scheme is read, and groups
+    are joined in at plot time to colour points. That separation is deliberate:
+    you can re-label a cohort and re-colour an existing projection without
+    recomputing anything.
+    """
+    __tablename__ = 'cohort_group_schemes'
+
+    id = Column(Integer, primary_key=True)
+    cohort_id = Column(Integer, ForeignKey('cohorts.id', ondelete='CASCADE'), nullable=False, index=True)
+    name = Column(String(200), nullable=False)
+    description = Column(String(1000))
+    sort_order = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    cohort = relationship('Cohort', back_populates='group_schemes')
+    groups = relationship('CohortGroup', back_populates='scheme', cascade='all, delete-orphan',
+                          order_by='CohortGroup.sort_order')
+
+    def __repr__(self):
+        return f"<CohortGroupScheme(name={self.name}, cohort_id={self.cohort_id})>"
+
+
+class CohortGroup(Base):
+    """
+    One label within a scheme — "Pre-treatment", "Arm B", and so on. Carries its
+    own colour so a plot legend stays stable as slides move between groups.
+
+    Nothing enforces that the groups of a scheme partition the cohort: a slide
+    may be in no group (rendered as "unassigned") or, if the user wants, in more
+    than one. Enforcing exclusivity in the schema would make the common case
+    (relabelling) needlessly painful.
+    """
+    __tablename__ = 'cohort_groups'
+
+    id = Column(Integer, primary_key=True)
+    scheme_id = Column(Integer, ForeignKey('cohort_group_schemes.id', ondelete='CASCADE'),
+                       nullable=False, index=True)
+    name = Column(String(200), nullable=False)
+    color = Column(String(7))   # hex, for the plot legend
+    sort_order = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    scheme = relationship('CohortGroupScheme', back_populates='groups')
+    slides = relationship('Slide', secondary=cohort_group_slides)
+
+    @property
+    def slide_count(self) -> int:
+        return len(self.slides)
+
+    def __repr__(self):
+        return f"<CohortGroup(name={self.name}, scheme_id={self.scheme_id})>"
+
+
+class CohortProjection(Base):
+    """
+    A 2D embedding of every patch across a cohort's slides — the job row and the
+    pointer to its artifact, in one.
+
+    Doubles as progress state while the compute runs (status/progress_pct/
+    progress_stage mirror AnalysisJob/JobSlide) because the work happens in a
+    background thread on this server and the UI polls this row.
+
+    `slide_hashes_json` pins exactly which slides went in. Cohorts mutate —
+    auto_add_cases pulls new slides in over time — so without this a projection
+    could not be reproduced or honestly described after the fact.
+
+    The artifact itself is columnar binary on local disk, not JSON and not in the
+    DB: at a million patches the per-point-object JSON the single-slide renderer
+    emits would be hundreds of megabytes.
+    """
+    __tablename__ = 'cohort_projections'
+
+    id = Column(Integer, primary_key=True)
+    cohort_id = Column(Integer, ForeignKey('cohorts.id', ondelete='CASCADE'), nullable=False, index=True)
+    # Which analysis supplied the embeddings (UNI today; the kind decides how to read them).
+    analysis_id = Column(Integer, ForeignKey('analyses.id', ondelete='SET NULL'), nullable=True)
+
+    method = Column(String(20), nullable=False)   # umap | pca  (tsne reserved)
+    params_json = Column(Text, default='{}')      # method params actually used, for reproducibility
+    slide_hashes_json = Column(Text, default='[]')
+
+    status = Column(String(20), nullable=False, default='pending')  # pending|running|completed|failed
+    progress_pct = Column(Integer, default=0)
+    progress_stage = Column(String(200))
+    error_message = Column(Text)
+
+    # Local paths, relative to settings.local_data_path — stored relative so they
+    # survive a host migration, unlike the absolute analysis output paths that
+    # need _resolve_job_slide_output() to re-anchor.
+    artifact_path = Column(String(500))
+    cluster_labels_path = Column(String(500))  # reserved: k-NN / Leiden overlays
+
+    point_count = Column(Integer)
+    feature_dim = Column(Integer)   # measured from the .h5, not assumed
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime)
+    completed_at = Column(DateTime)
+
+    cohort = relationship('Cohort', back_populates='projections')
+    analysis = relationship('Analysis')
+
+    def get_slide_hashes(self) -> list:
+        import json
+        try:
+            return json.loads(self.slide_hashes_json or '[]')
+        except Exception:
+            return []
+
+    def set_slide_hashes(self, hashes: list):
+        import json
+        # Order matters here, unlike CohortFlag: slide_idx in the artifact indexes
+        # into this list, so it must round-trip exactly as written.
+        self.slide_hashes_json = json.dumps(list(hashes))
+
+    def get_params(self) -> dict:
+        import json
+        try:
+            return json.loads(self.params_json or '{}')
+        except Exception:
+            return {}
+
+    def set_params(self, params: dict):
+        import json
+        self.params_json = json.dumps(params or {})
+
+    def __repr__(self):
+        return (f"<CohortProjection(id={self.id}, cohort_id={self.cohort_id}, "
+                f"method={self.method}, status={self.status})>")
 
 
 class CohortPlaceholder(Base):
@@ -924,6 +1078,10 @@ Index('idx_job_slides_status', JobSlide.status)
 Index('idx_request_rows_status', RequestRow.case_status)
 Index('idx_study_groups_study', StudyGroup.study_id)
 Index('idx_study_groups_parent', StudyGroup.parent_id)
+Index('idx_cohort_group_schemes_cohort', CohortGroupScheme.cohort_id)
+Index('idx_cohort_groups_scheme', CohortGroup.scheme_id)
+Index('idx_cohort_projections_cohort', CohortProjection.cohort_id)
+Index('idx_cohort_projections_status', CohortProjection.status)
 
 
 # ============================================================
