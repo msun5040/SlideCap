@@ -1118,8 +1118,8 @@ from openslide.deepzoom import DeepZoomGenerator
 
 # ── Tile source via `large_image` ────────────────────────────────────────
 #
-# Replaced the openslide.DeepZoomGenerator + PIL re-encode pipeline (pre-
-# large_image snapshot saved at backend/app/main.py.pre-large-image).
+# Replaced the openslide.DeepZoomGenerator + PIL re-encode pipeline (see git
+# history for the pre-large_image version of this module).
 # Why: SVS files store JPEG-compressed tiles in their native pyramid. The
 # old path decoded those JPEGs to RGBA, converted to RGB, re-encoded to
 # JPEG (~20-30ms per tile), and shipped them. large_image's tiff source

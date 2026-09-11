@@ -53,9 +53,9 @@ export function EmbeddingScatter({
   // Map scatter coords → canvas pixels. Recomputed only when the data
   // bounds change, not on every redraw — keeps hover lookups O(N) on a
   // pre-projected array rather than O(N) plus the projection math.
-  const { points, project, unproject } = useMemo(() => {
+  const { points, project } = useMemo(() => {
     if (!data || data.points.length === 0) {
-      return { points: [], project: () => ({ px: 0, py: 0 }), unproject: () => null as null | { px: number; py: number } }
+      return { points: [], project: () => ({ px: 0, py: 0 }) }
     }
     let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity
     for (const p of data.points) {
@@ -75,7 +75,6 @@ export function EmbeddingScatter({
         const py = pad + (1 - (y - minY) / spanY) * (canvasH - 2 * pad)
         return { px, py }
       },
-      unproject: () => null,
     }
   }, [data])
 

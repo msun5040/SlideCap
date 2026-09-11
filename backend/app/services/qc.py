@@ -16,13 +16,19 @@ from pathlib import Path
 from typing import Optional
 
 # Bump when the checks/thresholds change so cached results can be re-evaluated.
-QC_VERSION = "v3"   # v3 adds the level-0 corruption probe
+QC_VERSION = "v4"   # v4 scans every tile's JPEG stream
 
-# Corruption probe: how many level-0 windows to read, and how big.
-# 8 x 512px is well under a second on a local disk and enough to catch a
-# truncated file; it is not a full integrity scan.
+# Corruption probe: how many level-0 windows to read, and how big. This decodes,
+# so it stays a sample; the marker scan below is what provides full coverage.
 PROBE_REGIONS = 8
 PROBE_SIZE = 512
+
+# Tile marker scan: seconds to spend before reporting partial coverage. The scan
+# is seek-bound, so it's milliseconds on local disk but can crawl over SMB on a
+# multi-gigabyte slide — bounded rather than open-ended, and honest about it.
+MARKER_SCAN_BUDGET_S = 20.0
+# How many bad tiles to name before summarising the rest.
+MARKER_REPORT_LIMIT = 5
 
 # ── Absolute tissue AREA thresholds (mm²) ──
 # Percentage-of-slide is a poor gate: a valid needle biopsy is only a few % of a
@@ -146,6 +152,80 @@ def _truncation_check(filepath: Path) -> Optional[str]:
         # Unparseable as TIFF, or an exotic layout — not our call to fail it here.
         return None
     return None
+
+
+def _scan_tile_markers(filepath: Path) -> Optional[dict]:
+    """
+    Check every JPEG tile's stream markers without decoding anything.
+
+    A JPEG starts with SOI (FF D8) and ends with EOI (FF D9). Reading four bytes
+    per tile from the TIFF tile table covers the *whole* slide for the price of
+    some seeks — on a 9 MB fixture, ~1 ms.
+
+    This exists because sampling wasn't good enough. The region probe reads nine
+    windows; a slide has thousands of tiles, so a single damaged tile slips past
+    it almost every time. Measured on a file with exactly one corrupted tile: the
+    probe found nothing, and openslide didn't even raise when that tile was read
+    directly — while this scan named it immediately.
+
+    Returns None when the check doesn't apply (not a tiled JPEG TIFF, tifffile
+    missing). Otherwise a dict with `bad` (list of "page/tile" labels), `checked`,
+    `total`, and `complete` — `complete` is False when the time budget ran out,
+    so "no bad tiles" is never confused with "didn't finish looking".
+    """
+    try:
+        import tifffile
+    except ImportError:
+        return None
+
+    import time
+    started = time.time()
+    try:
+        entries: list = []   # (offset, count, page_index, tile_index)
+        with tifffile.TiffFile(str(filepath)) as tf:
+            for pi, page in enumerate(tf.pages):
+                offs = page.tags.get("TileOffsets")
+                cnts = page.tags.get("TileByteCounts")
+                if not offs or not cnts:
+                    continue
+                # Only JPEG-compressed tiles have SOI/EOI to check. Note
+                # str() on tifffile's COMPRESSION enum yields the number ("7"),
+                # not the name — read .name, and fall back to the TIFF codes.
+                comp = getattr(page, "compression", None)
+                comp_name = str(getattr(comp, "name", "") or "").upper()
+                comp_val = int(getattr(comp, "value", comp) or 0) if comp is not None else 0
+                if "JPEG" not in comp_name and comp_val not in (6, 7):
+                    continue
+                o = offs.value if isinstance(offs.value, (list, tuple)) else [offs.value]
+                c = cnts.value if isinstance(cnts.value, (list, tuple)) else [cnts.value]
+                for ti, (a, b) in enumerate(zip(o, c)):
+                    if int(b) > 4:
+                        entries.append((int(a), int(b), pi, ti))
+        if not entries:
+            return None
+
+        # Ascending offset order turns thousands of random seeks into a forward
+        # pass, which is the difference between fast and unusable on a network
+        # drive.
+        entries.sort()
+        bad: list = []
+        checked = 0
+        with open(filepath, "rb") as fh:
+            for off, cnt, pi, ti in entries:
+                if time.time() - started > MARKER_SCAN_BUDGET_S:
+                    break
+                fh.seek(off)
+                if fh.read(2) != b"\xff\xd8":
+                    bad.append(f"page {pi}/tile {ti}")
+                else:
+                    fh.seek(off + cnt - 2)
+                    if fh.read(2) != b"\xff\xd9":
+                        bad.append(f"page {pi}/tile {ti}")
+                checked += 1
+        return {"bad": bad, "checked": checked, "total": len(entries),
+                "complete": checked == len(entries)}
+    except Exception:
+        return None
 
 
 def _probe_regions(filepath: Path, points: list) -> tuple:
@@ -283,6 +363,35 @@ def run_qc(slide_hash: str, filepath: Path) -> dict:
     #        are truncated. This is the check that catches that.
     probe_status, probe_detail = _probe_regions(filepath, probe_points)
     checks.append({"name": "image_data", "status": probe_status, "detail": probe_detail})
+
+    # ── 5. Every tile's JPEG stream, by markers only.
+    #        Full coverage rather than the sample above — this is the check that
+    #        finds a single damaged tile in a slide that otherwise reads fine.
+    scan = _scan_tile_markers(filepath)
+    if scan is not None:
+        metrics["tiles_checked"] = scan["checked"]
+        metrics["tiles_total"] = scan["total"]
+        n_bad = len(scan["bad"])
+        if n_bad:
+            named = ", ".join(scan["bad"][:MARKER_REPORT_LIMIT])
+            more = f" (+{n_bad - MARKER_REPORT_LIMIT} more)" if n_bad > MARKER_REPORT_LIMIT else ""
+            checks.append({
+                "name": "tile_streams", "status": "fail",
+                "detail": f"{n_bad} of {scan['checked']} tiles have a damaged JPEG stream: "
+                          f"{named}{more}. Re-copy the slide.",
+            })
+        elif not scan["complete"]:
+            # Say so rather than implying a clean bill of health.
+            checks.append({
+                "name": "tile_streams", "status": "warn",
+                "detail": f"checked {scan['checked']:,} of {scan['total']:,} tiles before the "
+                          f"{MARKER_SCAN_BUDGET_S:.0f}s budget ran out — none bad so far",
+            })
+        else:
+            checks.append({
+                "name": "tile_streams", "status": "pass",
+                "detail": f"all {scan['total']:,} tile streams intact",
+            })
 
     status = _worst([c["status"] for c in checks])
     return {"status": status, "metrics": metrics, "checks": checks, "qc_version": QC_VERSION}
