@@ -20,12 +20,22 @@ interface FileTreeNode {
   children?: FileTreeNode[]
 }
 
+/** Per-slide context from /analyses/pull-inspect, keyed like PickTarget.key. */
+export interface PickMeta {
+  /** Absolute server path the relative file paths start from. */
+  source_dir: string | null
+  /** Folder an export writes this slide's files under: the full slide name. */
+  folder: string
+}
+
 interface Props {
   /** Selected slides (with the chosen analysis) whose outputs to browse. */
   targets: PickTarget[]
   /** slideKey → set of selected relpaths. Controlled by the parent. */
   value: Record<string, string[]>
   onChange: (next: Record<string, string[]>) => void
+  /** Receives per-slide source/destination names once the trees load. */
+  onMeta?: (meta: Record<string, PickMeta>) => void
 }
 
 function formatBytes(bytes?: number): string {
@@ -73,8 +83,9 @@ function flattenFiles(nodes: FileTreeNode[]): FileTreeNode[] {
  * Selection is reported up as slideKey → relpaths[]; the parent turns that
  * into export items.
  */
-export function AnalysisFilePicker({ targets, value, onChange }: Props) {
+export function AnalysisFilePicker({ targets, value, onChange, onMeta }: Props) {
   const [trees, setTrees] = useState<Record<string, FileTreeNode[]>>({})
+  const [meta, setMeta] = useState<Record<string, PickMeta>>({})
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [expandedSlides, setExpandedSlides] = useState<Set<string>>(new Set())
@@ -99,8 +110,10 @@ export function AnalysisFilePicker({ targets, value, onChange }: Props) {
         if (!r.ok) throw new Error(`HTTP ${r.status}`)
         return r.json()
       })
-      .then((data: { trees: Record<string, FileTreeNode[]> }) => {
+      .then((data: { trees: Record<string, FileTreeNode[]>; meta?: Record<string, PickMeta> }) => {
         setTrees(data.trees || {})
+        setMeta(data.meta || {})
+        onMeta?.(data.meta || {})
         setLoading(false)
       })
       .catch(e => {
@@ -231,6 +244,8 @@ export function AnalysisFilePicker({ targets, value, onChange }: Props) {
           const sel = new Set(value[t.key] || [])
           const open = expandedSlides.has(t.key)
           const nSel = files.filter(f => sel.has(f.path)).length
+          const m = meta[t.key]
+          const name = m?.folder || t.label
           return (
             <div key={t.key}>
               <button
@@ -240,11 +255,16 @@ export function AnalysisFilePicker({ targets, value, onChange }: Props) {
               >
                 {open ? <ChevronDown className="h-3.5 w-3.5 shrink-0" /> : <ChevronRight className="h-3.5 w-3.5 shrink-0" />}
                 <Folder className="h-3.5 w-3.5 text-amber-500 shrink-0" />
-                <span className="text-[12px] font-mono truncate flex-1 min-w-0" title={t.label}>{t.label}</span>
+                <span className="text-[12px] font-mono truncate flex-1 min-w-0" title={m?.source_dir || name}>{name}</span>
                 <span className="text-[11px] text-muted-foreground shrink-0">
                   {nSel > 0 ? `${nSel}/${files.length}` : `${files.length} files`}
                 </span>
               </button>
+              {open && m?.source_dir && (
+                <p className="pl-8 pr-2 pb-1 text-[10px] text-muted-foreground break-all">
+                  Paths below start in <span className="font-mono">{m.source_dir}</span>
+                </p>
+              )}
               {open && (
                 files.length === 0 ? (
                   <p className="text-[11px] text-muted-foreground pl-8 pb-1.5">No files on disk.</p>

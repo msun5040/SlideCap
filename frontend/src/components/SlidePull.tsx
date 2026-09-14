@@ -46,7 +46,7 @@ import {
 import { getApiBase, normalizeAccession } from '@/api'
 import { copyToClipboard } from '@/lib/clipboard'
 import { saveBlob } from '@/lib/download'
-import { AnalysisFilePicker, type PickTarget } from '@/components/AnalysisFilePicker'
+import { AnalysisFilePicker, type PickMeta, type PickTarget } from '@/components/AnalysisFilePicker'
 import type { Slide, Cohort, CohortDetail, RequestSheet, RequestSheetDetail } from '@/types/slide'
 
 // ── Types ───────────────────────────────────────────────────────
@@ -571,6 +571,27 @@ export function SlidePull() {
       })
   ), [analysisFileSel])
   const analysisFileCount = analysisItems.reduce((n, i) => n + i.files.length, 0)
+  const [analysisMeta, setAnalysisMeta] = useState<Record<string, PickMeta>>({})
+
+  // A concrete example of where the export will put things, built from the
+  // first selected file — so "analysis-files/<slide>/…" isn't left abstract.
+  const exportPreview = useMemo(() => {
+    const dir = exportDir.trim().replace(/[\\/]+$/, '')
+    const sep = dir.includes('\\') && !dir.includes('/') ? '\\' : '/'
+    const join = (...parts: string[]) => parts.filter(Boolean).join(sep)
+    const item = analysisItems[0]
+    const m = item ? analysisMeta[`${item.job_id}:${item.slide_hash}`] : undefined
+    const file = item?.files[0]
+    const folder = m?.folder || '<slide name>'
+    const fileSep = (p: string) => (sep === '\\' ? p.replace(/\//g, '\\') : p)
+    return {
+      dir: dir || '<output directory>',
+      slideDest: join(dir || '<output directory>', 'pull-001', '<slide name>.svs'),
+      analysisDest: file ? join(dir || '<output directory>', 'analysis-files', folder, fileSep(file)) : null,
+      analysisZip: file ? `${folder}/${file}` : null,
+      analysisSource: file && m?.source_dir ? `${m.source_dir.replace(/[\\/]+$/, '')}/${file}` : null,
+    }
+  }, [exportDir, analysisItems, analysisMeta])
 
   // When the extractor is enabled but no analysis chosen, default to the first.
   useEffect(() => {
@@ -997,6 +1018,7 @@ export function SlidePull() {
                     targets={analysisTargets}
                     value={analysisFileSel}
                     onChange={setAnalysisFileSel}
+                    onMeta={setAnalysisMeta}
                   />
                 </div>
               )}
@@ -1016,7 +1038,7 @@ export function SlidePull() {
                     <p className="text-[11px] text-muted-foreground">
                       Absolute path <span className="font-medium">on the SlideCap server</span> — not on this computer. A path
                       only your machine can see (or a relative one) will land in the wrong place; use Download ZIP for a local copy.
-                      Slides go into {exportBinSize}-slide <span className="font-mono">pull-NNN/</span> bins; analysis files into <span className="font-mono">analysis-files/&lt;case&gt;/</span>.
+                      Slides go into {exportBinSize}-slide <span className="font-mono">pull-NNN/</span> bins; analysis files into <span className="font-mono">analysis-files/&lt;full slide name&gt;/</span>.
                     </p>
                   </div>
                   <div className="grid grid-cols-2 gap-3">
@@ -1060,6 +1082,39 @@ export function SlidePull() {
                     </label>
                   </div>
                 </>
+              )}
+
+              {/* Where files will go — a worked example from the current selection */}
+              {((includeSlides && selectedSlides > 0) || (includeAnalysis && exportPreview.analysisZip)) && (
+                <div className="rounded-md border border-gray-200 bg-muted/20 p-2.5 space-y-1.5 min-w-0">
+                  <p className="text-[11px] font-medium text-muted-foreground uppercase tracking-wide">
+                    {exportMode === 'directory' ? 'Where files will go (on the server)' : 'Inside the downloaded ZIP'}
+                  </p>
+                  {includeSlides && selectedSlides > 0 && (
+                    <div className="text-[11px]">
+                      <span className="text-muted-foreground">Slides → </span>
+                      <span className="font-mono break-all">
+                        {exportMode === 'directory' ? exportPreview.slideDest : '<accession>/<slide name>.svs'}
+                      </span>
+                    </div>
+                  )}
+                  {includeAnalysis && exportPreview.analysisZip && (
+                    <>
+                      <div className="text-[11px]">
+                        <span className="text-muted-foreground">Analysis files → </span>
+                        <span className="font-mono break-all">
+                          {exportMode === 'directory' ? exportPreview.analysisDest : exportPreview.analysisZip}
+                        </span>
+                      </div>
+                      {exportPreview.analysisSource && (
+                        <div className="text-[11px]">
+                          <span className="text-muted-foreground">copied from → </span>
+                          <span className="font-mono break-all text-muted-foreground">{exportPreview.analysisSource}</span>
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
               )}
 
               {exportError && (

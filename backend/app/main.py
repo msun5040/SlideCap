@@ -7082,9 +7082,14 @@ def analyses_pull_inspect(data: AnalysisInspectRequest, db: Session = Depends(ge
     compute the union of output file types across a cohort and to let the user
     hand-pick individual files per slide.
 
-    Returns {trees: {"<job_id>:<slide_hash>": FileTreeNode[]}}.
+    Returns {trees: {"<job_id>:<slide_hash>": FileTreeNode[]},
+             meta:  {"<job_id>:<slide_hash>": {source_dir, folder}}}.
+
+    `source_dir` is the absolute server path the tree's relative paths start
+    from; `folder` is the per-slide folder name an export will write them under.
     """
     trees: dict[str, list] = {}
+    meta: dict[str, dict] = {}
     job_cache: dict[int, object] = {}
     for item in data.items:
         key = f"{item.job_id}:{item.slide_hash}"
@@ -7098,16 +7103,19 @@ def analyses_pull_inspect(data: AnalysisInspectRequest, db: Session = Depends(ge
                 .first()
             )
         job = job_cache[item.job_id]
-        if not job:
-            trees[key] = []
-            continue
-        js = next((js for js in job.slides if js.slide and js.slide.slide_hash == item.slide_hash), None)
+        js = None
+        if job:
+            js = next((js for js in job.slides if js.slide and js.slide.slide_hash == item.slide_hash), None)
         output_dir = _resolve_job_slide_output(js) if js else None
+        meta[key] = {
+            "source_dir": str(output_dir) if output_dir else None,
+            "folder": _pull_group_name(item.slide_hash, js.filename if js else None)[1],
+        }
         trees[key] = (
             _build_file_tree(output_dir, output_dir)
             if output_dir and output_dir.exists() else []
         )
-    return {"trees": trees}
+    return {"trees": trees, "meta": meta}
 
 
 class AnalysisPullFileItem(BaseModel):
@@ -7129,22 +7137,30 @@ class AnalysisPullExportRequest(BaseModel):
     skip_existing: bool = True
 
 
-def _pull_group_name(slide_hash: str) -> tuple[str, str]:
+def _pull_group_name(slide_hash: str, fallback_name: Optional[str] = None) -> tuple[str, str]:
     """(accession, per-slide folder name) for laying out an analysis pull.
 
-    Mirror layout: each slide's selected files land under one folder named
-    <accession>_<hash8>, preserving whatever nested structure the analysis
-    produced (the relpath carries it). Falls back to the hash when the file
-    isn't parseable/available.
+    Mirror layout: each slide's selected files land under one folder named after
+    the slide's full file name without extension (e.g.
+    BS24-K10001_A1-1_HNE_194601), preserving whatever nested structure the
+    analysis produced (the relpath carries it). The accession alone isn't enough:
+    a case has several slides, and two slides of one accession can differ only by
+    the trailing random id — which also makes the folder recognisable, unlike the
+    old <accession>_<hash8>. Falls back to the job's recorded filename, then to
+    the hash, when the slide isn't in the path cache.
     """
     accession = slide_hash[:12]
+    stem = None
     if indexer:
         fp = indexer.get_filepath(slide_hash)
         if fp:
+            stem = fp.stem
             parsed = indexer.parser.parse(fp.name)
             if parsed and parsed.accession:
                 accession = parsed.accession
-    group = re.sub(r"[^\w.\-]", "_", f"{accession}_{slide_hash[:8]}")
+    if not stem and fallback_name:
+        stem = Path(fallback_name).stem
+    group = re.sub(r"[^\w.\-]", "_", stem or slide_hash[:12])
     return accession, group
 
 
@@ -7158,6 +7174,10 @@ def _resolve_analysis_pull_files(items: List[AnalysisPullFileItem], db: Session)
     missing: list[dict] = []
     accessions: set[str] = set()
     job_cache: dict[int, object] = {}
+    # Folder name → the slide that owns it. Full file stems are unique within a
+    # slides folder, but an external-folder slide can share a stem with a clinical
+    # one; never let two slides merge into (and overwrite) one folder.
+    group_owner: dict[str, str] = {}
     for item in items:
         if item.job_id not in job_cache:
             job_cache[item.job_id] = (
@@ -7171,7 +7191,10 @@ def _resolve_analysis_pull_files(items: List[AnalysisPullFileItem], db: Session)
         if job:
             js = next((js for js in job.slides if js.slide and js.slide.slide_hash == item.slide_hash), None)
         output_dir = _resolve_job_slide_output(js) if js else None
-        accession, group = _pull_group_name(item.slide_hash)
+        accession, group = _pull_group_name(item.slide_hash, js.filename if js else None)
+        if group_owner.setdefault(group, item.slide_hash) != item.slide_hash:
+            group = f"{group}_{item.slide_hash[:8]}"
+            group_owner.setdefault(group, item.slide_hash)
         for rel in item.files:
             if not output_dir:
                 missing.append({"slide_hash": item.slide_hash, "file": rel})
