@@ -88,7 +88,7 @@ export function AnalysisWorkspace() {
   const [selectedHashes, setSelectedHashes] = useState<Set<string>>(new Set())
 
   const [projections, setProjections] = useState<ProjectionRow[]>([])
-  const [method, setMethod] = useState<'umap' | 'pca'>('umap')
+  const [method, setMethod] = useState<'umap' | 'tsne' | 'pca'>('umap')
   const [starting, setStarting] = useState(false)
   const [runError, setRunError] = useState('')
   const [openProjection, setOpenProjection] = useState<number | null>(null)
@@ -511,10 +511,11 @@ export function AnalysisWorkspace() {
             <div className="flex flex-wrap items-center gap-2">
               <select
                 value={method}
-                onChange={e => setMethod(e.target.value as 'umap' | 'pca')}
+                onChange={e => setMethod(e.target.value as 'umap' | 'tsne' | 'pca')}
                 className="h-8 rounded-md border border-input bg-background px-2 text-[13px]"
               >
                 <option value="umap">UMAP</option>
+                <option value="tsne">t-SNE (slower)</option>
                 <option value="pca">PCA (fast)</option>
               </select>
               <Button size="sm" className="h-8" onClick={runProjection}
@@ -525,6 +526,7 @@ export function AnalysisWorkspace() {
               </Button>
               <span className="text-[11px] text-muted-foreground">
                 every patch of every ready slide
+                {method !== 'pca' && ' · starts with a PCA pre-reduction step'}
               </span>
             </div>
 
@@ -544,7 +546,9 @@ export function AnalysisWorkspace() {
               {projections.map(p => (
                 <div key={p.id} className="rounded-md border p-2.5">
                   <div className="flex items-center gap-2">
-                    <span className="text-[13px] font-medium">{p.method.toUpperCase()}</span>
+                    <span className="text-[13px] font-medium">
+                      {({ umap: 'UMAP', tsne: 't-SNE', pca: 'PCA' } as Record<string, string>)[p.method] ?? p.method.toUpperCase()}
+                    </span>
                     <span className="text-[11px] text-muted-foreground">
                       {p.slide_count} slides
                       {p.point_count ? ` · ${p.point_count.toLocaleString()} patches` : ''}

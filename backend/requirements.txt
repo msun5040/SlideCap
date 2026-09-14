@@ -32,6 +32,8 @@ numpy>=1.24.0
 h5py>=3.10.0
 scikit-learn>=1.3.0
 umap-learn>=0.5.5
+# t-SNE for cohort projections (FFT-accelerated; sklearn's TSNE is too slow at cohort scale)
+openTSNE>=1.0.0
 
 # Clustering over cohort projections. k-means/HDBSCAN/agglomerative use
 # scikit-learn (HDBSCAN needs >=1.3); Leiden needs these two.

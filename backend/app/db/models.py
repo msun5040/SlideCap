@@ -569,7 +569,7 @@ class CohortProjection(Base):
     # Which analysis supplied the embeddings (UNI today; the kind decides how to read them).
     analysis_id = Column(Integer, ForeignKey('analyses.id', ondelete='SET NULL'), nullable=True)
 
-    method = Column(String(20), nullable=False)   # umap | pca  (tsne reserved)
+    method = Column(String(20), nullable=False)   # umap | tsne | pca
     params_json = Column(Text, default='{}')      # method params actually used, for reproducibility
     slide_hashes_json = Column(Text, default='[]')
 

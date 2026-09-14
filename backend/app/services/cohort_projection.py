@@ -20,9 +20,16 @@ The way out is to never hold the full-dimensional matrix:
   4. Run UMAP on the memmap. PCA-first is standard practice and improves kNN
      quality as well as cost.
 
+  4b. Or run t-SNE (openTSNE, FFT-accelerated) on the same memmap. Slower than
+     UMAP at cohort scale and it doesn't preserve global layout as well, but it
+     separates local structure sharply.
+
 `method="pca"` short-circuits after step 2 — the first two components are already
 the answer, which makes it a cheap smoke test on a large cohort before committing
-to a UMAP run.
+to a UMAP or t-SNE run.
+
+Because UMAP and t-SNE both start with the PCA steps, their progress first reads
+"PCA pre-reduction" — stage labels say which step of which method is running.
 
 Group labels are deliberately absent from this module. A projection is computed
 before any label is read, and groups are joined in at plot time purely to colour
@@ -345,6 +352,75 @@ def _run_umap(reduced, params, progress):
     return np.asarray(coords, dtype=np.float32)
 
 
+def _run_tsne(reduced, params, progress):
+    """
+    t-SNE on the reduced matrix via openTSNE.
+
+    scikit-learn's TSNE was measured and rejected: 166s at 50k points against
+    openTSNE's 39s, and it scales far worse beyond that. openTSNE uses approximate
+    nearest neighbours for the affinities and FFT-interpolated gradients, which is
+    what keeps a cohort-sized run in minutes rather than hours. Still markedly
+    slower than UMAP at the same size.
+
+    Like UMAP, seeding is opt-in and whatever was used is recorded in params.
+    """
+    openTSNE = _require("openTSNE", "openTSNE")
+    np = _require("numpy")
+
+    n = reduced.shape[0]
+    if n < 4:
+        raise ProjectionError("t-SNE needs at least 4 patches.")
+    # openTSNE needs 3*perplexity < n for its neighbour search.
+    perplexity = float(params.get("perplexity", 30))
+    perplexity = max(2.0, min(perplexity, (n - 1) / 3.0))
+    early_iter = int(params.get("early_exaggeration_iter", 250))
+    n_iter = int(params.get("n_iter", 500))
+    seed = params.get("random_state")
+    total = early_iter + n_iter
+
+    # openTSNE restarts the iteration count for each optimisation phase, so
+    # carry an offset to report one continuous count.
+    state = {"offset": 0, "last": 0}
+
+    def on_iter(iteration, error, embedding):
+        if iteration < state["last"]:
+            state["offset"] += state["last"]
+        state["last"] = iteration
+        done = min(total, state["offset"] + iteration)
+        progress(70 + int(22 * done / max(1, total)),
+                 f"Step 3/3 · t-SNE · optimising layout ({done}/{total} iterations)")
+        return False  # never stop early
+
+    params["perplexity"] = perplexity
+    params["n_iter"] = n_iter
+    params["early_exaggeration_iter"] = early_iter
+    params["random_state"] = int(seed) if seed is not None else None
+
+    progress(66, f"Step 3/3 · t-SNE · computing neighbour affinities for {n:,} points. "
+                 f"This is the slow part.")
+    tsne = openTSNE.TSNE(
+        n_components=2,
+        perplexity=perplexity,
+        n_iter=n_iter,
+        early_exaggeration_iter=early_iter,
+        initialization="pca",
+        metric="euclidean",
+        neighbors="auto",
+        negative_gradient_method="fft",
+        callbacks=on_iter,
+        callbacks_every_iters=25,
+        random_state=int(seed) if seed is not None else None,
+        n_jobs=-1,
+        verbose=False,
+    )
+    emb = tsne.fit(np.ascontiguousarray(np.asarray(reduced), dtype=np.float32))
+    progress(92, "Projection complete")
+    return np.asarray(emb, dtype=np.float32)
+
+
+_METHOD_LABELS = {"umap": "UMAP", "tsne": "t-SNE", "pca": "PCA"}
+
+
 def write_artifact(path: Path, xy, slide_idx, patch_x, patch_y, sources, method, params,
                    feature_dim: int) -> None:
     """
@@ -515,8 +591,23 @@ def build_projection(
     params = dict(params or {})
     started = time.time()
 
-    if method not in ("umap", "pca"):
-        raise ProjectionError(f"Unknown method {method!r}. Supported: umap, pca.")
+    if method not in _METHOD_LABELS:
+        raise ProjectionError(f"Unknown method {method!r}. Supported: umap, tsne, pca.")
+
+    # UMAP and t-SNE both run PCA first, so without this their progress reads
+    # "Fitting PCA" for the first half and looks like the wrong method is running.
+    label = _METHOD_LABELS[method]
+    raw_progress = progress
+
+    def progress(pct: int, stage: str):
+        if stage.startswith("Step ") or pct >= 93:
+            raw_progress(pct, stage)
+        elif method == "pca":
+            raw_progress(pct, f"PCA · {stage}")
+        elif pct < 66:
+            raw_progress(pct, f"Step {1 if pct < 45 else 2}/3 · PCA pre-reduction for {label} · {stage}")
+        else:
+            raw_progress(pct, f"Step 3/3 · {label} · {stage}")
 
     total_n, dim = scan_sources(sources, progress)
     progress(5, f"{total_n:,} patches across {len(sources)} slides")
@@ -534,6 +625,8 @@ def build_projection(
             # copy, so no view keeps the memmap's file handle open.
             progress(70, "Taking first two principal components")
             xy = np.array(reduced[:, :2], dtype=np.float32, copy=True)
+        elif method == "tsne":
+            xy = _run_tsne(reduced, params, progress)
         else:
             xy = _run_umap(reduced, params, progress)
 

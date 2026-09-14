@@ -540,7 +540,8 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
         {data && (
           <span className="text-[11px] text-neutral-400">
             {data.pointCount.toLocaleString()} patches · {data.header.slides.length} slides ·{' '}
-            {data.header.method.toUpperCase()}
+            {({ umap: 'UMAP', tsne: 't-SNE', pca: 'PCA' } as Record<string, string>)[data.header.method]
+              ?? data.header.method.toUpperCase()}
           </span>
         )}
         <button onClick={onClose} className="ml-auto rounded p-1 hover:bg-neutral-800" title="Close (Esc)">

@@ -5621,9 +5621,9 @@ def create_cohort_projection(cohort_id: int, data: CohortProjectionCreate,
     cohort = db.query(Cohort).options(joinedload(Cohort.slides)).filter_by(id=cohort_id).first()
     if not cohort:
         raise HTTPException(status_code=404, detail="Cohort not found")
-    if data.method not in ("umap", "pca"):
+    if data.method not in ("umap", "tsne", "pca"):
         raise HTTPException(status_code=400,
-                            detail=f"Unsupported method {data.method!r}. Use 'umap' or 'pca'.")
+                            detail=f"Unsupported method {data.method!r}. Use 'umap', 'tsne' or 'pca'.")
 
     sources, skipped = _collect_projection_sources(
         db, cohort, data.analysis_id, data.slide_hashes)
