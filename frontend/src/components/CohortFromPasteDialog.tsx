@@ -183,6 +183,29 @@ export function CohortFromPasteDialog({ open, onOpenChange, onCreated, targetCoh
     })
   }
 
+  // Select-all acts only on what the filters currently show, so it never picks
+  // up slides hidden by a year/stain filter.
+  const selectedShown = filteredSlides.filter(s => selected.has(s.slide_hash)).length
+  const allShownSelected = filteredSlides.length > 0 && selectedShown === filteredSlides.length
+  const toggleAll = () => {
+    setSelected(prev => {
+      const next = new Set(prev)
+      if (allShownSelected) filteredSlides.forEach(s => next.delete(s.slide_hash))
+      else filteredSlides.forEach(s => next.add(s.slide_hash))
+      return next
+    })
+  }
+
+  /** Tick every slide in a case, or clear them all if they're already ticked. */
+  const toggleCase = (slides: Slide[]) => {
+    setSelected(prev => {
+      const next = new Set(prev)
+      const all = slides.every(s => next.has(s.slide_hash))
+      slides.forEach(s => (all ? next.delete(s.slide_hash) : next.add(s.slide_hash)))
+      return next
+    })
+  }
+
   const toggleYear = (y: number) => {
     setFilterYears(prev => {
       const next = new Set(prev)
@@ -445,30 +468,52 @@ export function CohortFromPasteDialog({ open, onOpenChange, onCreated, targetCoh
                     No slides match the current filters.
                   </p>
                 ) : (
-                  groups.map(g => (
-                    <div key={g.caseKey} className="px-3 py-2">
-                      <div className="text-xs font-medium mb-1">
-                        {g.label} {g.year && <span className="text-muted-foreground">({g.year})</span>}
-                        <span className="ml-2 text-muted-foreground">
-                          {g.slides.filter(s => selected.has(s.slide_hash)).length}/{g.slides.length}
-                        </span>
-                      </div>
-                      <div className="space-y-0.5">
-                        {g.slides.map(s => (
-                          <label key={s.slide_hash}
-                            className="flex items-center gap-2 text-xs pl-4 py-0.5 hover:bg-muted/40 cursor-pointer rounded">
+                  <>
+                    {/* Select all — sticky so it stays reachable in a long list */}
+                    <label className="sticky top-0 z-10 flex items-center gap-2 bg-muted/60 backdrop-blur px-3 py-1.5 text-xs font-medium cursor-pointer">
+                      <Checkbox
+                        checked={allShownSelected ? true : selectedShown > 0 ? 'indeterminate' : false}
+                        onCheckedChange={toggleAll}
+                      />
+                      <span>Select all</span>
+                      <span className="ml-auto font-normal text-muted-foreground">
+                        {selectedShown} of {filteredSlides.length} selected
+                      </span>
+                    </label>
+                    {groups.map(g => {
+                      const picked = g.slides.filter(s => selected.has(s.slide_hash)).length
+                      return (
+                        <div key={g.caseKey} className="px-3 py-1.5">
+                          <label className="flex items-center gap-2 text-xs font-medium py-0.5 cursor-pointer rounded hover:bg-muted/40">
                             <Checkbox
-                              checked={selected.has(s.slide_hash)}
-                              onCheckedChange={() => toggleSlide(s.slide_hash)}
+                              checked={picked === g.slides.length ? true : picked > 0 ? 'indeterminate' : false}
+                              onCheckedChange={() => toggleCase(g.slides)}
                             />
-                            <span className="font-mono text-muted-foreground w-12 shrink-0">{s.block_id}</span>
-                            <Badge variant="outline" className="text-[10px] h-5 px-1.5">{s.stain_type}</Badge>
-                            <span className="text-muted-foreground">{displaySlide(s)}</span>
+                            <span>
+                              {g.label} {g.year && <span className="text-muted-foreground">({g.year})</span>}
+                            </span>
+                            <span className="ml-auto font-normal text-muted-foreground">
+                              {picked}/{g.slides.length}
+                            </span>
                           </label>
-                        ))}
-                      </div>
-                    </div>
-                  ))
+                          <div className="space-y-0.5">
+                            {g.slides.map(s => (
+                              <label key={s.slide_hash}
+                                className="flex items-center gap-2 text-xs pl-6 py-0.5 hover:bg-muted/40 cursor-pointer rounded">
+                                <Checkbox
+                                  checked={selected.has(s.slide_hash)}
+                                  onCheckedChange={() => toggleSlide(s.slide_hash)}
+                                />
+                                <span className="font-mono text-muted-foreground w-12 shrink-0">{s.block_id}</span>
+                                <Badge variant="outline" className="text-[10px] h-5 px-1.5">{s.stain_type}</Badge>
+                                <span className="text-muted-foreground">{displaySlide(s)}</span>
+                              </label>
+                            ))}
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </>
                 )}
               </div>
 
