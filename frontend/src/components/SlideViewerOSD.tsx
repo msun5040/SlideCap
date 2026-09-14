@@ -81,6 +81,7 @@ import { Button } from '@/components/ui/button'
 import { getApiBase, getAuthToken, isDemo } from '@/api'
 import { OverlayControls, type OverlaySpec, type OverlayRuntime } from '@/components/SlideOverlay'
 import { GeoJSONOverlay } from '@/components/GeoJSONOverlay'
+import { PatchClusterOverlay, type PatchMask } from '@/components/PatchClusterOverlay'
 
 interface SlideViewerOSDProps {
   slideHash: string
@@ -89,6 +90,9 @@ interface SlideViewerOSDProps {
   /** Draws a highlight rectangle on the slide at the given image-pixel coords.
    *  Used by EmbeddingScatter to point at the patch under the cursor. */
   highlightPatch?: { slide_x: number; slide_y: number; size: number } | null
+  /** Per-patch colour mask (cluster labels), painted beneath the highlight box.
+   *  Parent-controlled, like highlightPatch. */
+  patchMask?: PatchMask | null
   /** Click handler called with the click location in level-0 image-pixel
    *  coords. Used by ScatterViewerOverlay so clicking on tissue can highlight
    *  the corresponding scatter point. Not a drag — fires only on canvas-click. */
@@ -107,7 +111,7 @@ function formatElapsed(seconds: number) {
   return `${m}:${sec}`
 }
 
-export function SlideViewerOSD({ slideHash, slideName, overlays: initialOverlays = [], highlightPatch, onImageClick, embedded = false, onClose }: SlideViewerOSDProps) {
+export function SlideViewerOSD({ slideHash, slideName, overlays: initialOverlays = [], highlightPatch, patchMask, onImageClick, embedded = false, onClose }: SlideViewerOSDProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const viewerRef = useRef<any>(null)
   // Held in a ref so the OSD canvas-click handler (registered once at viewer
@@ -423,6 +427,9 @@ export function SlideViewerOSD({ slideHash, slideName, overlays: initialOverlays
         {/* Patch highlight box — driven by an external scatter / hover source.
             Lives outside the OverlayControls list because it's controlled by
             the parent (e.g. EmbeddingScatter), not by the user via the panel. */}
+        {viewerRef.current && !loading && patchMask && (
+          <PatchClusterOverlay viewer={viewerRef.current} mask={patchMask} />
+        )}
         {viewerRef.current && !loading && (
           <PatchHighlight viewer={viewerRef.current} patch={highlightPatch ?? null} />
         )}

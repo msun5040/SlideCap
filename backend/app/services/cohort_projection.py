@@ -92,6 +92,9 @@ class ProjectionResult:
     slide_hashes: List[str] = field(default_factory=list)
     elapsed_seconds: float = 0.0
     peak_chunk_rows: int = 0
+    # The PCA-reduced matrix, kept for clustering (see keep_reduced()).
+    reduced_path: Optional[Path] = None
+    reduced_dim: int = 0
 
 
 ProgressFn = Callable[[int, str], None]
@@ -427,6 +430,68 @@ def read_artifact_header(path: Path) -> dict:
         return json.loads(fh.read(hlen).decode("utf-8"))
 
 
+def keep_reduced(mm_path: Path, dest: Path) -> bool:
+    """
+    Move the work-dir memmap to its permanent home. Returns False (and logs) on
+    failure rather than raising: losing the matrix only means a later clustering
+    rebuilds it, which is no reason to fail a finished projection.
+    """
+    import gc
+    import os
+    import shutil
+    gc.collect()  # drop any lingering ndarray views of the mapping (Windows)
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.replace(mm_path, dest)
+        except OSError:
+            shutil.copyfile(mm_path, dest)
+            try:
+                mm_path.unlink()
+            except OSError:
+                pass
+        return True
+    except OSError as e:
+        print(f"[cohort-projection] could not keep reduced matrix at {dest}: {e}")
+        return False
+
+
+def rebuild_reduced(
+    sources: List[SlideSource],
+    dest: Path,
+    work_dir: Path,
+    expected_points: Optional[int] = None,
+    chunk_rows: int = DEFAULT_CHUNK_ROWS,
+    pca_dim: int = DEFAULT_PCA_DIM,
+    progress: ProgressFn = _noop_progress,
+) -> Tuple[int, int]:
+    """
+    Recreate the PCA-reduced matrix for a projection that predates keeping it.
+
+    `sources` must be in the projection's pinned slide order: row i of the result
+    has to be row i of the artifact, or every label lands on the wrong patch. The
+    refit PCA basis can differ slightly from the original — immaterial for
+    clustering — but the row count must match exactly, and is checked.
+
+    Returns (n_points, n_components).
+    """
+    total_n, dim = scan_sources(sources, progress)
+    if expected_points is not None and total_n != expected_points:
+        raise ProjectionError(
+            f"The slides' feature files now hold {total_n:,} patches, but this projection "
+            f"was built from {expected_points:,}. The analysis output changed since the "
+            f"projection ran; re-run the projection before clustering it."
+        )
+    ipca, n_components = _fit_incremental_pca(sources, total_n, dim, pca_dim, chunk_rows, progress)
+    reduced, mm_path = _transform_to_memmap(
+        sources, ipca, total_n, n_components, chunk_rows, work_dir, progress)
+    reduced.flush()
+    del reduced
+    if not keep_reduced(mm_path, dest):
+        raise ProjectionError(f"Could not write the reduced matrix to {dest}.")
+    return int(total_n), int(n_components)
+
+
 def build_projection(
     sources: List[SlideSource],
     out_path: Path,
@@ -436,12 +501,15 @@ def build_projection(
     chunk_rows: int = DEFAULT_CHUNK_ROWS,
     pca_dim: int = DEFAULT_PCA_DIM,
     progress: ProgressFn = _noop_progress,
+    reduced_out: Optional[Path] = None,
 ) -> ProjectionResult:
     """
     Project every patch of every source slide into 2D and write the artifact.
 
-    `work_dir` holds the intermediate memmap and is removed on success; point it
-    at local disk, never the network drive.
+    `work_dir` holds the intermediate memmap; point it at local disk, never the
+    network drive. When `reduced_out` is given, the PCA-reduced matrix is kept
+    there on success — clustering runs on it rather than on the 2D coordinates,
+    which for UMAP would mean clustering the embedding's distortions.
     """
     np = _require("numpy")
     params = dict(params or {})
@@ -458,12 +526,14 @@ def build_projection(
     reduced, mm_path = _transform_to_memmap(
         sources, ipca, total_n, n_components, chunk_rows, work_dir, progress)
 
+    kept = False
     try:
         if method == "pca":
             # Components come out ordered by explained variance, so the first two
-            # columns of the reduction already are the PCA projection.
+            # columns of the reduction already are the PCA projection. An explicit
+            # copy, so no view keeps the memmap's file handle open.
             progress(70, "Taking first two principal components")
-            xy = np.asarray(reduced[:, :2], dtype=np.float32)
+            xy = np.array(reduced[:, :2], dtype=np.float32, copy=True)
         else:
             xy = _run_umap(reduced, params, progress)
 
@@ -483,16 +553,23 @@ def build_projection(
         progress(96, "Writing artifact")
         write_artifact(out_path, xy, slide_idx, coords[:, 0], coords[:, 1],
                        sources, method, params, dim)
+        kept = reduced_out is not None
     finally:
-        # Free the memmap handle before unlinking, or Windows keeps the file.
+        # Free the memmap handle before moving/unlinking, or Windows keeps the file.
+        reduced.flush()
         del reduced
-        try:
-            mm_path.unlink()
-        except OSError:
-            pass
+        if kept:
+            kept = keep_reduced(mm_path, reduced_out)
+        else:
+            try:
+                mm_path.unlink()
+            except OSError:
+                pass
 
     progress(100, "Done")
     return ProjectionResult(
+        reduced_path=reduced_out if kept else None,
+        reduced_dim=int(n_components) if kept else 0,
         artifact_path=out_path,
         point_count=int(total_n),
         feature_dim=int(dim),

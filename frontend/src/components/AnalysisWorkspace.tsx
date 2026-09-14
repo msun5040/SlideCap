@@ -57,7 +57,22 @@ interface ProjectionRow {
   created_at?: string | null
 }
 
-type AnalysisStatus = Record<string, Record<string, { status: string; job_id: number }>>
+interface AnalysisStatusEntry {
+  status: string
+  job_id: number
+  analysis_id?: number | null
+  analysis_name?: string | null
+}
+
+// slide_hash → analysis key → best status across that slide's jobs
+type AnalysisStatus = Record<string, Record<string, AnalysisStatusEntry>>
+
+function analysisChipClass(status: string): string {
+  if (status === 'completed') return 'border-transparent bg-emerald-600/15 text-emerald-700 dark:text-emerald-400'
+  if (status === 'failed') return 'border-red-500/40 text-red-600'
+  // pending / running / transferring
+  return 'border-dashed border-muted-foreground/40 text-muted-foreground'
+}
 
 export function AnalysisWorkspace() {
   const [cohorts, setCohorts] = useState<CohortRow[]>([])
@@ -448,8 +463,8 @@ export function AnalysisWorkspace() {
                   </button>
                   {slides.map(s => {
                     const g = groupOfSlide.get(s.slide_hash)
-                    const ready = Object.values(analysisStatus[s.slide_hash] || {})
-                      .some(e => e.status === 'completed')
+                    const analyses = Object.entries(analysisStatus[s.slide_hash] || {})
+                      .sort(([a], [b]) => a.localeCompare(b))
                     return (
                       <label key={s.slide_hash}
                              className="flex cursor-pointer items-center gap-2 px-2 py-1 text-[12px] hover:bg-muted/30">
@@ -458,16 +473,26 @@ export function AnalysisWorkspace() {
                           onCheckedChange={() => toggleSlide(s.slide_hash)}
                         />
                         <span className="truncate">{s.block_id}-{s.slide_number} {s.stain_type}</span>
-                        {g && (
-                          <span className="ml-auto inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px]">
-                            <span className="h-2 w-2 rounded-[2px]"
-                                  style={{ backgroundColor: g.color || '#94a3b8' }} />
-                            {g.name}
-                          </span>
-                        )}
-                        {!ready && (
-                          <span className="ml-auto text-[10px] text-amber-600">no analysis</span>
-                        )}
+                        {/* One right-aligned group, so the group chip and the
+                            analysis chips never compete for the ml-auto slot. */}
+                        <span className="ml-auto flex shrink-0 items-center gap-1">
+                          {analyses.length === 0 ? (
+                            <span className="text-[10px] text-amber-600">no analysis</span>
+                          ) : analyses.map(([key, e]) => (
+                            <span key={key}
+                                  title={`${e.analysis_name || key}: ${e.status} (job ${e.job_id})`}
+                                  className={`rounded border px-1.5 py-0.5 text-[10px] ${analysisChipClass(e.status)}`}>
+                              {e.analysis_name || key}
+                            </span>
+                          ))}
+                          {g && (
+                            <span className="inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px]">
+                              <span className="h-2 w-2 rounded-[2px]"
+                                    style={{ backgroundColor: g.color || '#94a3b8' }} />
+                              {g.name}
+                            </span>
+                          )}
+                        </span>
                       </label>
                     )
                   })}

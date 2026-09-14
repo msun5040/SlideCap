@@ -33,6 +33,11 @@ h5py>=3.10.0
 scikit-learn>=1.3.0
 umap-learn>=0.5.5
 
+# Clustering over cohort projections. k-means/HDBSCAN/agglomerative use
+# scikit-learn (HDBSCAN needs >=1.3); Leiden needs these two.
+igraph>=0.11.0
+leidenalg>=0.10.0
+
 # SSH for GPU cluster
 paramiko>=3.4.0
 

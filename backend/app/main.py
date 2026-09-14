@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import text as sa_text, func, or_
 
 from .config import settings
-from .db import init_db, get_db, get_session, Case, Slide, Tag, Project, Cohort, CohortFlag, CohortGroupScheme, CohortGroup, CohortProjection, CohortPatient, CohortPatientCase, CohortPlaceholder, Analysis, AnalysisJob, JobSlide, SlideQC, RequestSheet, RequestRow, RequestStatus, Study, StudyGroup, init_lock, get_lock, Patient, ExternalMapping, generate_slidecap_id
+from .db import init_db, get_db, get_session, Case, Slide, Tag, Project, Cohort, CohortFlag, CohortGroupScheme, CohortGroup, CohortProjection, ProjectionClustering, CohortPatient, CohortPatientCase, CohortPlaceholder, Analysis, AnalysisJob, JobSlide, SlideQC, RequestSheet, RequestRow, RequestStatus, Study, StudyGroup, init_lock, get_lock, Patient, ExternalMapping, generate_slidecap_id
 from .services import SlideHasher, SlideIndexer, ClusterService, JobStatusPoller
 from .services import tiff_pyramid
 from .auth import AuthMiddleware, create_challenge, verify_challenge, create_token, verify_token, cleanup_expired_challenges
@@ -2558,6 +2558,11 @@ class CohortProjectionCreate(BaseModel):
     analysis_id: Optional[int] = None
     # None = every slide in the cohort that has usable output.
     slide_hashes: Optional[List[str]] = None
+    params: Dict[str, Any] = {}
+
+
+class ProjectionClusteringCreate(BaseModel):
+    algorithm: str   # kmeans | hdbscan | leiden | agglomerative
     params: Dict[str, Any] = {}
 
 
@@ -5450,6 +5455,9 @@ def _serialize_projection(pr: CohortProjection, db: Session = None) -> dict:
         "error_message": pr.error_message,
         "point_count": pr.point_count,
         "feature_dim": pr.feature_dim,
+        # False for projections made before the reduced matrix was kept; the
+        # first clustering on those rebuilds it (slower), and the UI says so.
+        "has_reduced": bool(pr.reduced_path and (settings.local_data_path / pr.reduced_path).exists()),
         "created_at": pr.created_at.isoformat() if pr.created_at else None,
         "started_at": pr.started_at.isoformat() if pr.started_at else None,
         "completed_at": pr.completed_at.isoformat() if pr.completed_at else None,
@@ -5558,16 +5566,21 @@ def _run_projection_background(projection_id: int, sources, method: str, params:
     root = _projection_root()
     out_path = root / f"projection-{projection_id}.scproj"
     work_dir = root / f"work-{projection_id}"
+    reduced_out = root / f"projection-{projection_id}.reduced.f32"
 
     try:
         result = build_projection(
             sources, out_path, work_dir, method=method, params=params, progress=progress,
+            reduced_out=reduced_out,
         )
         _update(status="completed",
                 completed_at=datetime.now(),
                 progress_pct=100,
                 progress_stage="Done",
                 artifact_path=f"{PROJECTION_DIR_NAME}/{out_path.name}",
+                reduced_path=(f"{PROJECTION_DIR_NAME}/{reduced_out.name}"
+                              if result.reduced_path else None),
+                reduced_dim=result.reduced_dim or None,
                 point_count=result.point_count,
                 feature_dim=result.feature_dim,
                 params_json=json.dumps(params),
@@ -5683,15 +5696,228 @@ def delete_cohort_projection(projection_id: int, db: Session = Depends(get_db)):
     pr = db.query(CohortProjection).filter_by(id=projection_id).first()
     if not pr:
         raise HTTPException(status_code=404, detail="Projection not found")
-    artifact = settings.local_data_path / pr.artifact_path if pr.artifact_path else None
+    # Derived files: the artifact, the kept reduced matrix, and every clustering's
+    # labels (their rows go with the projection via the ORM cascade).
+    rel_paths = [pr.artifact_path, pr.reduced_path] + [c.labels_path for c in pr.clusterings]
+    files = [settings.local_data_path / p for p in rel_paths if p]
     with get_lock().write_lock():
         db.delete(pr)
         db.commit()
-    if artifact:
+    for f in files:
         try:
-            artifact.unlink(missing_ok=True)
+            f.unlink(missing_ok=True)
         except OSError as e:
-            print(f"[cohort-projection] could not remove {artifact}: {e}")
+            print(f"[cohort-projection] could not remove {f}: {e}")
+    return {"status": "ok"}
+
+
+# ── Clustering over a projection ─────────────────────────────────────────────
+
+def _serialize_clustering(c: ProjectionClustering) -> dict:
+    return {
+        "id": c.id,
+        "projection_id": c.projection_id,
+        "algorithm": c.algorithm,
+        "params": c.get_params(),
+        "status": c.status,
+        "progress_pct": c.progress_pct or 0,
+        "progress_stage": c.progress_stage,
+        "error_message": c.error_message,
+        "n_clusters": c.n_clusters,
+        "n_noise": c.n_noise,
+        "silhouette": c.silhouette,
+        "approximate": bool(c.approximate),
+        "elapsed_seconds": c.elapsed_seconds,
+        "created_at": c.created_at.isoformat() if c.created_at else None,
+        "completed_at": c.completed_at.isoformat() if c.completed_at else None,
+    }
+
+
+def _run_clustering_background(clustering_id: int) -> None:
+    """
+    Worker thread: make sure the projection's reduced matrix exists (rebuilding
+    it for projections that predate keeping it), then cluster it.
+    """
+    from .services.cohort_projection import rebuild_reduced, ProjectionError
+    from .services.projection_clustering import run_clustering, ClusteringError
+
+    def _update_row(model, row_id, **fields):
+        s = get_session()
+        try:
+            row = s.query(model).filter_by(id=row_id).first()
+            if row:
+                for k, v in fields.items():
+                    setattr(row, k, v)
+                s.commit()
+        except Exception as e:
+            print(f"[clustering] status update failed: {e}")
+        finally:
+            s.close()
+
+    def _update(**fields):
+        _update_row(ProjectionClustering, clustering_id, **fields)
+
+    last = {"pct": -1, "t": 0.0}
+
+    def progress_in(lo: int, hi: int):
+        def progress(pct: int, stage: str):
+            scaled = lo + int((hi - lo) * max(0, min(100, pct)) / 100)
+            now = time.time()
+            if scaled >= 100 or scaled - last["pct"] >= 2 or now - last["t"] > 3:
+                last["pct"], last["t"] = scaled, now
+                _update(progress_pct=scaled, progress_stage=stage)
+        return progress
+
+    db = get_session()
+    try:
+        cl = db.query(ProjectionClustering).filter_by(id=clustering_id).first()
+        pr = db.query(CohortProjection).filter_by(id=cl.projection_id).first() if cl else None
+        if not cl or not pr:
+            return
+        algorithm, params = cl.algorithm, cl.get_params()
+        projection_id, point_count = pr.id, pr.point_count
+        reduced_rel, reduced_dim = pr.reduced_path, pr.reduced_dim
+        pinned = pr.get_slide_hashes()
+        cohort = (db.query(Cohort).options(joinedload(Cohort.slides))
+                  .filter_by(id=pr.cohort_id).first())
+        analysis_id = pr.analysis_id
+        _update(status="running", started_at=datetime.now(), progress_pct=0,
+                progress_stage="Starting")
+
+        root = _projection_root()
+        reduced_path = settings.local_data_path / reduced_rel if reduced_rel else None
+        cluster_lo = 0
+        if reduced_path is None or not reduced_path.exists():
+            # Rebuild in the pinned order — row i must be artifact row i.
+            if cohort is None:
+                raise ProjectionError("The projection's cohort no longer exists.")
+            sources, _skipped = _collect_projection_sources(db, cohort, analysis_id, pinned)
+            by_hash = {s.slide_hash: s for s in sources}
+            missing = [h for h in pinned if h not in by_hash]
+            if missing:
+                raise ProjectionError(
+                    f"{len(missing)} slide(s) this projection was built from are no longer "
+                    f"available (removed from the cohort or output missing). Re-run the "
+                    f"projection before clustering it.")
+            reduced_path = root / f"projection-{projection_id}.reduced.f32"
+            work_dir = root / f"work-cluster-{clustering_id}"
+            try:
+                _, reduced_dim = rebuild_reduced(
+                    [by_hash[h] for h in pinned], reduced_path, work_dir,
+                    expected_points=point_count, progress=progress_in(0, 50))
+            finally:
+                shutil.rmtree(work_dir, ignore_errors=True)
+            _update_row(CohortProjection, projection_id,
+                        reduced_path=f"{PROJECTION_DIR_NAME}/{reduced_path.name}",
+                        reduced_dim=reduced_dim)
+            cluster_lo = 50
+    except (ProjectionError, ClusteringError) as e:
+        _update(status="failed", completed_at=datetime.now(), error_message=str(e))
+        return
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        _update(status="failed", completed_at=datetime.now(),
+                error_message=f"{type(e).__name__}: {e}")
+        return
+    finally:
+        db.close()
+
+    labels_path = root / f"clustering-{clustering_id}.labels"
+    try:
+        result = run_clustering(reduced_path, point_count, reduced_dim, algorithm, params,
+                                labels_path, progress=progress_in(cluster_lo, 100))
+        _update(status="completed", completed_at=datetime.now(), progress_pct=100,
+                progress_stage="Done",
+                labels_path=f"{PROJECTION_DIR_NAME}/{labels_path.name}",
+                n_clusters=result.n_clusters, n_noise=result.n_noise,
+                silhouette=result.silhouette, approximate=result.approximate,
+                elapsed_seconds=result.elapsed_seconds,
+                params_json=json.dumps(result.params), error_message=None)
+        print(f"[clustering] #{clustering_id} {algorithm}: {result.n_clusters} clusters, "
+              f"{result.n_noise:,} noise, {result.elapsed_seconds:.0f}s")
+    except ClusteringError as e:
+        _update(status="failed", completed_at=datetime.now(), error_message=str(e))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        _update(status="failed", completed_at=datetime.now(),
+                error_message=f"{type(e).__name__}: {e}")
+
+
+@app.get("/projections/{projection_id}/clusterings")
+def list_projection_clusterings(projection_id: int, db: Session = Depends(get_db)):
+    rows = (db.query(ProjectionClustering)
+              .filter_by(projection_id=projection_id)
+              .order_by(ProjectionClustering.created_at.desc())
+              .all())
+    return [_serialize_clustering(c) for c in rows]
+
+
+@app.post("/projections/{projection_id}/clusterings")
+def create_projection_clustering(projection_id: int, data: ProjectionClusteringCreate,
+                                 db: Session = Depends(get_db)):
+    """Start a clustering run. Returns immediately; poll the row for progress."""
+    from .services.projection_clustering import ALGORITHMS
+    pr = db.query(CohortProjection).filter_by(id=projection_id).first()
+    if not pr:
+        raise HTTPException(status_code=404, detail="Projection not found")
+    if pr.status != "completed" or not pr.point_count:
+        raise HTTPException(status_code=409,
+                            detail=f"Projection is {pr.status}; cluster it once it has completed.")
+    if data.algorithm not in ALGORITHMS:
+        raise HTTPException(status_code=400,
+                            detail=f"Unsupported algorithm {data.algorithm!r}. "
+                                   f"Use one of: {', '.join(ALGORITHMS)}.")
+    with get_lock().write_lock():
+        cl = ProjectionClustering(projection_id=projection_id, algorithm=data.algorithm,
+                                  status="pending", progress_pct=0, progress_stage="Queued")
+        cl.set_params(dict(data.params or {}))
+        db.add(cl)
+        db.commit()
+        db.refresh(cl)
+    threading.Thread(target=_run_clustering_background, args=(cl.id,),
+                     name=f"clustering-{cl.id}", daemon=True).start()
+    return _serialize_clustering(cl)
+
+
+@app.get("/clusterings/{clustering_id}")
+def get_projection_clustering(clustering_id: int, db: Session = Depends(get_db)):
+    cl = db.query(ProjectionClustering).filter_by(id=clustering_id).first()
+    if not cl:
+        raise HTTPException(status_code=404, detail="Clustering not found")
+    return _serialize_clustering(cl)
+
+
+@app.get("/clusterings/{clustering_id}/labels")
+def get_projection_clustering_labels(clustering_id: int, db: Session = Depends(get_db)):
+    """Raw little-endian int16 per point, row-aligned with the projection artifact; -1 = noise."""
+    cl = db.query(ProjectionClustering).filter_by(id=clustering_id).first()
+    if not cl:
+        raise HTTPException(status_code=404, detail="Clustering not found")
+    if cl.status != "completed" or not cl.labels_path:
+        raise HTTPException(status_code=409, detail=f"Clustering is {cl.status}, not ready to read.")
+    path = settings.local_data_path / cl.labels_path
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Cluster labels are missing; re-run the clustering.")
+    return FileResponse(str(path), media_type="application/octet-stream",
+                        headers={"Cache-Control": "private, max-age=86400"})
+
+
+@app.delete("/clusterings/{clustering_id}")
+def delete_projection_clustering(clustering_id: int, db: Session = Depends(get_db)):
+    cl = db.query(ProjectionClustering).filter_by(id=clustering_id).first()
+    if not cl:
+        raise HTTPException(status_code=404, detail="Clustering not found")
+    labels = settings.local_data_path / cl.labels_path if cl.labels_path else None
+    with get_lock().write_lock():
+        db.delete(cl)
+        db.commit()
+    if labels:
+        try:
+            labels.unlink(missing_ok=True)
+        except OSError as e:
+            print(f"[clustering] could not remove {labels}: {e}")
     return {"status": "ok"}
 
 

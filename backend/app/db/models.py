@@ -13,6 +13,7 @@ from sqlalchemy import (
     create_engine,
     Column,
     Integer,
+    Float,
     String,
     DateTime,
     ForeignKey,
@@ -581,7 +582,12 @@ class CohortProjection(Base):
     # survive a host migration, unlike the absolute analysis output paths that
     # need _resolve_job_slide_output() to re-anchor.
     artifact_path = Column(String(500))
-    cluster_labels_path = Column(String(500))  # reserved: k-NN / Leiden overlays
+    cluster_labels_path = Column(String(500))  # unused — superseded by ProjectionClustering
+    # The PCA-reduced matrix (float32, point_count x reduced_dim, row-aligned with
+    # the artifact). Clustering runs on this. Null for projections made before it
+    # was kept; a clustering run rebuilds it from the pinned slides.
+    reduced_path = Column(String(500))
+    reduced_dim = Column(Integer)
 
     point_count = Column(Integer)
     feature_dim = Column(Integer)   # measured from the .h5, not assumed
@@ -592,6 +598,11 @@ class CohortProjection(Base):
 
     cohort = relationship('Cohort', back_populates='projections')
     analysis = relationship('Analysis')
+    # ORM-level cascade: SQLite foreign-key enforcement isn't enabled on this
+    # engine, so ON DELETE CASCADE alone wouldn't remove the rows.
+    clusterings = relationship('ProjectionClustering', back_populates='projection',
+                               cascade='all, delete-orphan',
+                               order_by='ProjectionClustering.created_at.desc()')
 
     def get_slide_hashes(self) -> list:
         import json
@@ -620,6 +631,60 @@ class CohortProjection(Base):
     def __repr__(self):
         return (f"<CohortProjection(id={self.id}, cohort_id={self.cohort_id}, "
                 f"method={self.method}, status={self.status})>")
+
+
+class ProjectionClustering(Base):
+    """
+    One clustering run over a projection's patches — several per projection, so
+    algorithms and parameters can be compared on the same embedding.
+
+    Runs on the projection's PCA-reduced matrix, not its 2D coordinates. Labels
+    live in a sidecar file (int16 per point, -1 = noise) row-aligned with the
+    projection artifact; like the artifact, the row doubles as progress state for
+    the background thread.
+    """
+    __tablename__ = 'projection_clusterings'
+
+    id = Column(Integer, primary_key=True)
+    projection_id = Column(Integer, ForeignKey('cohort_projections.id', ondelete='CASCADE'),
+                           nullable=False, index=True)
+    algorithm = Column(String(20), nullable=False)  # kmeans | hdbscan | leiden | agglomerative
+    params_json = Column(Text, default='{}')        # params actually used (incl. chosen k, k_scores)
+
+    status = Column(String(20), nullable=False, default='pending')  # pending|running|completed|failed
+    progress_pct = Column(Integer, default=0)
+    progress_stage = Column(String(200))
+    error_message = Column(Text)
+
+    labels_path = Column(String(500))   # relative to settings.local_data_path
+    n_clusters = Column(Integer)
+    n_noise = Column(Integer)
+    silhouette = Column(Float)
+    # True when fit on a subsample and extended by nearest centroid (HDBSCAN,
+    # agglomerative at scale) — surfaced in the UI rather than hidden.
+    approximate = Column(Boolean, default=False)
+    elapsed_seconds = Column(Float)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime)
+    completed_at = Column(DateTime)
+
+    projection = relationship('CohortProjection', back_populates='clusterings')
+
+    def get_params(self) -> dict:
+        import json
+        try:
+            return json.loads(self.params_json or '{}')
+        except Exception:
+            return {}
+
+    def set_params(self, params: dict):
+        import json
+        self.params_json = json.dumps(params or {})
+
+    def __repr__(self):
+        return (f"<ProjectionClustering(id={self.id}, projection_id={self.projection_id}, "
+                f"algorithm={self.algorithm}, status={self.status})>")
 
 
 class CohortPlaceholder(Base):
@@ -1548,6 +1613,28 @@ def _migrate_cohort_placeholders(engine):
         print(f"[DB Migration] Skipping cohort_placeholders migration: {e}")
 
 
+def _migrate_cohort_projections(engine):
+    """Add reduced_path / reduced_dim to cohort_projections (kept PCA matrix for clustering)."""
+    from sqlalchemy import text
+    try:
+        insp = inspect(engine)
+        if not insp.has_table('cohort_projections'):
+            return
+        existing = {col['name'] for col in insp.get_columns('cohort_projections')}
+        adds = {
+            'reduced_path': "ALTER TABLE cohort_projections ADD COLUMN reduced_path VARCHAR(500)",
+            'reduced_dim': "ALTER TABLE cohort_projections ADD COLUMN reduced_dim INTEGER",
+        }
+        with engine.connect() as conn:
+            for col, ddl in adds.items():
+                if col not in existing:
+                    print(f"[DB Migration] Adding column: cohort_projections.{col}")
+                    conn.execute(text(ddl))
+            conn.commit()
+    except Exception as e:
+        print(f"[DB Migration] Skipping cohort_projections migration: {e}")
+
+
 def _seed_request_statuses(engine):
     """Populate request_statuses with defaults on first init (table empty)."""
     from sqlalchemy import text
@@ -1593,6 +1680,7 @@ def init_db(db_path: Path):
     _migrate_cohort_patient_cases(_engine)  # Adds display_order to cohort_patient_cases
     _migrate_cohorts(_engine)          # Adds auto_add_cases to cohorts
     _migrate_cohort_placeholders(_engine)  # Adds patient_id/surgery_label to cohort_placeholders
+    _migrate_cohort_projections(_engine)   # Adds reduced_path/reduced_dim to cohort_projections
     _seed_request_statuses(_engine)    # Seeds default case statuses (request_statuses)
     _SessionLocal = sessionmaker(bind=_engine)
 
