@@ -55,6 +55,13 @@ interface ProjectionRow {
   slide_count: number
   analysis_name?: string | null
   created_at?: string | null
+  params?: Record<string, unknown>
+}
+
+/** " · fit on N" when the embedding was fit on a subsample and the rest placed onto it (e.g. imported runs). */
+function fitSampleNote(params: Record<string, unknown> | undefined, pointCount?: number | null): string {
+  const n = params?.fit_sample_n
+  return typeof n === 'number' && pointCount && n < pointCount ? ` · fit on ${n.toLocaleString()}` : ''
 }
 
 interface AnalysisStatusEntry {
@@ -601,10 +608,17 @@ export function AnalysisWorkspace() {
                     <span className="text-[13px] font-medium">
                       {({ umap: 'UMAP', tsne: 't-SNE', pca: 'PCA' } as Record<string, string>)[p.method] ?? p.method.toUpperCase()}
                     </span>
-                    <span className="text-[11px] text-muted-foreground">
+                    <span className="text-[11px] text-muted-foreground"
+                          title={typeof p.params?.fit_note === 'string' ? p.params.fit_note : undefined}>
                       {p.slide_count} slides
                       {p.point_count ? ` · ${p.point_count.toLocaleString()} patches` : ''}
+                      {fitSampleNote(p.params, p.point_count)}
                     </span>
+                    {p.params?.source === 'imported' && (
+                      <span className="rounded bg-violet-50 px-1.5 py-0.5 text-[10px] font-medium text-violet-700">
+                        imported
+                      </span>
+                    )}
                     <span className={`ml-auto rounded px-1.5 py-0.5 text-[10px] font-medium ${
                       p.status === 'completed' ? 'bg-emerald-50 text-emerald-700'
                       : p.status === 'failed' ? 'bg-red-50 text-red-700'

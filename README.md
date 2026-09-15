@@ -180,6 +180,27 @@ from Let's Encrypt if the server has a real DNS name. Either drops in as
 
 `certs/` and `*.pem` are gitignored — never commit a private key.
 
+### Server log (admin)
+
+**Settings → Server log** shows the backend's live console output — the same
+lines the server terminal prints, including uvicorn request lines and
+tracebacks. It's off unless a password is set in the backend's `.env` (the file
+next to where the backend is started):
+
+```bash
+ADMIN_LOG_PASSWORD=choose-a-password
+```
+
+Restart the backend after setting it. This is a stopgap until per-user
+permissions exist: anyone who can log in to SlideCap *and* knows the password can
+read the log, which includes slide filenames. The password unlocks an 8-hour
+token held only in that browser tab; five wrong attempts in 15 minutes lock that
+address out for a while.
+
+Besides the live view (the last `SERVER_LOG_BUFFER_LINES`, default 5000, lines in
+memory), the full log is written to `LOCAL_DATA_DIR/logs/server.log`, rotated at
+10 MB with 5 old files kept — **Download** in the view serves it.
+
 ## API Endpoints
 
 | Method | Endpoint | Description |

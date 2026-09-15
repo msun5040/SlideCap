@@ -22,6 +22,7 @@ import {
   Ghost,
   Loader2,
   Code,
+  ScrollText,
 } from 'lucide-react'
 import {
   DropdownMenu,
@@ -44,6 +45,7 @@ import { SlidePull } from '@/components/SlidePull'
 import { LauncherScreen } from '@/components/LauncherScreen'
 import { LoginScreen } from '@/components/LoginScreen'
 import { ParserSettingsDialog } from '@/components/ParserSettingsDialog'
+import { ServerLogView } from '@/components/ServerLogView'
 import { LoadingSpinner } from '@/components/LoadingSpinner'
 import { setApiBase, getApiBase, getAuthToken, clearAuthToken, installAuthInterceptor, setAppMode, isDemo } from '@/api'
 import { SlideDetailsProvider } from '@/components/SlideDetailsContext'
@@ -60,7 +62,9 @@ interface SortStatus {
   errors: string[]
 }
 
-type View = 'dashboard' | 'slides' | 'cohorts' | 'requests' | 'pull' | 'analysis' | 'workspace'
+// 'serverlog' is deliberately not in the sidebar — it's reached from
+// Settings → Server log and is password-gated.
+type View = 'dashboard' | 'slides' | 'cohorts' | 'requests' | 'pull' | 'analysis' | 'workspace' | 'serverlog'
 
 // Re-export for backward compat
 export { getApiBase as getAPI } from '@/api'
@@ -478,13 +482,20 @@ export default function App() {
                 <Code className="h-4 w-4 mr-2" />
                 Parser configuration
               </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuLabel className="text-xs">Admin</DropdownMenuLabel>
+              <DropdownMenuItem onClick={() => setCurrentView('serverlog')}>
+                <ScrollText className="h-4 w-4 mr-2" />
+                Server log
+              </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
 
           {/* Spacer + current view label */}
           <div className="h-4 w-px bg-border mx-1" />
           <span className="text-[13px] font-medium text-foreground">
-            {navigationItems.find((item) => item.id === currentView)?.label}
+            {navigationItems.find((item) => item.id === currentView)?.label
+              ?? (currentView === 'serverlog' ? 'Server log' : '')}
           </span>
 
           {/* Menu action status — right side */}
@@ -594,6 +605,9 @@ export default function App() {
                 </div>
                 <div className={`${viewClass('workspace')} h-full min-h-0`}>
                   <AnalysisWorkspace />
+                </div>
+                <div className={`${viewClass('serverlog')} h-full min-h-0`}>
+                  <ServerLogView active={currentView === 'serverlog'} />
                 </div>
               </>
             )}

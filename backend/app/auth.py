@@ -141,6 +141,36 @@ def verify_token(token: str) -> bool:
         return False
 
 
+# ── Server-log access (password-gated, temporary until permissions) ─
+
+SERVER_LOG_TOKEN_HOURS = 8
+
+
+def _server_log_secret() -> str:
+    # A distinct signing key: an ordinary session token must never pass as a
+    # server-log token (verify_token only checks the signature), and vice versa.
+    return settings.get_secret_key() + ":server-log"
+
+
+def create_server_log_token() -> str:
+    """Short-lived token issued after the server-log password is entered."""
+    payload = {
+        "sub": "slidecap_server_log",
+        "scope": "server-log",
+        "iat": datetime.utcnow(),
+        "exp": datetime.utcnow() + timedelta(hours=SERVER_LOG_TOKEN_HOURS),
+    }
+    return jwt.encode(payload, _server_log_secret(), algorithm="HS256")
+
+
+def verify_server_log_token(token: str) -> bool:
+    try:
+        data = jwt.decode(token, _server_log_secret(), algorithms=["HS256"])
+        return data.get("scope") == "server-log"
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+        return False
+
+
 # ── Middleware ──────────────────────────────────────────────────
 
 class AuthMiddleware(BaseHTTPMiddleware):

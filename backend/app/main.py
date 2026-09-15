@@ -27,7 +27,17 @@ from .db import init_db, get_db, get_session, Case, Slide, Tag, Project, Cohort,
 from .services import SlideHasher, SlideIndexer, ClusterService, JobStatusPoller
 from .services import tiff_pyramid
 from .auth import AuthMiddleware, create_challenge, verify_challenge, create_token, verify_token, cleanup_expired_challenges
+from .auth import create_server_log_token, verify_server_log_token, SERVER_LOG_TOKEN_HOURS
 from . import demo as demo_mod
+from .services import server_log
+
+# Capture console output for the Server Log view as early as possible, so the
+# lifespan startup messages are included. Never fatal: without it the server
+# simply logs to the console as before.
+try:
+    server_log.install(settings.logs_path, settings.SERVER_LOG_BUFFER_LINES)
+except Exception as _server_log_err:  # pragma: no cover
+    print(f"[server-log] capture disabled: {_server_log_err}")
 
 
 def _is_demo() -> bool:
@@ -296,6 +306,98 @@ def health():
         "network_accessible": os.path.exists(settings.NETWORK_ROOT),
         "app_mode": settings.APP_MODE,
     }
+
+
+# ============================================================
+# Server Log (password-gated; see services/server_log.py)
+# ============================================================
+# Temporary gate until per-user permissions exist: ADMIN_LOG_PASSWORD unlocks a
+# short-lived token sent as X-Server-Log-Token. The normal login is still
+# required on top (AuthMiddleware).
+
+class ServerLogUnlock(BaseModel):
+    password: str
+
+
+_LOG_UNLOCK_MAX_FAILURES = 5
+_LOG_UNLOCK_WINDOW_S = 15 * 60
+_log_unlock_failures: dict[str, list[float]] = {}
+_log_unlock_lock = threading.Lock()
+
+
+def _require_server_log_token(request: Request) -> None:
+    if not settings.ADMIN_LOG_PASSWORD:
+        raise HTTPException(status_code=503,
+                            detail="The server log view is not enabled on this server.")
+    token = request.headers.get("X-Server-Log-Token", "")
+    if not token or not verify_server_log_token(token):
+        raise HTTPException(status_code=401, detail="Server log is locked.")
+
+
+@app.get("/admin/logs/status")
+def server_log_status():
+    return {
+        "enabled": bool(settings.ADMIN_LOG_PASSWORD),
+        "capturing": server_log.get_buffer() is not None,
+    }
+
+
+@app.post("/admin/logs/unlock")
+def server_log_unlock(body: ServerLogUnlock, request: Request):
+    import hmac
+    if not settings.ADMIN_LOG_PASSWORD:
+        raise HTTPException(status_code=503,
+                            detail="The server log view is not enabled on this server.")
+    client = request.client.host if request.client else "unknown"
+    now = time.time()
+    with _log_unlock_lock:
+        recent = [t for t in _log_unlock_failures.get(client, []) if now - t < _LOG_UNLOCK_WINDOW_S]
+        _log_unlock_failures[client] = recent
+    if len(recent) >= _LOG_UNLOCK_MAX_FAILURES:
+        wait_min = int((_LOG_UNLOCK_WINDOW_S - (now - recent[0])) // 60) + 1
+        raise HTTPException(status_code=429,
+                            detail=f"Too many incorrect attempts. Try again in about {wait_min} minute(s).")
+
+    if not hmac.compare_digest(body.password.encode("utf-8"),
+                               settings.ADMIN_LOG_PASSWORD.encode("utf-8")):
+        with _log_unlock_lock:
+            _log_unlock_failures.setdefault(client, []).append(now)
+        print(f"[server-log] incorrect password attempt from {client}")
+        time.sleep(0.5)  # slow guessing a little
+        raise HTTPException(status_code=401, detail="Incorrect password.")
+
+    with _log_unlock_lock:
+        _log_unlock_failures.pop(client, None)
+    print(f"[server-log] unlocked from {client}")
+    return {"token": create_server_log_token(), "expires_in_hours": SERVER_LOG_TOKEN_HOURS}
+
+
+@app.get("/admin/logs")
+def server_log_lines(
+    request: Request,
+    after: int = Query(0, ge=0, description="Return lines with seq > after; 0 = most recent"),
+    limit: int = Query(1000, ge=1, le=5000),
+):
+    _require_server_log_token(request)
+    buf = server_log.get_buffer()
+    if buf is None:
+        return {"lines": [], "next_seq": after, "latest_seq": 0, "has_more": False, "gap": False,
+                "boot_id": None, "started_at": None, "capacity": 0, "file_available": False}
+    return buf.since(after, limit)
+
+
+@app.get("/admin/logs/download")
+def server_log_download(request: Request):
+    _require_server_log_token(request)
+    buf = server_log.get_buffer()
+    path = buf.file_path if buf else None
+    if not path or not path.exists():
+        raise HTTPException(status_code=404, detail="No log file is being written on this server.")
+    return FileResponse(
+        str(path),
+        media_type="text/plain; charset=utf-8",
+        filename=f"slidecap-server-{datetime.now():%Y%m%d-%H%M%S}.log",
+    )
 
 
 # ── Parser settings (read-only + test) ────────────────────────────────

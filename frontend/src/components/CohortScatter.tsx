@@ -301,7 +301,9 @@ export function CohortScatter({
         </button>
       </div>
       <div className="pointer-events-none absolute bottom-3 left-3 rounded bg-background/80 px-2 py-1 text-[11px] text-muted-foreground">
-        {data.pointCount.toLocaleString()} patches · {data.header.slides.length} slides · {data.header.method.toUpperCase()}
+        {data.pointCount.toLocaleString()} patches · {data.header.slides.length} slides ·{' '}
+        {({ umap: 'UMAP', tsne: 't-SNE', pca: 'PCA' } as Record<string, string>)[data.header.method]
+          ?? data.header.method.toUpperCase()}
       </div>
     </div>
   )

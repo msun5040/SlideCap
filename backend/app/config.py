@@ -124,6 +124,15 @@ class Settings(BaseSettings):
     AUTH_TOKEN_EXPIRY_DAYS: int = 30
     AUTH_CHALLENGE_EXPIRY_MINUTES: int = 5
 
+    # Server Log view (Settings → Server log). Unset = the view is disabled.
+    # A stopgap until per-user permissions exist: anyone who knows this password
+    # (and can log in) can read the backend's console output, which includes
+    # slide filenames. Set it in the backend's .env, e.g. ADMIN_LOG_PASSWORD=...
+    ADMIN_LOG_PASSWORD: Optional[str] = None
+    # How many recent lines the view can scroll back through (memory only; the
+    # full history is in LOCAL_DATA_DIR/logs/server.log).
+    SERVER_LOG_BUFFER_LINES: int = 5000
+
     # Cluster settings (SSH + tmux, no Slurm)
     CLUSTER_HOST: Optional[str] = None   # Default hostname, overridable in UI
     CLUSTER_PORT: int = 22
@@ -211,6 +220,11 @@ class Settings(BaseSettings):
     @property
     def secret_key_path(self) -> Path:
         return self.local_data_path / ".secret_key"
+
+    @property
+    def logs_path(self) -> Path:
+        """Rotating server.log for the Server Log view — local disk, not the share."""
+        return self.local_data_path / "logs"
 
     @property
     def auth_challenges_path(self) -> Path:

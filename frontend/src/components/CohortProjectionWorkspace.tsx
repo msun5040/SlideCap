@@ -97,7 +97,9 @@ type ColorMode =
 
 function clusteringLabel(c: ClusteringRow): string {
   const k = c.n_clusters != null ? ` · ${c.n_clusters} cluster${c.n_clusters === 1 ? '' : 's'}` : ''
-  return `${ALG_LABEL[c.algorithm] ?? c.algorithm}${k} (#${c.id})`
+  // Imported runs carry a short variant label (e.g. "k = 8") so several k-means runs stay distinguishable.
+  const variant = typeof c.params?.label === 'string' ? ` ${c.params.label}` : ''
+  return `${ALG_LABEL[c.algorithm] ?? c.algorithm}${variant}${k} (#${c.id})`
 }
 
 function colorModeValue(m: ColorMode): string {
@@ -542,6 +544,9 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
             {data.pointCount.toLocaleString()} patches · {data.header.slides.length} slides ·{' '}
             {({ umap: 'UMAP', tsne: 't-SNE', pca: 'PCA' } as Record<string, string>)[data.header.method]
               ?? data.header.method.toUpperCase()}
+            {typeof data.header.params?.fit_sample_n === 'number'
+              && data.header.params.fit_sample_n < data.pointCount
+              && ` · fit on ${data.header.params.fit_sample_n.toLocaleString()}, all patches placed`}
           </span>
         )}
         <button onClick={onClose} className="ml-auto rounded p-1 hover:bg-neutral-800" title="Close (Esc)">
