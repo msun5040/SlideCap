@@ -2558,6 +2558,8 @@ class CohortProjectionCreate(BaseModel):
     analysis_id: Optional[int] = None
     # None = every slide in the cohort that has usable output.
     slide_hashes: Optional[List[str]] = None
+    # Held-out cases (cohort_held_out_cases) are excluded unless this is set.
+    include_held_out: bool = False
     params: Dict[str, Any] = {}
 
 
@@ -2701,6 +2703,7 @@ def get_cohort(cohort_id: int, db: Session = Depends(get_db)):
         "case_count": cohort.case_count,
         "auto_add_cases": cohort.auto_add_cases,
         "followed_case_hashes": [c.accession_hash for c in cohort.followed_cases],
+        "held_out_cases": _held_out_rows(db, cohort.id),
         "auto_tags": [{"id": t.id, "name": t.name, "color": t.color} for t in cohort.auto_tags],
         "placeholders": [
             {
@@ -2889,6 +2892,120 @@ def unfollow_cases(cohort_id: int, data: CohortFollowCases, db: Session = Depend
     return {
         "status": "ok",
         "followed_case_hashes": [c.accession_hash for c in cohort.followed_cases],
+    }
+
+
+# ── Held-out cases (kept in the cohort, excluded from analysis) ───────────
+
+class CohortHoldOutCases(BaseModel):
+    case_hashes: List[str]
+    # Optional note shown on the case, e.g. "autopsy". Only used when holding out.
+    reason: Optional[str] = None
+
+
+def _held_out_rows(db: Session, cohort_id: int) -> list[dict]:
+    rows = db.execute(
+        sa_text(
+            "SELECT c.accession_hash, h.reason, h.added_at "
+            "FROM cohort_held_out_cases h JOIN cases c ON c.id = h.case_id "
+            "WHERE h.cohort_id = :cid ORDER BY h.added_at"
+        ),
+        {"cid": cohort_id},
+    ).fetchall()
+    return [
+        {"case_hash": r[0], "reason": r[1], "added_at": str(r[2]) if r[2] else None}
+        for r in rows
+    ]
+
+
+def _held_out_case_hashes(db: Session, cohort_id: int) -> set:
+    return {r["case_hash"] for r in _held_out_rows(db, cohort_id)}
+
+
+@app.post("/cohorts/{cohort_id}/held-out-cases")
+def hold_out_cases(cohort_id: int, data: CohortHoldOutCases, db: Session = Depends(get_db)):
+    """Hold cases out of analysis without removing them from the cohort.
+
+    Only cases actually in this cohort (a slide or a case placeholder) can be
+    held out; anything else comes back in `not_in_cohort` so a pasted list can
+    report what didn't match. Re-holding a case updates its reason.
+    """
+    cohort = db.query(Cohort).filter_by(id=cohort_id).first()
+    if not cohort:
+        raise HTTPException(status_code=404, detail="Cohort not found")
+
+    requested = list(dict.fromkeys(h for h in data.case_hashes if h))
+    cases_by_hash = {
+        c.accession_hash: c
+        for c in db.query(Case).filter(Case.accession_hash.in_(requested)).all()
+    }
+    member_case_ids = {
+        row[0]
+        for row in db.execute(
+            sa_text(
+                "SELECT DISTINCT s.case_id FROM cohort_slides cs "
+                "JOIN slides s ON s.id = cs.slide_id WHERE cs.cohort_id = :cid"
+            ),
+            {"cid": cohort_id},
+        ).fetchall()
+    }
+    placeholder_cases = {p.case_hash for p in cohort.placeholders if p.case_hash}
+
+    to_hold, not_in_cohort = [], []
+    for h in requested:
+        case = cases_by_hash.get(h)
+        if case and (case.id in member_case_ids or h in placeholder_cases):
+            to_hold.append(case)
+        else:
+            not_in_cohort.append(h)
+
+    reason = (data.reason or "").strip()[:200] or None
+    with get_lock().write_lock():
+        for case in to_hold:
+            db.execute(
+                sa_text(
+                    "INSERT INTO cohort_held_out_cases (cohort_id, case_id, reason, added_at) "
+                    "VALUES (:cid, :case_id, :reason, :now) "
+                    "ON CONFLICT(cohort_id, case_id) DO UPDATE SET "
+                    "reason = COALESCE(excluded.reason, cohort_held_out_cases.reason)"
+                ),
+                {"cid": cohort_id, "case_id": case.id, "reason": reason, "now": datetime.utcnow()},
+            )
+        db.commit()
+
+    return {
+        "status": "ok",
+        "held": len(to_hold),
+        "not_in_cohort": not_in_cohort,
+        "held_out_cases": _held_out_rows(db, cohort_id),
+    }
+
+
+@app.delete("/cohorts/{cohort_id}/held-out-cases")
+def return_held_out_cases(cohort_id: int, data: CohortHoldOutCases, db: Session = Depends(get_db)):
+    """Put held-out cases back into analysis."""
+    cohort = db.query(Cohort).filter_by(id=cohort_id).first()
+    if not cohort:
+        raise HTTPException(status_code=404, detail="Cohort not found")
+
+    case_ids = [
+        c.id for c in db.query(Case).filter(Case.accession_hash.in_(list(set(data.case_hashes)))).all()
+    ]
+    returned = 0
+    if case_ids:
+        with get_lock().write_lock():
+            for cid_ in case_ids:
+                res = db.execute(
+                    sa_text("DELETE FROM cohort_held_out_cases WHERE cohort_id = :cid AND case_id = :case_id"),
+                    {"cid": cohort_id, "case_id": cid_},
+                )
+                returned += res.rowcount or 0
+            db.commit()
+
+    return {
+        "status": "ok",
+        "returned": returned,
+        "held_out_cases": _held_out_rows(db, cohort_id),
     }
 
 
@@ -5465,19 +5582,26 @@ def _serialize_projection(pr: CohortProjection, db: Session = None) -> dict:
 
 
 def _collect_projection_sources(db: Session, cohort: Cohort, analysis_id: Optional[int],
-                                slide_hashes: Optional[List[str]]):
+                                slide_hashes: Optional[List[str]],
+                                exclude_case_hashes: Optional[set] = None):
     """
     Resolve cohort slides to on-disk UNI inputs.
 
     Returns (sources, skipped) where skipped explains per-slide why a slide
     couldn't contribute — a partially-analysed cohort is normal, and silently
     dropping slides from a cohort-wide plot would be misleading.
+
+    `exclude_case_hashes` drops held-out cases' slides before anything else; the
+    caller reports those separately, since they're a choice, not a failure.
     """
     from .services.cohort_projection import SlideSource
     from .analyses import uni as uni_mod
 
     wanted = set(slide_hashes) if slide_hashes else None
-    slides = [s for s in cohort.slides if (wanted is None or s.slide_hash in wanted)]
+    excluded = exclude_case_hashes or set()
+    slides = [s for s in cohort.slides
+              if (wanted is None or s.slide_hash in wanted)
+              and not (s.case and s.case.accession_hash in excluded)]
     slide_ids = {s.id: s for s in slides}
     if not slide_ids:
         return [], []
@@ -5625,10 +5749,16 @@ def create_cohort_projection(cohort_id: int, data: CohortProjectionCreate,
         raise HTTPException(status_code=400,
                             detail=f"Unsupported method {data.method!r}. Use 'umap', 'tsne' or 'pca'.")
 
+    held_out = set() if data.include_held_out else _held_out_case_hashes(db, cohort_id)
+    held_out_slides = [s.slide_hash for s in cohort.slides
+                       if s.case and s.case.accession_hash in held_out
+                       and (not data.slide_hashes or s.slide_hash in data.slide_hashes)]
     sources, skipped = _collect_projection_sources(
-        db, cohort, data.analysis_id, data.slide_hashes)
+        db, cohort, data.analysis_id, data.slide_hashes, exclude_case_hashes=held_out)
     if not sources:
         detail = "No slides in this cohort have completed analysis output to project."
+        if held_out_slides:
+            detail += f" {len(held_out_slides)} slide(s) from held-out cases were excluded."
         if skipped:
             detail += f" {len(skipped)} slide(s) skipped; first reason: {skipped[0]['reason']}"
         raise HTTPException(status_code=400, detail=detail)
@@ -5658,6 +5788,7 @@ def create_cohort_projection(cohort_id: int, data: CohortProjectionCreate,
 
     result = _serialize_projection(pr)
     result["skipped"] = skipped
+    result["held_out_slide_count"] = len(held_out_slides)
     return result
 
 

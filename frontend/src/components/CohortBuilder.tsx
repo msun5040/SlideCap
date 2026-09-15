@@ -4,6 +4,7 @@ import {
   Check, Download, FolderArchive, AlertTriangle, Users, FileText,
   CheckCircle2, Clock, XCircle, Loader2, Flag, BarChart2, Trash2, Stethoscope,
   Microscope, ClipboardList, Link2, CircleDashed, Settings, Tag as TagIcon,
+  Eye, EyeOff,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -44,6 +45,8 @@ import { useSlideDetails } from '@/components/SlideDetailsContext'
 import { useSortable } from '@/hooks/useSortable'
 import { useStainTypes } from '@/hooks/useStainTypes'
 import { SearchableSelect } from '@/components/ui/searchable-select'
+import { Textarea } from '@/components/ui/textarea'
+import { CopyButton } from '@/components/ui/CopyButton'
 const SLIDE_FLAG_TAG = 'flagged'
 
 // Above this slide count, the per-slide stain dots are replaced by a compact
@@ -157,11 +160,21 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
   // ── Cohort-specific flags ────────────────────────────────────────────
   const [cohortFlags, setCohortFlags] = useState<CohortFlag[]>([])
   const [loadingFlags, setLoadingFlags] = useState(false)
-  const [flagToolbarMode, setFlagToolbarMode] = useState<'idle' | 'apply' | 'new' | 'confirm-remove'>('idle')
+  const [flagToolbarMode, setFlagToolbarMode] = useState<'idle' | 'apply' | 'new' | 'confirm-remove' | 'hold'>('idle')
   const [removingCases, setRemovingCases] = useState(false)
   const [flagDropdownValue, setFlagDropdownValue] = useState<string>('')
   const [newFlagName, setNewFlagName] = useState('')
   const [flagApplying, setFlagApplying] = useState(false)
+
+  // ── Case search + held-out cases (kept in cohort, excluded from analysis) ─
+  const [caseSearch, setCaseSearch] = useState('')
+  const [caseView, setCaseView] = useState<'all' | 'active' | 'held'>('all')
+  const [holdReason, setHoldReason] = useState('')
+  const [holdSaving, setHoldSaving] = useState(false)
+  const [isHoldPasteOpen, setIsHoldPasteOpen] = useState(false)
+  const [holdPasteText, setHoldPasteText] = useState('')
+  const [holdPasteReason, setHoldPasteReason] = useState('')
+  const [holdPasteError, setHoldPasteError] = useState<string | null>(null)
 
   // ── Per-slide analysis status ────────────────────────────────────────
   const [slideAnalysisStatus, setSlideAnalysisStatus] = useState<
@@ -248,6 +261,81 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
     return groups
   }, [cohort])
 
+  // case_hash → optional reason, for cases held out of analysis.
+  const heldOutReasons = useMemo(() => {
+    const m = new Map<string, string | null>()
+    for (const h of cohort?.held_out_cases ?? []) m.set(h.case_hash, h.reason ?? null)
+    return m
+  }, [cohort])
+
+  const heldOutCaseCount = useMemo(
+    () => caseGroups.filter(g => heldOutReasons.has(g.case_hash)).length,
+    [caseGroups, heldOutReasons],
+  )
+
+  // The case list as shown: narrowed by the search box and the All / Active /
+  // Held-out view. Every term must match somewhere in the case — accession,
+  // year, block, stain, slide number, slide tags, cohort flags, held-out reason,
+  // placeholder labels.
+  const visibleCaseGroups = useMemo(() => {
+    const terms = caseSearch.trim().toLowerCase().split(/\s+/).filter(Boolean)
+    const flagsByCase = new Map<string, string[]>()
+    for (const f of cohortFlags) {
+      for (const h of f.case_hashes) flagsByCase.set(h, [...(flagsByCase.get(h) ?? []), f.name])
+    }
+    return caseGroups.filter(g => {
+      const held = heldOutReasons.has(g.case_hash)
+      if (caseView === 'active' && held) return false
+      if (caseView === 'held' && !held) return false
+      if (terms.length === 0) return true
+      const haystack = [
+        displayCase(g), g.accession_number ?? '', g.year ? String(g.year) : '',
+        heldOutReasons.get(g.case_hash) ?? '',
+        ...(flagsByCase.get(g.case_hash) ?? []),
+        ...g.slides.flatMap(s => [s.block_id, s.stain_type, s.slide_number ?? '', ...(s.tags ?? [])]),
+        ...(g.placeholders ?? []).map(p => p.label),
+      ].join(' ').toLowerCase()
+      return terms.every(t => haystack.includes(t))
+    })
+  }, [caseGroups, caseSearch, caseView, heldOutReasons, cohortFlags])
+
+  // Drop selections the filter now hides, so a bulk action never touches cases
+  // you can't see.
+  useEffect(() => {
+    const visible = new Set(visibleCaseGroups.map(g => g.case_hash))
+    setSelectedCaseHashes(prev => {
+      const next = new Set([...prev].filter(h => visible.has(h)))
+      return next.size === prev.size ? prev : next
+    })
+  }, [visibleCaseGroups])
+
+  // Pasted accessions → cases in this cohort. Matched locally against the
+  // cohort's own cases, so anything not found is "not in this cohort".
+  const holdPasteMatch = useMemo(() => {
+    // De-duplicate on the normalized accession, so "BS24-K10001" and
+    // "bs24-k10001" count as one entry rather than inflating the total.
+    const byNorm = new Map<string, string>()
+    for (const raw of holdPasteText.split(/[\n,;\t]+/).map(s => s.trim()).filter(Boolean)) {
+      const norm = normalizeAccession(raw)
+      if (!byNorm.has(norm)) byNorm.set(norm, raw)
+    }
+    const tokens = Array.from(byNorm.values())
+    const byAccession = new Map<string, CaseGroup>()
+    for (const g of caseGroups) {
+      if (g.accession_number) byAccession.set(normalizeAccession(g.accession_number), g)
+    }
+    const matched: CaseGroup[] = []
+    const notFound: string[] = []
+    const seen = new Set<string>()
+    for (const t of tokens) {
+      const g = byAccession.get(normalizeAccession(t))
+      if (!g) { notFound.push(t); continue }
+      if (!seen.has(g.case_hash)) { seen.add(g.case_hash); matched.push(g) }
+    }
+    const alreadyHeld = matched.filter(g => heldOutReasons.has(g.case_hash)).length
+    return { tokens, matched, notFound, alreadyHeld }
+  }, [holdPasteText, caseGroups, heldOutReasons])
+
   const stats = useMemo(() => {
     if (!cohort) return { slides: 0, cases: 0, stains: {} as Record<string, number> }
     const stains: Record<string, number> = {}
@@ -259,7 +347,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
   }, [cohort, caseGroups])
 
   const groupedCasesByPatient = useMemo(() => {
-    if (!caseGroups.length || !cohortPatients.length) {
+    if (!visibleCaseGroups.length || !cohortPatients.length) {
       return { patientGroups: [] as {
         patientId: number
         patientLabel: string
@@ -268,7 +356,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
           surgeryLabel: string
           cases: CaseGroup[]
         }[]
-      }[], unassigned: caseGroups }
+      }[], unassigned: visibleCaseGroups }
     }
 
     const caseToMeta = new Map<string, { patientId: number; patientLabel: string; surgeryId: number; surgeryLabel: string }>()
@@ -289,7 +377,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
       surgeries: Map<number, { surgeryLabel: string; cases: CaseGroup[] }>
     }>()
 
-    for (const group of caseGroups) {
+    for (const group of visibleCaseGroups) {
       const meta = group.case_hash ? caseToMeta.get(group.case_hash) : undefined
       if (!meta) {
         unassigned.push(group)
@@ -336,7 +424,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
     }
 
     return { patientGroups, unassigned }
-  }, [caseGroups, cohortPatients])
+  }, [visibleCaseGroups, cohortPatients])
 
   const exportInfo = useMemo(() => {
     if (!cohort) return { totalBytes: 0, knownCount: 0, unknownCount: 0 }
@@ -680,7 +768,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
     const next = new Set(selectedCaseHashes)
     if (e.shiftKey && lastClickedCase.current) {
       // Range select
-      const hashes = caseGroups.map(g => g.case_hash)
+      const hashes = visibleCaseGroups.map(g => g.case_hash)
       const a = hashes.indexOf(lastClickedCase.current)
       const b = hashes.indexOf(caseHash)
       const [lo, hi] = a < b ? [a, b] : [b, a]
@@ -694,8 +782,9 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
   }
 
   const toggleSelectAll = () => {
-    if (selectedCaseHashes.size === caseGroups.length) setSelectedCaseHashes(new Set())
-    else setSelectedCaseHashes(new Set(caseGroups.map(g => g.case_hash)))
+    // Acts on the cases currently shown (search + view filter).
+    if (selectedCaseHashes.size === visibleCaseGroups.length) setSelectedCaseHashes(new Set())
+    else setSelectedCaseHashes(new Set(visibleCaseGroups.map(g => g.case_hash)))
   }
 
   // ── Search ───────────────────────────────────────────────────────────
@@ -843,6 +932,31 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
   }
 
   const toggleFollowCase = (caseHash: string, next: boolean) => followCases([caseHash], next)
+
+  // ── Hold cases out of analysis / return them ─────────────────────────
+  // Returns the server response on success, null on failure.
+  const setHeldOut = async (caseHashes: string[], hold: boolean, reason?: string) => {
+    if (!cohort) return null
+    const hashes = caseHashes.filter(Boolean)
+    if (hashes.length === 0) return null
+    setHoldSaving(true)
+    try {
+      const res = await fetch(`${getApiBase()}/cohorts/${cohortId}/held-out-cases`, {
+        method: hold ? 'POST' : 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ case_hashes: hashes, reason: hold ? (reason?.trim() || null) : null }),
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json()
+      setCohort(c => c ? { ...c, held_out_cases: data.held_out_cases } : c)
+      return data
+    } catch (e) {
+      console.error('Failed to update held-out cases:', e)
+      return null
+    } finally {
+      setHoldSaving(false)
+    }
+  }
 
   // ── Placeholders (outstanding "to find & scan" reminders) ────────────
   const addPlaceholder = async () => {
@@ -1331,16 +1445,70 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                 )
               ) : (
                 <>
+                  {/* Search + held-out view */}
+                  <div className="flex flex-wrap items-center gap-2 px-3 py-2 border-b border-gray-300 shrink-0">
+                    <div className="relative flex-1 min-w-44">
+                      <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground pointer-events-none" />
+                      <Input
+                        value={caseSearch}
+                        onChange={e => setCaseSearch(e.target.value)}
+                        placeholder="Search this cohort — accession, block, stain, tag, flag…"
+                        className="h-7 pl-7 pr-7 text-xs"
+                      />
+                      {caseSearch && (
+                        <button
+                          className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                          onClick={() => setCaseSearch('')}
+                          title="Clear search"
+                        >
+                          <X className="h-3.5 w-3.5" />
+                        </button>
+                      )}
+                    </div>
+                    <div className="inline-flex shrink-0 overflow-hidden rounded-md border border-gray-300 text-[11px]">
+                      {([
+                        ['all', 'All', caseGroups.length],
+                        ['active', 'In analysis', caseGroups.length - heldOutCaseCount],
+                        ['held', 'Held out', heldOutCaseCount],
+                      ] as const).map(([v, label, n]) => (
+                        <button
+                          key={v}
+                          onClick={() => setCaseView(v)}
+                          className={`h-7 px-2 border-l first:border-l-0 border-gray-300 ${
+                            caseView === v ? 'bg-primary text-primary-foreground' : 'hover:bg-muted'
+                          }`}
+                        >
+                          {label} <span className="tabular-nums opacity-70">{n}</span>
+                        </button>
+                      ))}
+                    </div>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-7 px-2 text-xs shrink-0"
+                      onClick={() => {
+                        setHoldPasteText(''); setHoldPasteReason(''); setHoldPasteError(null)
+                        setIsHoldPasteOpen(true)
+                      }}
+                      title="Paste accession numbers to hold out of analysis"
+                    >
+                      <EyeOff className="h-3 w-3 mr-1" />
+                      Hold out from list…
+                    </Button>
+                  </div>
+
                   {/* Select-all + bulk flag toolbar */}
                   <div className="flex items-center gap-2 px-3 py-2 border-b border-gray-300 bg-muted/20 shrink-0">
                     <Checkbox
-                      checked={selectedCaseHashes.size === caseGroups.length && caseGroups.length > 0}
+                      checked={selectedCaseHashes.size === visibleCaseGroups.length && visibleCaseGroups.length > 0}
                       onCheckedChange={toggleSelectAll}
                       className="shrink-0"
                     />
                     {selectedCaseHashes.size === 0 ? (
                       <span className="text-xs text-muted-foreground">
-                        {caseGroups.length} case{caseGroups.length !== 1 ? 's' : ''}
+                        {visibleCaseGroups.length === caseGroups.length
+                          ? `${caseGroups.length} case${caseGroups.length !== 1 ? 's' : ''}`
+                          : `${visibleCaseGroups.length} of ${caseGroups.length} cases`}
                         {' · shift+click to range select'}
                       </span>
                     ) : (
@@ -1365,6 +1533,34 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                                 >
                                   <Link2 className="h-3 w-3 mr-1" />
                                   {allFollowed ? 'Unfollow' : 'Follow'}
+                                </Button>
+                              )
+                            })()}
+                            {(() => {
+                              const selected = Array.from(selectedCaseHashes)
+                              const allHeld = selected.length > 0 && selected.every(h => heldOutReasons.has(h))
+                              return allHeld ? (
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  className="h-6 px-2 text-xs"
+                                  onClick={() => setHeldOut(selected, false)}
+                                  disabled={holdSaving}
+                                  title="Put the selected cases back into analysis"
+                                >
+                                  <Eye className="h-3 w-3 mr-1" />
+                                  Return to analysis
+                                </Button>
+                              ) : (
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  className="h-6 px-2 text-xs"
+                                  onClick={() => { setHoldReason(''); setFlagToolbarMode('hold') }}
+                                  title="Keep the selected cases in the cohort but leave them out of the Analysis Workspace"
+                                >
+                                  <EyeOff className="h-3 w-3 mr-1" />
+                                  Hold out
                                 </Button>
                               )
                             })()}
@@ -1428,6 +1624,40 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                             </button>
                           </div>
                         )}
+
+                        {flagToolbarMode === 'hold' && (() => {
+                          const confirmHold = async () => {
+                            if (await setHeldOut(Array.from(selectedCaseHashes), true, holdReason)) {
+                              setFlagToolbarMode('idle')
+                              setSelectedCaseHashes(new Set())
+                            }
+                          }
+                          return (
+                            <div className="flex items-center gap-1.5">
+                              <span className="text-xs">
+                                Hold out {selectedCaseHashes.size} case{selectedCaseHashes.size === 1 ? '' : 's'}?
+                              </span>
+                              <Input
+                                autoFocus
+                                placeholder="Reason (optional), e.g. autopsy"
+                                value={holdReason}
+                                onChange={e => setHoldReason(e.target.value)}
+                                onKeyDown={e => {
+                                  if (e.key === 'Enter') confirmHold()
+                                  if (e.key === 'Escape') setFlagToolbarMode('idle')
+                                }}
+                                className="h-6 text-xs w-52"
+                              />
+                              <Button size="sm" className="h-6 px-2 text-xs" onClick={confirmHold} disabled={holdSaving}>
+                                {holdSaving ? <Loader2 className="h-3 w-3 animate-spin" /> : 'Hold out'}
+                              </Button>
+                              <button className="text-muted-foreground hover:text-foreground"
+                                      onClick={() => setFlagToolbarMode('idle')}>
+                                <X className="h-3.5 w-3.5" />
+                              </button>
+                            </div>
+                          )
+                        })()}
 
                         {flagToolbarMode === 'confirm-remove' && (() => {
                           const groups = caseGroups.filter(g => selectedCaseHashes.has(g.case_hash))
@@ -1512,6 +1742,8 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                           // Cohort-wide auto-add makes every case followed implicitly; the
                           // per-case toggle is disabled in that mode (nothing to opt out of).
                           const followLockedByCohort = !!cohort.auto_add_cases
+                          const heldOut = heldOutReasons.has(group.case_hash)
+                          const heldReason = heldOutReasons.get(group.case_hash)
 
                           // Group slides by stain for the dot / bar summary
                           const stainCounts: Record<string, number> = {}
@@ -1532,7 +1764,9 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                               className={`rounded-lg border transition-all ${
                                 isSelected
                                   ? 'border-blue-300 bg-blue-50/50 shadow-sm'
-                                  : 'border-gray-200 bg-white hover:border-gray-300 hover:shadow-sm'
+                                  : heldOut
+                                    ? 'border-dashed border-gray-300 bg-gray-50/80 hover:border-gray-400'
+                                    : 'border-gray-200 bg-white hover:border-gray-300 hover:shadow-sm'
                               } ${indent ? 'ml-4' : ''}`}
                             >
                               {/* Case header */}
@@ -1551,11 +1785,11 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
 
                                 {/* Expand toggle + accession */}
                                 <button
-                                  className="flex items-center gap-2 min-w-0 flex-1 text-left"
+                                  className="flex items-center gap-2 min-w-[7.5rem] flex-1 text-left"
                                   onClick={() => toggleCaseCollapse(group.case_hash)}
                                 >
                                   <Microscope className="h-3.5 w-3.5 text-muted-foreground/60 shrink-0" />
-                                  <span className="text-sm font-semibold truncate">
+                                  <span className={`text-sm font-semibold truncate ${heldOut ? 'text-muted-foreground' : ''}`}>
                                     {displayCase(group)}
                                   </span>
                                   {group.year && (
@@ -1591,6 +1825,18 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                                       />
                                     ))}
                                   </div>
+                                )}
+
+                                {/* Held out of analysis — click to return */}
+                                {heldOut && (
+                                  <button
+                                    className="inline-flex min-w-0 max-w-32 items-center gap-1 rounded-full border border-gray-300 bg-gray-100 px-1.5 py-0.5 text-[10px] text-gray-600 hover:bg-gray-200"
+                                    onClick={e => { e.stopPropagation(); setHeldOut([group.case_hash], false) }}
+                                    title={`Held out of analysis${heldReason ? ` — ${heldReason}` : ''}. Still in the cohort. Click to return it to analysis.`}
+                                  >
+                                    <EyeOff className="h-2.5 w-2.5 shrink-0" />
+                                    <span className="truncate">{heldReason ? `Held out · ${heldReason}` : 'Held out'}</span>
+                                  </button>
                                 )}
 
                                 {/* Slide count */}
@@ -1874,7 +2120,16 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
 
                         // ── No patients assigned: flat case list ──
                         if (groupedCasesByPatient.patientGroups.length === 0) {
-                          return <div className="space-y-1">{caseGroups.map(g => renderCaseCard(g))}</div>
+                          if (visibleCaseGroups.length === 0) {
+                            return (
+                              <p className="py-8 text-center text-xs text-muted-foreground">
+                                No cases match
+                                {caseSearch.trim() ? ` “${caseSearch.trim()}”` : ''}
+                                {caseView === 'held' ? ' among held-out cases' : caseView === 'active' ? ' among cases in analysis' : ''}.
+                              </p>
+                            )
+                          }
+                          return <div className="space-y-1">{visibleCaseGroups.map(g => renderCaseCard(g))}</div>
                         }
 
                         // ── Patient → Surgery → Case hierarchy ──
@@ -2423,6 +2678,95 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
 
       {/* ── Export Dialog ── */}
       {/* Add placeholder dialog */}
+      {/* Hold out cases from a pasted accession list */}
+      <Dialog open={isHoldPasteOpen} onOpenChange={setIsHoldPasteOpen}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Hold out cases from a list</DialogTitle>
+            <DialogDescription>
+              Held-out cases stay in this cohort but are left out of the Analysis Workspace until
+              you return them. Paste accession numbers — one per line, or comma-separated.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <Textarea
+              value={holdPasteText}
+              onChange={e => setHoldPasteText(e.target.value)}
+              rows={6}
+              placeholder={'BS24-K10001\nBS23-A04521'}
+              className="font-mono text-xs"
+            />
+            <Input
+              value={holdPasteReason}
+              onChange={e => setHoldPasteReason(e.target.value)}
+              placeholder="Reason (optional), e.g. autopsy"
+              className="h-8 text-xs"
+            />
+            {holdPasteMatch.tokens.length > 0 && (
+              <div className="space-y-2 text-xs">
+                <div className={`flex items-center gap-2 rounded-md border px-3 py-2 ${
+                  holdPasteMatch.matched.length > 0
+                    ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+                    : 'border-gray-200 bg-muted/40 text-muted-foreground'
+                }`}>
+                  <Check className="h-3.5 w-3.5 shrink-0" />
+                  <span>
+                    {holdPasteMatch.matched.length} of {holdPasteMatch.tokens.length} found in this cohort
+                    {holdPasteMatch.alreadyHeld > 0 && ` · ${holdPasteMatch.alreadyHeld} already held out`}
+                  </span>
+                </div>
+                {holdPasteMatch.matched.length > 0 && (
+                  <p className="break-all font-mono text-[11px] text-muted-foreground">
+                    {holdPasteMatch.matched.slice(0, 12).map(g => displayCase(g)).join(', ')}
+                    {holdPasteMatch.matched.length > 12 ? ` … +${holdPasteMatch.matched.length - 12} more` : ''}
+                  </p>
+                )}
+                {holdPasteMatch.notFound.length > 0 && (
+                  <div className="space-y-1 rounded-md border border-orange-200 bg-orange-50 px-3 py-2">
+                    <div className="flex items-center justify-between">
+                      <span className="font-medium text-orange-800">
+                        {holdPasteMatch.notFound.length} not in this cohort
+                      </span>
+                      <CopyButton
+                        value={holdPasteMatch.notFound.join('\n')}
+                        iconClassName="h-3 w-3"
+                        className="h-6 rounded-md px-2 text-xs text-orange-800 hover:bg-orange-100"
+                        label="Copy"
+                      />
+                    </div>
+                    <p className="break-all font-mono text-[11px] text-orange-700">
+                      {holdPasteMatch.notFound.slice(0, 20).join(', ')}
+                      {holdPasteMatch.notFound.length > 20 ? ` … +${holdPasteMatch.notFound.length - 20} more` : ''}
+                    </p>
+                  </div>
+                )}
+              </div>
+            )}
+            {holdPasteError && <p className="text-xs text-red-600">{holdPasteError}</p>}
+          </div>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setIsHoldPasteOpen(false)} disabled={holdSaving}>
+              Cancel
+            </Button>
+            <Button
+              disabled={holdSaving || holdPasteMatch.matched.length === 0}
+              onClick={async () => {
+                setHoldPasteError(null)
+                const done = await setHeldOut(
+                  holdPasteMatch.matched.map(g => g.case_hash), true, holdPasteReason,
+                )
+                if (done) setIsHoldPasteOpen(false)
+                else setHoldPasteError('Could not hold out these cases. Please try again.')
+              }}
+            >
+              {holdSaving
+                ? <Loader2 className="h-4 w-4 animate-spin" />
+                : <>Hold out {holdPasteMatch.matched.length} case{holdPasteMatch.matched.length === 1 ? '' : 's'}</>}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <Dialog open={isPlaceholderOpen} onOpenChange={setIsPlaceholderOpen}>
         <DialogContent className="max-w-md">
           <DialogHeader>

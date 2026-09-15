@@ -80,6 +80,9 @@ export interface CohortDetail {
   // Case accession_hashes explicitly "followed" by this cohort — every slide of
   // a followed case is kept, and future onboarded slides for it auto-join.
   followed_case_hashes?: string[]
+  // Cases held out of analysis while staying in the cohort (e.g. autopsies set
+  // aside). The Analysis Workspace leaves their slides out of projections.
+  held_out_cases?: { case_hash: string; reason?: string | null; added_at?: string | null }[]
   // Manual "to find & scan" reminders tracked alongside real slides.
   placeholders?: CohortPlaceholder[]
   // Tags auto-applied to every slide in the cohort (now and as it grows).

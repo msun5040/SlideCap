@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
-  ChartScatter, Check, Loader2, Play, Plus, RefreshCw, Tags, Trash2, X,
+  ChartScatter, Check, EyeOff, Loader2, Play, Plus, RefreshCw, Tags, Trash2, X,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -92,6 +92,8 @@ export function AnalysisWorkspace() {
   const [starting, setStarting] = useState(false)
   const [runError, setRunError] = useState('')
   const [openProjection, setOpenProjection] = useState<number | null>(null)
+  // Held-out cases (set in Cohorts) are left out of runs unless included here.
+  const [includeHeldOut, setIncludeHeldOut] = useState(false)
 
   useEffect(() => {
     fetch(`${getApiBase()}/cohorts`)
@@ -117,6 +119,7 @@ export function AnalysisWorkspace() {
       setProjections(projs)
       setActiveSchemeId(sch.length > 0 ? sch[0].id : null)
       setSelectedHashes(new Set())
+      setIncludeHeldOut(false)
     } catch (e) {
       console.error('Failed to load cohort:', e)
     } finally {
@@ -142,17 +145,35 @@ export function AnalysisWorkspace() {
   }, [projections, numericCohortId])
 
   // ── Readiness: which slides actually have output to project ──────────
+  // case_hash → reason for cases held out of analysis in the Cohorts section.
+  const heldOut = useMemo(
+    () => new Map((cohort?.held_out_cases ?? []).map(h => [h.case_hash, h.reason ?? null] as const)),
+    [cohort],
+  )
+
   const readiness = useMemo(() => {
     const slides = cohort?.slides || []
     const ready: string[] = []
     const notReady: string[] = []
+    const heldSlides: string[] = []
+    const heldCases = new Set<string>()
     for (const s of slides) {
+      if (s.case_hash && heldOut.has(s.case_hash)) {
+        heldSlides.push(s.slide_hash)
+        heldCases.add(s.case_hash)
+        if (!includeHeldOut) continue
+      }
       const entries = Object.values(analysisStatus[s.slide_hash] || {})
       if (entries.some(e => e.status === 'completed')) ready.push(s.slide_hash)
       else notReady.push(s.slide_hash)
     }
-    return { ready, notReady, total: slides.length }
-  }, [cohort, analysisStatus])
+    return {
+      ready, notReady,
+      total: ready.length + notReady.length,
+      heldSlideCount: heldSlides.length,
+      heldCaseCount: heldCases.size,
+    }
+  }, [cohort, analysisStatus, heldOut, includeHeldOut])
 
   // ── Scheme / group mutations ─────────────────────────────────────────
   const refreshSchemes = useCallback(async (selectId?: number) => {
@@ -256,7 +277,7 @@ export function AnalysisWorkspace() {
       const res = await fetch(`${getApiBase()}/cohorts/${numericCohortId}/projections`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ method }),
+        body: JSON.stringify({ method, include_held_out: includeHeldOut }),
       })
       if (!res.ok) {
         const d = await res.json().catch(() => null)
@@ -332,6 +353,24 @@ export function AnalysisWorkspace() {
                   : 'every slide has completed analysis output'}
               </div>
             </div>
+            {readiness.heldCaseCount > 0 && (
+              <label className="flex cursor-pointer items-center gap-2 rounded-md border border-dashed px-2 py-1.5 text-[12px]">
+                <Checkbox
+                  checked={includeHeldOut}
+                  onCheckedChange={v => setIncludeHeldOut(v === true)}
+                />
+                <span>
+                  <span className="font-medium">
+                    {includeHeldOut ? 'Including' : 'Excluding'} {readiness.heldCaseCount} held-out
+                    case{readiness.heldCaseCount === 1 ? '' : 's'}
+                  </span>
+                  <span className="block text-[11px] text-muted-foreground">
+                    {readiness.heldSlideCount} slide{readiness.heldSlideCount === 1 ? '' : 's'} · held out in Cohorts ·
+                    tick to include them in runs
+                  </span>
+                </span>
+              </label>
+            )}
             <Button variant="outline" size="sm"
                     onClick={() => numericCohortId && loadCohort(numericCohortId)}>
               <RefreshCw className="mr-1 h-3.5 w-3.5" />Refresh
@@ -451,7 +490,8 @@ export function AnalysisWorkspace() {
             {/* Slide list */}
             <div className="min-h-0 flex-1 overflow-auto rounded border">
               {casesList.map(([caseHash, slides]) => (
-                <div key={caseHash} className="border-b last:border-b-0">
+                <div key={caseHash}
+                     className={`border-b last:border-b-0 ${heldOut.has(caseHash) && !includeHeldOut ? 'opacity-60' : ''}`}>
                   <button
                     onClick={() => selectCase(caseHash === 'unknown' ? null : caseHash)}
                     className="flex w-full items-center gap-2 bg-muted/40 px-2 py-1 text-left text-[12px] font-medium hover:bg-muted"
@@ -460,6 +500,18 @@ export function AnalysisWorkspace() {
                     <span className="text-[11px] font-normal text-muted-foreground">
                       {slides.length} slide{slides.length === 1 ? '' : 's'}
                     </span>
+                    {heldOut.has(caseHash) && (
+                      <span
+                        className="ml-auto inline-flex items-center gap-1 rounded-full border border-gray-300 bg-gray-100 px-1.5 py-0.5 text-[10px] font-normal text-gray-600"
+                        title={includeHeldOut
+                          ? 'Held out in Cohorts, but included in runs because "include held-out" is ticked'
+                          : 'Held out in Cohorts — excluded from projections'}
+                      >
+                        <EyeOff className="h-2.5 w-2.5" />
+                        held out{heldOut.get(caseHash) ? ` · ${heldOut.get(caseHash)}` : ''}
+                        {includeHeldOut ? ' (included)' : ''}
+                      </span>
+                    )}
                   </button>
                   {slides.map(s => {
                     const g = groupOfSlide.get(s.slide_hash)

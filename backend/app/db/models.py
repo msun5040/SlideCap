@@ -192,6 +192,19 @@ cohort_followed_cases = Table(
     Column('added_at', DateTime, default=datetime.utcnow)
 )
 
+# Cases temporarily held out of analysis while staying in the cohort (e.g. set
+# autopsy cases aside for one analysis without losing them). Membership is
+# untouched — the Analysis Workspace excludes held-out cases' slides from
+# projections unless asked to include them. `reason` is an optional free-text
+# note ("autopsy") shown on the case.
+cohort_held_out_cases = Table(
+    'cohort_held_out_cases', Base.metadata,
+    Column('cohort_id', Integer, ForeignKey('cohorts.id', ondelete='CASCADE'), primary_key=True),
+    Column('case_id', Integer, ForeignKey('cases.id', ondelete='CASCADE'), primary_key=True),
+    Column('reason', String(200)),
+    Column('added_at', DateTime, default=datetime.utcnow)
+)
+
 # Tags auto-applied to every slide in a cohort. Applied when the auto-tag set is
 # saved, when slides are added, and when case-following pulls new slides in — so
 # "tag everything in this cohort" stays true as the cohort grows.
@@ -380,6 +393,10 @@ class Cohort(Base):
     # Cases explicitly followed by this cohort (per-case auto-add). Independent of
     # auto_add_cases, which follows every case already represented in the cohort.
     followed_cases = relationship('Case', secondary=cohort_followed_cases)
+    # Cases held out of analysis (still members). Read/written via SQL in main.py
+    # for the reason column; the relationship is here so deleting a cohort clears
+    # its rows (SQLite FK enforcement is off on this engine).
+    held_out_cases = relationship('Case', secondary=cohort_held_out_cases)
     # Tags auto-applied to every slide in the cohort (kept applied as it grows).
     auto_tags = relationship('Tag', secondary=cohort_auto_tags)
     patients = relationship('CohortPatient', back_populates='cohort', cascade='all, delete-orphan')
