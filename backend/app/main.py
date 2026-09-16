@@ -3390,6 +3390,52 @@ def create_cohort_patient(cohort_id: int, data: PatientCreate, db: Session = Dep
             "display_order": patient.display_order, "surgeries": []}
 
 
+class PatientBulkCreate(BaseModel):
+    labels: List[str]
+
+
+@app.post("/cohorts/{cohort_id}/patients/bulk")
+def bulk_create_cohort_patients(cohort_id: int, data: PatientBulkCreate, db: Session = Depends(get_db)):
+    """Create many patients at once (e.g. CCNU_1 … CCNU_50), appended in the given order.
+
+    Labels that already exist in the cohort (case-insensitive) or repeat within the
+    request are skipped and reported, so re-running a range only fills the gaps.
+    """
+    if not db.query(Cohort).filter_by(id=cohort_id).first():
+        raise HTTPException(status_code=404, detail="Cohort not found")
+    labels = [l.strip() for l in data.labels if l and l.strip()]
+    if len(labels) > 1000:
+        raise HTTPException(status_code=400, detail="At most 1,000 patients can be created at once.")
+    existing = {
+        (lbl or "").lower()
+        for (lbl,) in db.query(CohortPatient.label).filter_by(cohort_id=cohort_id).all()
+    }
+    created, skipped, seen = [], [], set()
+    with get_lock().write_lock():
+        max_order = (
+            db.query(func.max(CohortPatient.display_order)).filter_by(cohort_id=cohort_id).scalar()
+        )
+        next_order = (max_order if max_order is not None else -1) + 1
+        for label in labels:
+            key = label.lower()
+            if key in existing or key in seen:
+                skipped.append(label)
+                continue
+            seen.add(key)
+            p = CohortPatient(cohort_id=cohort_id, label=label[:100], display_order=next_order)
+            next_order += 1
+            db.add(p)
+            created.append(p)
+        db.commit()
+        for p in created:
+            db.refresh(p)
+    return {
+        "created": [{"id": p.id, "label": p.label, "note": p.note,
+                     "display_order": p.display_order, "surgeries": []} for p in created],
+        "skipped": skipped,
+    }
+
+
 @app.patch("/cohorts/{cohort_id}/patients/reorder")
 def reorder_cohort_patients(cohort_id: int, data: PatientReorder, db: Session = Depends(get_db)):
     """Set the manual display order of patients in a cohort.
