@@ -605,6 +605,9 @@ class CohortProjection(Base):
     # was kept; a clustering run rebuilds it from the pinned slides.
     reduced_path = Column(String(500))
     reduced_dim = Column(Integer)
+    # Affine PCA map raw features → reduced rows (npz), recovered the first time a
+    # cohort is overlaid onto this projection. Imported projections carry no model.
+    pca_path = Column(String(500))
 
     point_count = Column(Integer)
     feature_dim = Column(Integer)   # measured from the .h5, not assumed
@@ -620,6 +623,9 @@ class CohortProjection(Base):
     clusterings = relationship('ProjectionClustering', back_populates='projection',
                                cascade='all, delete-orphan',
                                order_by='ProjectionClustering.created_at.desc()')
+    overlays = relationship('ProjectionOverlay', back_populates='projection',
+                            cascade='all, delete-orphan',
+                            order_by='ProjectionOverlay.created_at.desc()')
 
     def get_slide_hashes(self) -> list:
         import json
@@ -702,6 +708,70 @@ class ProjectionClustering(Base):
     def __repr__(self):
         return (f"<ProjectionClustering(id={self.id}, projection_id={self.projection_id}, "
                 f"algorithm={self.algorithm}, status={self.status})>")
+
+
+class ProjectionOverlay(Base):
+    """
+    Another cohort's patches placed onto a projection without refitting it: pushed
+    through the projection's PCA, assigned to its k-means clusterings by nearest
+    centroid, and positioned on its 2D map (see services/projection_overlay.py).
+
+    The overlay artifact uses the projection format (slides of the overlay cohort,
+    x/y on the reference map), so the frontend parses it the same way. Cluster
+    assignments are cached per clustering as sidecar files, computed on demand.
+    """
+    __tablename__ = 'projection_overlays'
+
+    id = Column(Integer, primary_key=True)
+    projection_id = Column(Integer, ForeignKey('cohort_projections.id', ondelete='CASCADE'),
+                           nullable=False, index=True)
+    cohort_id = Column(Integer, ForeignKey('cohorts.id', ondelete='CASCADE'), nullable=False, index=True)
+    analysis_id = Column(Integer, ForeignKey('analyses.id', ondelete='SET NULL'), nullable=True)
+    include_held_out = Column(Boolean, default=False)
+
+    slide_hashes_json = Column(Text, default='[]')   # overlay slide order (= artifact order)
+    excluded_json = Column(Text, default='[]')       # [{slide_hash, reason}]
+    warnings_json = Column(Text, default='[]')       # [str]
+    report_json = Column(Text, default='{}')         # PCA recovery report, timings
+
+    status = Column(String(20), nullable=False, default='pending')
+    progress_pct = Column(Integer, default=0)
+    progress_stage = Column(String(200))
+    error_message = Column(Text)
+
+    artifact_path = Column(String(500))
+    reduced_path = Column(String(500))
+    point_count = Column(Integer)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime)
+    completed_at = Column(DateTime)
+
+    projection = relationship('CohortProjection', back_populates='overlays')
+    cohort = relationship('Cohort')
+
+    def _get(self, attr, default):
+        import json
+        try:
+            return json.loads(getattr(self, attr) or '')
+        except Exception:
+            return default
+
+    def get_slide_hashes(self) -> list:
+        return self._get('slide_hashes_json', [])
+
+    def get_excluded(self) -> list:
+        return self._get('excluded_json', [])
+
+    def get_warnings(self) -> list:
+        return self._get('warnings_json', [])
+
+    def get_report(self) -> dict:
+        return self._get('report_json', {})
+
+    def __repr__(self):
+        return (f"<ProjectionOverlay(id={self.id}, projection_id={self.projection_id}, "
+                f"cohort_id={self.cohort_id}, status={self.status})>")
 
 
 class CohortPlaceholder(Base):
@@ -1641,6 +1711,7 @@ def _migrate_cohort_projections(engine):
         adds = {
             'reduced_path': "ALTER TABLE cohort_projections ADD COLUMN reduced_path VARCHAR(500)",
             'reduced_dim': "ALTER TABLE cohort_projections ADD COLUMN reduced_dim INTEGER",
+            'pca_path': "ALTER TABLE cohort_projections ADD COLUMN pca_path VARCHAR(500)",
         }
         with engine.connect() as conn:
             for col, ddl in adds.items():

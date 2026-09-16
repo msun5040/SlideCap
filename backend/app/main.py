@@ -19,11 +19,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 from datetime import datetime
+import numpy as np
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import text as sa_text, func, or_
 
 from .config import settings
-from .db import init_db, get_db, get_session, Case, Slide, Tag, Project, Cohort, CohortFlag, CohortGroupScheme, CohortGroup, CohortProjection, ProjectionClustering, CohortPatient, CohortPatientCase, CohortPlaceholder, Analysis, AnalysisJob, JobSlide, SlideQC, RequestSheet, RequestRow, RequestStatus, Study, StudyGroup, init_lock, get_lock, Patient, ExternalMapping, generate_slidecap_id
+from .db import init_db, get_db, get_session, Case, Slide, Tag, Project, Cohort, CohortFlag, CohortGroupScheme, CohortGroup, CohortProjection, ProjectionClustering, ProjectionOverlay, CohortPatient, CohortPatientCase, CohortPlaceholder, Analysis, AnalysisJob, JobSlide, SlideQC, RequestSheet, RequestRow, RequestStatus, Study, StudyGroup, init_lock, get_lock, Patient, ExternalMapping, generate_slidecap_id
 from .services import SlideHasher, SlideIndexer, ClusterService, JobStatusPoller
 from .services import tiff_pyramid
 from .auth import AuthMiddleware, create_challenge, verify_challenge, create_token, verify_token, cleanup_expired_challenges
@@ -5677,6 +5678,8 @@ def _serialize_projection(pr: CohortProjection, db: Session = None) -> dict:
         # False for projections made before the reduced matrix was kept; the
         # first clustering on those rebuilds it (slower), and the UI says so.
         "has_reduced": bool(pr.reduced_path and (settings.local_data_path / pr.reduced_path).exists()),
+        "has_pca": bool(pr.pca_path and (settings.local_data_path / pr.pca_path).exists()),
+        "overlay_count": len(pr.overlays),
         "created_at": pr.created_at.isoformat() if pr.created_at else None,
         "started_at": pr.started_at.isoformat() if pr.started_at else None,
         "completed_at": pr.completed_at.isoformat() if pr.completed_at else None,
@@ -5929,10 +5932,15 @@ def delete_cohort_projection(projection_id: int, db: Session = Depends(get_db)):
     pr = db.query(CohortProjection).filter_by(id=projection_id).first()
     if not pr:
         raise HTTPException(status_code=404, detail="Projection not found")
-    # Derived files: the artifact, the kept reduced matrix, and every clustering's
-    # labels (their rows go with the projection via the ORM cascade).
-    rel_paths = [pr.artifact_path, pr.reduced_path] + [c.labels_path for c in pr.clusterings]
+    # Derived files: the artifact, the kept reduced matrix and recovered PCA, every
+    # clustering's labels and centroids, and every overlay's files (their rows go
+    # with the projection via the ORM cascade).
+    rel_paths = [pr.artifact_path, pr.reduced_path, pr.pca_path] + [c.labels_path for c in pr.clusterings]
     files = [settings.local_data_path / p for p in rel_paths if p]
+    root = _projection_root()
+    files += [root / f"clustering-{c.id}.centroids.npz" for c in pr.clusterings]
+    for ov in pr.overlays:
+        files += _overlay_files(ov)
     with get_lock().write_lock():
         db.delete(pr)
         db.commit()
@@ -6142,16 +6150,542 @@ def delete_projection_clustering(clustering_id: int, db: Session = Depends(get_d
     cl = db.query(ProjectionClustering).filter_by(id=clustering_id).first()
     if not cl:
         raise HTTPException(status_code=404, detail="Clustering not found")
-    labels = settings.local_data_path / cl.labels_path if cl.labels_path else None
+    root = _projection_root()
+    files = [settings.local_data_path / cl.labels_path] if cl.labels_path else []
+    # Its centroids and any overlay assignments made against it.
+    files.append(root / f"clustering-{cl.id}.centroids.npz")
+    files += list(root.glob(f"overlay-*-c{cl.id}.*"))
     with get_lock().write_lock():
         db.delete(cl)
         db.commit()
-    if labels:
+    for f in files:
         try:
-            labels.unlink(missing_ok=True)
+            f.unlink(missing_ok=True)
         except OSError as e:
-            print(f"[clustering] could not remove {labels}: {e}")
+            print(f"[clustering] could not remove {f}: {e}")
     return {"status": "ok"}
+
+
+# ── Overlays: another cohort placed onto a projection's map and clusters ─────
+# See services/projection_overlay.py. The reference projection is never refit.
+
+class ProjectionOverlayCreate(BaseModel):
+    cohort_id: int
+    analysis_id: Optional[int] = None
+    include_held_out: bool = False
+
+
+class OverlayCompositionRequest(BaseModel):
+    clustering_ids: List[int]
+    scheme_id: int
+    group_a_id: int
+    group_b_id: int
+    weighting: str = "slide"                     # slide | patch
+    exclude_clusters: Dict[str, List[int]] = {}  # clustering_id → cluster labels
+    exclude_far: bool = False
+    restrict_group_id: Optional[int] = None      # e.g. a "Resection" group, for a sensitivity check
+
+
+# One lock per reference projection, so two overlays started together don't both
+# recover the PCA or build the same centroids.
+_overlay_ref_locks: dict[int, threading.Lock] = {}
+_overlay_ref_locks_guard = threading.Lock()
+
+
+def _overlay_ref_lock(projection_id: int) -> threading.Lock:
+    with _overlay_ref_locks_guard:
+        return _overlay_ref_locks.setdefault(projection_id, threading.Lock())
+
+
+def _uni_analysis_id(db: Session) -> Optional[int]:
+    """The UNI analysis, so 'most recent completed job' can't pick another analysis's output."""
+    a = db.query(Analysis).filter(Analysis.kind == "uni").order_by(Analysis.id).first()
+    return a.id if a else None
+
+
+def _overlay_files(ov: ProjectionOverlay) -> list:
+    root = _projection_root()
+    files = [settings.local_data_path / p for p in (ov.artifact_path, ov.reduced_path) if p]
+    files += list(root.glob(f"overlay-{ov.id}-*"))
+    return files
+
+
+def _serialize_overlay(ov: ProjectionOverlay) -> dict:
+    return {
+        "id": ov.id,
+        "projection_id": ov.projection_id,
+        "cohort_id": ov.cohort_id,
+        "cohort_name": ov.cohort.name if ov.cohort else None,
+        "analysis_id": ov.analysis_id,
+        "include_held_out": bool(ov.include_held_out),
+        "slide_count": len(ov.get_slide_hashes()),
+        "point_count": ov.point_count,
+        "status": ov.status,
+        "progress_pct": ov.progress_pct or 0,
+        "progress_stage": ov.progress_stage,
+        "error_message": ov.error_message,
+        "excluded": ov.get_excluded(),
+        "warnings": ov.get_warnings(),
+        "report": ov.get_report(),
+        "created_at": ov.created_at.isoformat() if ov.created_at else None,
+        "completed_at": ov.completed_at.isoformat() if ov.completed_at else None,
+    }
+
+
+def _update_model_row(model, row_id: int, **fields) -> None:
+    s = get_session()
+    try:
+        row = s.query(model).filter_by(id=row_id).first()
+        if row:
+            for k, v in fields.items():
+                setattr(row, k, v)
+            s.commit()
+    except Exception as e:
+        print(f"[overlay] status update failed: {e}")
+    finally:
+        s.close()
+
+
+def _ensure_projection_pca(db: Session, pr: CohortProjection, progress) -> Path:
+    """The projection's affine PCA map, recovering it from the reference slides if needed."""
+    from .services import projection_overlay as po
+    if pr.pca_path and (settings.local_data_path / pr.pca_path).exists():
+        return settings.local_data_path / pr.pca_path
+    if not (pr.reduced_path and (settings.local_data_path / pr.reduced_path).exists() and pr.reduced_dim):
+        raise po.OverlayError(
+            "The reference projection has no saved PCA matrix. Run any clustering on it once "
+            "(that rebuilds the matrix), then overlay again.")
+    cohort = db.query(Cohort).options(joinedload(Cohort.slides)).filter_by(id=pr.cohort_id).first()
+    if cohort is None:
+        raise po.OverlayError("The reference projection's cohort no longer exists.")
+    pinned = pr.get_slide_hashes()
+    sources, _ = _collect_projection_sources(db, cohort, pr.analysis_id or _uni_analysis_id(db), pinned)
+    ref = po.read_artifact(settings.local_data_path / pr.artifact_path)
+    reduced = po.open_reduced(settings.local_data_path / pr.reduced_path, pr.point_count, pr.reduced_dim)
+    out = _projection_root() / f"projection-{pr.id}.pca.npz"
+    po.recover_pca(ref, reduced, {s.slide_hash: s for s in sources}, out, progress=progress)
+    del reduced
+    _update_model_row(CohortProjection, pr.id, pca_path=f"{PROJECTION_DIR_NAME}/{out.name}")
+    return out
+
+
+def _clustering_centroids(pr: CohortProjection, cl: ProjectionClustering) -> dict:
+    """Centroids for a k-means clustering of the projection, built once and cached."""
+    from .services import projection_overlay as po
+    path = _projection_root() / f"clustering-{cl.id}.centroids.npz"
+    if not path.exists():
+        with _overlay_ref_lock(pr.id):
+            if not path.exists():
+                labels = np.fromfile(settings.local_data_path / cl.labels_path, dtype="<i2")
+                reduced = po.open_reduced(settings.local_data_path / pr.reduced_path,
+                                          pr.point_count, pr.reduced_dim)
+                po.build_centroids(reduced, labels, path)
+                del reduced
+    return po.load_centroids(path)
+
+
+def _check_overlayable_clustering(ov: ProjectionOverlay, cl: Optional[ProjectionClustering]) -> None:
+    if not cl or cl.projection_id != ov.projection_id:
+        raise HTTPException(status_code=404, detail="Clustering not found on this overlay's projection.")
+    if cl.status != "completed" or not cl.labels_path:
+        raise HTTPException(status_code=409, detail=f"Clustering is {cl.status}, not ready.")
+    if cl.algorithm != "kmeans":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only k-means clusterings can be overlaid ({cl.algorithm} has no centroids to assign to).")
+
+
+def _overlay_assignment(ov: ProjectionOverlay, cl: ProjectionClustering):
+    """(labels int16, far uint8) for the overlay under one clustering, cached as sidecars."""
+    from .services import projection_overlay as po
+    root = _projection_root()
+    lab_p = root / f"overlay-{ov.id}-c{cl.id}.labels"
+    far_p = root / f"overlay-{ov.id}-c{cl.id}.far"
+    if not (lab_p.exists() and far_p.exists()):
+        pr = ov.projection
+        cent = _clustering_centroids(pr, cl)
+        Q = po.open_reduced(settings.local_data_path / ov.reduced_path, ov.point_count, pr.reduced_dim)
+        lab, far, _ = po.assign(Q, cent)
+        del Q
+        for path, arr in ((lab_p, lab.astype("<i2")), (far_p, far)):
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            arr.tofile(tmp)
+            tmp.replace(path)
+        report = ov.get_report()
+        report.setdefault("clusterings", {})[str(cl.id)] = {
+            "agreement": cent["report"]["agreement"],
+            "n_clusters": cent["report"]["n_clusters"],
+            "far_share": float(far.mean()) if far.size else 0.0,
+        }
+        _update_model_row(ProjectionOverlay, ov.id, report_json=json.dumps(report))
+    return np.fromfile(lab_p, dtype="<i2"), np.fromfile(far_p, dtype=np.uint8)
+
+
+def _run_overlay_background(overlay_id: int) -> None:
+    from .services import projection_overlay as po
+    from .services.cohort_projection import ProjectionError
+
+    last = {"pct": -1, "t": 0.0}
+
+    def progress_in(lo: int, hi: int):
+        def progress(pct: int, stage: str):
+            scaled = lo + int((hi - lo) * max(0, min(100, pct)) / 100)
+            now = time.time()
+            if scaled >= 100 or scaled - last["pct"] >= 2 or now - last["t"] > 3:
+                last["pct"], last["t"] = scaled, now
+                _update_model_row(ProjectionOverlay, overlay_id, progress_pct=scaled, progress_stage=stage)
+        return progress
+
+    db = get_session()
+    try:
+        ov = db.query(ProjectionOverlay).filter_by(id=overlay_id).first()
+        if not ov:
+            return
+        pr = ov.projection
+        _update_model_row(ProjectionOverlay, overlay_id, status="running", started_at=datetime.now(),
+                          progress_pct=0, progress_stage="Starting")
+
+        # ── Overlay sources, held-out cases and overlap with the reference ──
+        cohort = (db.query(Cohort).options(joinedload(Cohort.slides).joinedload(Slide.case))
+                  .filter_by(id=ov.cohort_id).first())
+        if cohort is None:
+            raise po.OverlayError("The overlay cohort no longer exists.")
+        held = set() if ov.include_held_out else _held_out_case_hashes(db, cohort.id)
+        excluded = [{"slide_hash": s.slide_hash, "reason": "held out of analysis"}
+                    for s in cohort.slides if s.case and s.case.accession_hash in held]
+        analysis_id = ov.analysis_id or pr.analysis_id or _uni_analysis_id(db)
+        sources, skipped = _collect_projection_sources(db, cohort, analysis_id, None, exclude_case_hashes=held)
+        excluded += skipped
+
+        pinned = set(pr.get_slide_hashes())
+        in_ref = [s for s in sources if s.slide_hash in pinned]
+        excluded += [{"slide_hash": s.slide_hash, "reason": "already in the reference projection"} for s in in_ref]
+        sources = [s for s in sources if s.slide_hash not in pinned]
+        if not sources:
+            raise po.OverlayError(
+                "No slides in this cohort can be overlaid: none have completed UNI output outside the reference "
+                f"projection ({len(excluded)} excluded).")
+
+        warnings = []
+        ref_slides = db.query(Slide).options(joinedload(Slide.case)).filter(Slide.slide_hash.in_(list(pinned))).all()
+        ref_case_ids = {s.case_id for s in ref_slides}
+        ref_patient_ids = {s.case.patient_id for s in ref_slides if s.case and s.case.patient_id}
+        by_hash = {s.slide_hash: s for s in cohort.slides}
+        ov_slides = [by_hash[s.slide_hash] for s in sources if s.slide_hash in by_hash]
+        shared_cases = {s.case_id for s in ov_slides if s.case_id in ref_case_ids}
+        if shared_cases:
+            warnings.append(f"{len(shared_cases)} overlay case(s) also have other slides in the reference cohort.")
+        shared_patients = {s.case.patient_id for s in ov_slides
+                           if s.case and s.case.patient_id and s.case.patient_id in ref_patient_ids}
+        if shared_patients:
+            warnings.append(f"{len(shared_patients)} overlay patient(s) also have cases in the reference cohort.")
+
+        # ── Reference PCA (recovered once per projection) ──
+        recovering = not (pr.pca_path and (settings.local_data_path / pr.pca_path).exists())
+        split = 40 if recovering else 0
+        with _overlay_ref_lock(pr.id):
+            pca_path = _ensure_projection_pca(db, pr, progress_in(0, split))
+        pca_report = po.load_pca(pca_path)[2]
+
+        # ── Transform, place, write ──
+        root = _projection_root()
+        art = root / f"overlay-{overlay_id}.scproj"
+        red = root / f"overlay-{overlay_id}.reduced.f32"
+        ref_reduced = po.open_reduced(settings.local_data_path / pr.reduced_path, pr.point_count, pr.reduced_dim)
+        result = po.build_overlay(settings.local_data_path / pr.artifact_path, ref_reduced, pca_path,
+                                  sources, art, red, pr.id, progress=progress_in(split, 90))
+        del ref_reduced
+        warnings += result["warnings"]
+
+        _update_model_row(
+            ProjectionOverlay, overlay_id,
+            slide_hashes_json=json.dumps([s.slide_hash for s in sources]),
+            excluded_json=json.dumps(excluded), warnings_json=json.dumps(warnings),
+            report_json=json.dumps({"pca": pca_report, "elapsed_seconds": result["elapsed_seconds"]}),
+            artifact_path=f"{PROJECTION_DIR_NAME}/{art.name}",
+            reduced_path=f"{PROJECTION_DIR_NAME}/{red.name}",
+            point_count=result["point_count"],
+        )
+
+        # ── Pre-assign under every completed k-means clustering, so the first view is instant ──
+        db.expire_all()
+        ov = db.query(ProjectionOverlay).filter_by(id=overlay_id).first()
+        kms = [c for c in ov.projection.clusterings if c.algorithm == "kmeans" and c.status == "completed"]
+        for i, cl in enumerate(kms):
+            progress_in(90, 100)(int(100 * i / max(1, len(kms))), f"Assigning clusters ({cl.get_params().get('label') or f'k={cl.n_clusters}'})")
+            _overlay_assignment(ov, cl)
+            db.expire(ov)
+
+        _update_model_row(ProjectionOverlay, overlay_id, status="completed", completed_at=datetime.now(),
+                          progress_pct=100, progress_stage="Done", error_message=None)
+        print(f"[overlay] #{overlay_id} done: {result['point_count']:,} patches from {len(sources)} slides "
+              f"onto projection #{pr.id} (PCA recovery error {pca_report.get('relative_error', 0):.1e})")
+    except (po.OverlayError, ProjectionError) as e:
+        _update_model_row(ProjectionOverlay, overlay_id, status="failed", completed_at=datetime.now(),
+                          error_message=str(e))
+        print(f"[overlay] #{overlay_id} failed: {e}")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        _update_model_row(ProjectionOverlay, overlay_id, status="failed", completed_at=datetime.now(),
+                          error_message=f"{type(e).__name__}: {e}")
+    finally:
+        db.close()
+
+
+def _get_overlay(db: Session, overlay_id: int) -> ProjectionOverlay:
+    ov = db.query(ProjectionOverlay).filter_by(id=overlay_id).first()
+    if not ov:
+        raise HTTPException(status_code=404, detail="Overlay not found")
+    return ov
+
+
+def _require_completed_overlay(ov: ProjectionOverlay) -> None:
+    if ov.status != "completed" or not ov.artifact_path:
+        raise HTTPException(status_code=409, detail=f"Overlay is {ov.status}, not ready to read.")
+
+
+@app.get("/projections/{projection_id}/overlays")
+def list_projection_overlays(projection_id: int, db: Session = Depends(get_db)):
+    rows = (db.query(ProjectionOverlay).filter_by(projection_id=projection_id)
+              .order_by(ProjectionOverlay.created_at.desc()).all())
+    return [_serialize_overlay(o) for o in rows]
+
+
+@app.post("/projections/{projection_id}/overlays")
+def create_projection_overlay(projection_id: int, data: ProjectionOverlayCreate, db: Session = Depends(get_db)):
+    """Place another cohort onto this projection. Returns immediately; poll the row."""
+    pr = db.query(CohortProjection).filter_by(id=projection_id).first()
+    if not pr:
+        raise HTTPException(status_code=404, detail="Projection not found")
+    if pr.status != "completed" or not pr.artifact_path:
+        raise HTTPException(status_code=409, detail=f"Projection is {pr.status}; overlay onto it once it has completed.")
+    if not db.query(Cohort).filter_by(id=data.cohort_id).first():
+        raise HTTPException(status_code=404, detail="Cohort not found")
+    with get_lock().write_lock():
+        ov = ProjectionOverlay(projection_id=projection_id, cohort_id=data.cohort_id,
+                               analysis_id=data.analysis_id, include_held_out=data.include_held_out,
+                               status="pending", progress_pct=0, progress_stage="Queued")
+        db.add(ov)
+        db.commit()
+        db.refresh(ov)
+    threading.Thread(target=_run_overlay_background, args=(ov.id,),
+                     name=f"overlay-{ov.id}", daemon=True).start()
+    return _serialize_overlay(ov)
+
+
+@app.get("/overlays/{overlay_id}")
+def get_projection_overlay(overlay_id: int, db: Session = Depends(get_db)):
+    return _serialize_overlay(_get_overlay(db, overlay_id))
+
+
+@app.get("/overlays/{overlay_id}/points")
+def get_projection_overlay_points(overlay_id: int, db: Session = Depends(get_db)):
+    """The overlay artifact — same binary format as /projections/{id}/points."""
+    ov = _get_overlay(db, overlay_id)
+    _require_completed_overlay(ov)
+    path = settings.local_data_path / ov.artifact_path
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Overlay artifact is missing; re-run the overlay.")
+    return FileResponse(str(path), media_type="application/octet-stream",
+                        headers={"Cache-Control": "private, max-age=86400"})
+
+
+@app.get("/overlays/{overlay_id}/labels")
+def get_projection_overlay_labels(overlay_id: int, clustering_id: int, db: Session = Depends(get_db)):
+    """int16 per overlay point: nearest-centroid cluster under the given k-means clustering."""
+    ov = _get_overlay(db, overlay_id)
+    _require_completed_overlay(ov)
+    cl = db.query(ProjectionClustering).filter_by(id=clustering_id).first()
+    _check_overlayable_clustering(ov, cl)
+    _overlay_assignment(ov, cl)
+    return FileResponse(str(_projection_root() / f"overlay-{ov.id}-c{cl.id}.labels"),
+                        media_type="application/octet-stream")
+
+
+@app.get("/overlays/{overlay_id}/far")
+def get_projection_overlay_far(overlay_id: int, clustering_id: int, db: Session = Depends(get_db)):
+    """uint8 per overlay point: 1 when farther from its centroid than the reference's own 99th percentile."""
+    ov = _get_overlay(db, overlay_id)
+    _require_completed_overlay(ov)
+    cl = db.query(ProjectionClustering).filter_by(id=clustering_id).first()
+    _check_overlayable_clustering(ov, cl)
+    _overlay_assignment(ov, cl)
+    return FileResponse(str(_projection_root() / f"overlay-{ov.id}-c{cl.id}.far"),
+                        media_type="application/octet-stream")
+
+
+@app.delete("/overlays/{overlay_id}")
+def delete_projection_overlay(overlay_id: int, db: Session = Depends(get_db)):
+    ov = _get_overlay(db, overlay_id)
+    if ov.status in ("pending", "running"):
+        raise HTTPException(status_code=409, detail="This overlay is still running.")
+    files = _overlay_files(ov)
+    with get_lock().write_lock():
+        db.delete(ov)
+        db.commit()
+    for f in files:
+        try:
+            f.unlink(missing_ok=True)
+        except OSError as e:
+            print(f"[overlay] could not remove {f}: {e}")
+    return {"status": "ok"}
+
+
+def _group_slide_hashes(db: Session, group_id: int, cohort_id: int) -> set:
+    g = db.query(CohortGroup).options(joinedload(CohortGroup.slides), joinedload(CohortGroup.scheme)) \
+        .filter_by(id=group_id).first()
+    if not g or not g.scheme or g.scheme.cohort_id != cohort_id:
+        raise HTTPException(status_code=404, detail=f"Group {group_id} not found in the overlay cohort.")
+    return {s.slide_hash for s in g.slides}
+
+
+@app.post("/overlays/{overlay_id}/composition")
+def overlay_composition(overlay_id: int, data: OverlayCompositionRequest, db: Session = Depends(get_db)):
+    """Patient-paired cluster composition, group A → group B, for each chosen clustering."""
+    from .services import projection_overlay as po
+    from .services import cluster_composition as cc
+
+    ov = _get_overlay(db, overlay_id)
+    _require_completed_overlay(ov)
+    if data.weighting not in ("slide", "patch"):
+        raise HTTPException(status_code=400, detail="weighting must be 'slide' or 'patch'.")
+    if data.group_a_id == data.group_b_id:
+        raise HTTPException(status_code=400, detail="Choose two different groups to compare.")
+    a = _group_slide_hashes(db, data.group_a_id, ov.cohort_id)
+    b = _group_slide_hashes(db, data.group_b_id, ov.cohort_id)
+    restrict = _group_slide_hashes(db, data.restrict_group_id, ov.cohort_id) if data.restrict_group_id else None
+
+    header = po.read_artifact_header(settings.local_data_path / ov.artifact_path)
+    hashes = [s["slide_hash"] for s in header["slides"]]
+    slide_rows = {s.slide_hash: s for s in
+                  db.query(Slide).options(joinedload(Slide.case)).filter(Slide.slide_hash.in_(hashes)).all()}
+    patient_of_case: dict = {}
+    for p in (db.query(CohortPatient).options(joinedload(CohortPatient.surgeries).joinedload(CohortPatientCase.case))
+                .filter_by(cohort_id=ov.cohort_id).all()):
+        for sg in p.surgeries:
+            if sg.case:
+                patient_of_case[sg.case.accession_hash] = p.label
+
+    slides = []
+    for s in header["slides"]:
+        h = s["slide_hash"]
+        if restrict is not None and h not in restrict:
+            continue
+        row = slide_rows.get(h)
+        case_hash = row.case.accession_hash if row and row.case else None
+        slides.append(cc.SlideInfo(slide_hash=h, case_hash=case_hash, patient=patient_of_case.get(case_hash),
+                                   in_a=h in a, in_b=h in b, start=int(s["start"]), count=int(s["n_patches"])))
+
+    results = []
+    for cid in data.clustering_ids:
+        cl = db.query(ProjectionClustering).filter_by(id=cid).first()
+        _check_overlayable_clustering(ov, cl)
+        labels, far = _overlay_assignment(ov, cl)
+        cent = _clustering_centroids(ov.projection, cl)
+        try:
+            res = cc.compute(cc.CompositionInput(
+                slides=slides, labels=labels, far=far, n_clusters=int(cent["report"]["n_clusters"]),
+                ref_share=cent["ref_share"], exclude_clusters=data.exclude_clusters.get(str(cid), []),
+                exclude_far=data.exclude_far, weighting=data.weighting))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        res.update({"clustering_id": cl.id, "n_clusters": int(cent["report"]["n_clusters"]),
+                    "label": cl.get_params().get("label") or f"k={cl.n_clusters}",
+                    "agreement": cent["report"]["agreement"]})
+        results.append(res)
+
+    counts = {"a": sum(1 for s in slides if s.in_a and not s.in_b), "b": sum(1 for s in slides if s.in_b and not s.in_a)}
+    return {"overlay_id": ov.id, "slides_in_groups": counts, "results": results}
+
+
+@app.get("/overlays/{overlay_id}/tiles")
+def overlay_tiles(overlay_id: int, clustering_id: int, cluster: int, group_id: Optional[int] = None,
+                  source: str = "overlay", n: int = Query(24, ge=1, le=100), db: Session = Depends(get_db)):
+    """
+    Representative patches of one cluster: those nearest its centroid, spread across
+    slides. `source=overlay` (optionally within a group of the overlay cohort) or
+    `source=reference`.
+    """
+    from .services import projection_overlay as po
+    ov = _get_overlay(db, overlay_id)
+    _require_completed_overlay(ov)
+    cl = db.query(ProjectionClustering).filter_by(id=clustering_id).first()
+    _check_overlayable_clustering(ov, cl)
+    pr = ov.projection
+    cent = _clustering_centroids(pr, cl)
+    if not 0 <= cluster < len(cent["centroids"]):
+        raise HTTPException(status_code=400, detail="No such cluster.")
+
+    if source == "reference":
+        art = po.read_artifact(settings.local_data_path / pr.artifact_path)
+        labels = np.fromfile(settings.local_data_path / cl.labels_path, dtype="<i2")
+        reduced = po.open_reduced(settings.local_data_path / pr.reduced_path, pr.point_count, pr.reduced_dim)
+        allowed = None
+    elif source == "overlay":
+        art = po.read_artifact(settings.local_data_path / ov.artifact_path)
+        labels, _far = _overlay_assignment(ov, cl)
+        reduced = po.open_reduced(settings.local_data_path / ov.reduced_path, ov.point_count, pr.reduced_dim)
+        allowed = _group_slide_hashes(db, group_id, ov.cohort_id) if group_id else None
+    else:
+        raise HTTPException(status_code=400, detail="source must be 'overlay' or 'reference'.")
+
+    slides = art.header["slides"]
+    cand = np.flatnonzero(labels == cluster)
+    if allowed is not None:
+        ok = np.array([slides[i]["slide_hash"] in allowed for i in range(len(slides))], dtype=bool)
+        cand = cand[ok[np.asarray(art.slide_idx)[cand]]]
+    if cand.size == 0:
+        return {"tiles": []}
+    C = cent["centroids"][cluster]
+    dist = np.empty(cand.size, dtype=np.float32)
+    for s in range(0, cand.size, 65536):
+        sel = cand[s:s + 65536]
+        dist[s:s + 65536] = np.linalg.norm(np.asarray(reduced[sel], dtype=np.float32) - C, axis=1)
+    order = cand[np.argsort(dist)]
+    dist_sorted = np.sort(dist)
+    sidx = np.asarray(art.slide_idx)[order]
+    n_slides = len(np.unique(sidx))
+    cap = max(1, int(np.ceil(n / max(1, min(n_slides, n)))))
+    taken: dict = {}
+    tiles = []
+    for i, row in enumerate(order):
+        si = int(sidx[i])
+        if taken.get(si, 0) >= cap:
+            continue
+        taken[si] = taken.get(si, 0) + 1
+        sl = slides[si]
+        tiles.append({"slide_hash": sl["slide_hash"], "display_name": sl.get("display_name"),
+                      "x": int(art.patch_x[row]), "y": int(art.patch_y[row]),
+                      "size": int(sl.get("patch_size") or 256), "dist": float(dist_sorted[i])})
+        if len(tiles) >= n:
+            break
+    return {"tiles": tiles}
+
+
+@app.get("/projections/{projection_id}/crosswalk")
+def projection_crosswalk(projection_id: int, a: int, b: int, db: Session = Depends(get_db)):
+    """How clustering `a`'s clusters split across clustering `b`'s, on the reference patches."""
+    pr = db.query(CohortProjection).filter_by(id=projection_id).first()
+    if not pr:
+        raise HTTPException(status_code=404, detail="Projection not found")
+    rows = []
+    for cid in (a, b):
+        cl = db.query(ProjectionClustering).filter_by(id=cid, projection_id=projection_id).first()
+        if not cl or cl.status != "completed" or not cl.labels_path:
+            raise HTTPException(status_code=404, detail=f"Clustering {cid} not found or not ready.")
+        rows.append((cl, np.fromfile(settings.local_data_path / cl.labels_path, dtype="<i2")))
+    (ca, la), (cb, lb) = rows
+    m = (la >= 0) & (lb >= 0)
+    ka, kb = int(la[m].max()) + 1, int(lb[m].max()) + 1
+    counts = np.bincount(la[m].astype(np.int64) * kb + lb[m], minlength=ka * kb).reshape(ka, kb)
+    frac = counts / np.maximum(counts.sum(axis=1, keepdims=True), 1)
+    return {
+        "a": {"id": ca.id, "label": ca.get_params().get("label") or f"k={ca.n_clusters}", "n_clusters": ka},
+        "b": {"id": cb.id, "label": cb.get_params().get("label") or f"k={cb.n_clusters}", "n_clusters": kb},
+        "counts": counts.tolist(),
+        "row_fraction": frac.round(4).tolist(),
+    }
 
 
 @app.get("/cohorts/{cohort_id}/analysis-status")

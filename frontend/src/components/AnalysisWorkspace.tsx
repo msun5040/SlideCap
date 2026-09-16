@@ -56,6 +56,7 @@ interface ProjectionRow {
   analysis_name?: string | null
   created_at?: string | null
   params?: Record<string, unknown>
+  overlay_count?: number
 }
 
 /** " · fit on N" when the embedding was fit on a subsample and the rest placed onto it (e.g. imported runs). */
@@ -613,6 +614,7 @@ export function AnalysisWorkspace() {
                       {p.slide_count} slides
                       {p.point_count ? ` · ${p.point_count.toLocaleString()} patches` : ''}
                       {fitSampleNote(p.params, p.point_count)}
+                      {p.overlay_count ? ` · ${p.overlay_count} overlay${p.overlay_count === 1 ? '' : 's'}` : ''}
                     </span>
                     {p.params?.source === 'imported' && (
                       <span className="rounded bg-violet-50 px-1.5 py-0.5 text-[10px] font-medium text-violet-700">

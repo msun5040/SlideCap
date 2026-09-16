@@ -35,18 +35,52 @@ export interface ScatterColors {
   unassigned: string
 }
 
+/** A second point set in the same map coordinates (another cohort placed on this projection). */
+export interface ScatterOverlay {
+  data: ProjectionData
+  colors?: ScatterColors | null
+  visible?: boolean
+}
+
+export type PointSet = 'base' | 'overlay'
+
 interface Props {
   data: ProjectionData
   colors?: ScatterColors | null
   /** Array index of the pinned point, or null. */
   highlightIdx?: number | null
-  onHoverPoint?: (idx: number | null) => void
-  onSelectPoint?: (idx: number) => void
+  overlay?: ScatterOverlay | null
+  /** Hide the base points (e.g. to look at an overlay alone). */
+  baseHidden?: boolean
+  /** Array index into the overlay of its pinned point, or null. */
+  overlayHighlightIdx?: number | null
+  onHoverPoint?: (idx: number | null, set?: PointSet) => void
+  onSelectPoint?: (idx: number, set: PointSet) => void
   className?: string
 }
 
+/** Pixel value for an empty colour: the point isn't drawn. */
+const SKIP = 0
+
+function hslToRgb(h: number, s: number, l: number): [number, number, number] {
+  h = ((h % 360) + 360) % 360 / 360
+  const q = l < 0.5 ? l * (1 + s) : l + s - l * s
+  const p = 2 * l - q
+  const f = (t: number) => {
+    if (t < 0) t += 1
+    if (t > 1) t -= 1
+    if (t < 1 / 6) return p + (q - p) * 6 * t
+    if (t < 1 / 2) return q
+    if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6
+    return p
+  }
+  return [Math.round(f(h + 1 / 3) * 255), Math.round(f(h) * 255), Math.round(f(h - 1 / 3) * 255)]
+}
+
 function cssToRgba(css: string): number {
-  // Tiny parser: the palette is ours, so only #rgb/#rrggbb need handling.
+  // Tiny parser for the colours our palettes produce: #rgb, #rrggbb, rgb(), hsl().
+  // An empty string means "don't draw".
+  if (!css) return SKIP
   let r = 128, g = 128, b = 128
   if (css.startsWith('#')) {
     const h = css.slice(1)
@@ -55,13 +89,21 @@ function cssToRgba(css: string): number {
     } else if (h.length >= 6) {
       r = parseInt(h.slice(0, 2), 16); g = parseInt(h.slice(2, 4), 16); b = parseInt(h.slice(4, 6), 16)
     }
+  } else {
+    const nums = css.match(/-?[\d.]+/g)?.map(Number) ?? []
+    if (css.startsWith('hsl') && nums.length >= 3) {
+      ;[r, g, b] = hslToRgb(nums[0], nums[1] / 100, nums[2] / 100)
+    } else if (css.startsWith('rgb') && nums.length >= 3) {
+      ;[r, g, b] = nums
+    }
   }
   // ImageData is little-endian ABGR when viewed as Uint32.
-  return (255 << 24) | (b << 16) | (g << 8) | r
+  return ((255 << 24) | (b << 16) | (g << 8) | r) >>> 0
 }
 
 export function CohortScatter({
-  data, colors, highlightIdx, onHoverPoint, onSelectPoint, className = '',
+  data, colors, highlightIdx, overlay, baseHidden = false, overlayHighlightIdx,
+  onHoverPoint, onSelectPoint, className = '',
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const offscreenRef = useRef<HTMLCanvasElement | null>(null)
@@ -70,21 +112,27 @@ export function CohortScatter({
   // View transform in data space: centre + scale (pixels per data unit).
   const [view, setView] = useState({ cx: 0, cy: 0, scale: 1 })
   const [size, setSize] = useState({ w: 0, h: 0 })
-  const [hovered, setHovered] = useState<number | null>(null)
+  const [hovered, setHovered] = useState<{ idx: number; set: PointSet } | null>(null)
   const dragRef = useRef<{ x: number; y: number; cx: number; cy: number } | null>(null)
   const settleRef = useRef<number | null>(null)
   const dirtyRef = useRef(true)
 
   const grid = useMemo(() => new PointGrid(data), [data])
+  const overlayData = overlay?.data ?? null
+  const overlayShown = !!overlayData && overlay?.visible !== false
+  const overlayGrid = useMemo(() => (overlayData ? new PointGrid(overlayData) : null), [overlayData])
 
   const fitView = useCallback(() => {
-    const { minX, maxX, minY, maxY } = data.bounds
+    // Fit whatever is shown: the base, the overlay, or both together.
+    const sets = [...(baseHidden && overlayShown ? [] : [data]), ...(overlayShown && overlayData ? [overlayData] : [])]
+    const minX = Math.min(...sets.map(d => d.bounds.minX)), maxX = Math.max(...sets.map(d => d.bounds.maxX))
+    const minY = Math.min(...sets.map(d => d.bounds.minY)), maxY = Math.max(...sets.map(d => d.bounds.maxY))
     const w = size.w || 1, h = size.h || 1
     const sx = (w - PADDING * 2) / (maxX - minX || 1)
     const sy = (h - PADDING * 2) / (maxY - minY || 1)
     setView({ cx: (minX + maxX) / 2, cy: (minY + maxY) / 2, scale: Math.min(sx, sy) })
     dirtyRef.current = true
-  }, [data, size.w, size.h])
+  }, [data, overlayData, overlayShown, baseHidden, size.w, size.h])
 
   // Track container size.
   useEffect(() => {
@@ -105,7 +153,7 @@ export function CohortScatter({
   useEffect(() => {
     if (size.w > 0 && size.h > 0) fitView()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [data, size.w > 0 && size.h > 0])
+  }, [data, overlayData, size.w > 0 && size.h > 0])
 
   const toScreen = useCallback((x: number, y: number) => ({
     // y is flipped so the plot reads the conventional way up.
@@ -131,41 +179,43 @@ export function CohortScatter({
     const img = ctx.createImageData(w, h)
     const buf = new Uint32Array(img.data.buffer)
 
-    const paletteRgba = colors
-      ? colors.palette.map(cssToRgba)
-      : []
-    const unassignedRgba = cssToRgba(colors?.unassigned ?? '#94a3b8')
-    const defaultRgba = cssToRgba('#3b82f6')
-
-    const { x, y } = data
-    const n = data.pointCount
     const scale = view.scale
     const halfW = w / 2, halfH = h / 2
     const cx = view.cx, cy = view.cy
 
-    for (let i = 0; i < n; i++) {
-      const sx = ((x[i] - cx) * scale + halfW) | 0
-      if (sx < 0 || sx >= w) continue
-      const sy = (halfH - (y[i] - cy) * scale) | 0
-      if (sy < 0 || sy >= h) continue
+    const drawSet = (d: ProjectionData, c: ScatterColors | null | undefined, block: number, defaultCss: string) => {
+      const paletteRgba = c ? c.palette.map(cssToRgba) : []
+      const unassignedRgba = cssToRgba(c ? c.unassigned : '#94a3b8')
+      const defaultRgba = cssToRgba(defaultCss)
+      const { x, y } = d
+      const n = d.pointCount
+      for (let i = 0; i < n; i++) {
+        const sx = ((x[i] - cx) * scale + halfW) | 0
+        if (sx < 0 || sx >= w) continue
+        const sy = (halfH - (y[i] - cy) * scale) | 0
+        if (sy < 0 || sy >= h) continue
 
-      let rgba = defaultRgba
-      if (colors) {
-        const ci = colors.index[i]
-        rgba = ci === 255 ? unassignedRgba : (paletteRgba[ci] ?? unassignedRgba)
-      }
-      // 2x2 block: a single pixel is too faint to read at these densities.
-      const o = sy * w + sx
-      buf[o] = rgba
-      if (sx + 1 < w) buf[o + 1] = rgba
-      if (sy + 1 < h) {
-        buf[o + w] = rgba
-        if (sx + 1 < w) buf[o + w + 1] = rgba
+        let rgba = defaultRgba
+        if (c) {
+          const ci = c.index[i]
+          rgba = ci === 255 ? unassignedRgba : (paletteRgba[ci] ?? unassignedRgba)
+        }
+        if (rgba === SKIP) continue
+        // A block rather than one pixel: a single pixel is too faint at these densities.
+        for (let dy = 0; dy < block && sy + dy < h; dy++) {
+          const row = (sy + dy) * w
+          for (let dx = 0; dx < block && sx + dx < w; dx++) buf[row + sx + dx] = rgba
+        }
       }
     }
+
+    if (!(baseHidden && overlayShown)) drawSet(data, colors, 2, '#3b82f6')
+    // The overlay draws on top, slightly larger, so it stays legible over a dense reference.
+    if (overlayShown && overlayData) drawSet(overlayData, overlay?.colors, 3, '#f97316')
+
     ctx.putImageData(img, 0, 0)
     dirtyRef.current = false
-  }, [data, colors, view, size])
+  }, [data, colors, overlayData, overlay?.colors, overlayShown, baseHidden, view, size])
 
   /** Composite: offscreen raster + interactive overlays (hover/selection). */
   const paint = useCallback(() => {
@@ -185,25 +235,45 @@ export function CohortScatter({
     if (dirtyRef.current) renderOffscreen()
     if (offscreenRef.current) ctx.drawImage(offscreenRef.current, 0, 0)
 
-    const ring = (idx: number, color: string, r: number) => {
-      const { sx, sy } = toScreen(data.x[idx], data.y[idx])
+    const ring = (d: ProjectionData, idx: number, color: string, r: number) => {
+      if (idx < 0 || idx >= d.pointCount) return
+      const { sx, sy } = toScreen(d.x[idx], d.y[idx])
       ctx.beginPath()
       ctx.arc(sx, sy, r, 0, Math.PI * 2)
       ctx.strokeStyle = color
       ctx.lineWidth = 2
       ctx.stroke()
     }
-    if (hovered != null && hovered >= 0) ring(hovered, '#0f172a', 5)
-    if (highlightIdx != null && highlightIdx >= 0) {
-      ring(highlightIdx, '#ffffff', 7)
-      ring(highlightIdx, '#ef4444', 5)
+    if (hovered) {
+      const d = hovered.set === 'overlay' ? overlayData : data
+      if (d) ring(d, hovered.idx, '#0f172a', 5)
     }
-  }, [size, renderOffscreen, toScreen, data, hovered, highlightIdx])
+    const pin = (d: ProjectionData | null, idx: number | null | undefined) => {
+      if (!d || idx == null || idx < 0) return
+      ring(d, idx, '#ffffff', 7)
+      ring(d, idx, '#ef4444', 5)
+    }
+    pin(data, highlightIdx)
+    pin(overlayShown ? overlayData : null, overlayHighlightIdx)
+  }, [size, renderOffscreen, toScreen, data, overlayData, overlayShown, hovered, highlightIdx, overlayHighlightIdx])
 
   // The offscreen raster is cached and only redrawn when marked dirty, so a
   // change of colouring (or of the data itself) has to invalidate it explicitly
   // — otherwise the plot keeps showing the previous colours.
-  useEffect(() => { dirtyRef.current = true }, [colors, data])
+  useEffect(() => { dirtyRef.current = true }, [colors, data, overlayData, overlay?.colors, overlayShown, baseHidden])
+
+  /** Nearest point under the cursor, overlay first (it's drawn on top). */
+  const hitTest = useCallback((dx: number, dy: number, radius: number): { idx: number; set: PointSet } | null => {
+    if (overlayShown && overlayGrid) {
+      const o = overlayGrid.nearest(dx, dy, radius)
+      if (o >= 0) return { idx: o, set: 'overlay' }
+    }
+    if (!(baseHidden && overlayShown)) {
+      const b = grid.nearest(dx, dy, radius)
+      if (b >= 0) return { idx: b, set: 'base' }
+    }
+    return null
+  }, [overlayShown, overlayGrid, baseHidden, grid])
 
   useEffect(() => { paint() }, [paint])
 
@@ -249,12 +319,10 @@ export function CohortScatter({
     }
 
     const d = toData(mx, my)
-    const radius = 6 / view.scale   // 6px in data units
-    const hit = grid.nearest(d.x, d.y, radius)
-    const next = hit >= 0 ? hit : null
-    if (next !== hovered) {
+    const next = hitTest(d.x, d.y, 6 / view.scale)   // 6px in data units
+    if (next?.idx !== hovered?.idx || next?.set !== hovered?.set) {
       setHovered(next)
-      onHoverPoint?.(next)
+      onHoverPoint?.(next ? next.idx : null, next?.set)
     }
   }
 
@@ -264,8 +332,8 @@ export function CohortScatter({
     // A drag that moved shouldn't register as a click.
     const rect = canvasRef.current!.getBoundingClientRect()
     const d = toData(e.clientX - rect.left, e.clientY - rect.top)
-    const hit = grid.nearest(d.x, d.y, 8 / view.scale)
-    if (hit >= 0) onSelectPoint?.(hit)
+    const hit = hitTest(d.x, d.y, 8 / view.scale)
+    if (hit) onSelectPoint?.(hit.idx, hit.set)
   }
 
   const zoomBy = (factor: number) => {
@@ -304,6 +372,9 @@ export function CohortScatter({
         {data.pointCount.toLocaleString()} patches · {data.header.slides.length} slides ·{' '}
         {({ umap: 'UMAP', tsne: 't-SNE', pca: 'PCA' } as Record<string, string>)[data.header.method]
           ?? data.header.method.toUpperCase()}
+        {overlayShown && overlayData && (
+          <> · overlay {overlayData.pointCount.toLocaleString()} patches · {overlayData.header.slides.length} slides</>
+        )}
       </div>
     </div>
   )

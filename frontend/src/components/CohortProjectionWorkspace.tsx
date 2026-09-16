@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Eye, EyeOff, Layers, List, Loader2, Play, Trash2, X } from 'lucide-react'
+import { BarChart3, Eye, EyeOff, Layers, List, Loader2, Play, SquareStack, Trash2, X } from 'lucide-react'
 import { getApiBase } from '@/api'
 import { SlideViewerOSD } from '@/components/SlideViewerOSD'
-import { CohortScatter, type ScatterColors } from '@/components/CohortScatter'
+import { CohortScatter, type PointSet, type ScatterColors } from '@/components/CohortScatter'
 import type { PatchMask } from '@/components/PatchClusterOverlay'
+import { CompositionPanel } from '@/components/CompositionPanel'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { parseProjection, pointAtSlideXY, pointPatch, type ProjectionData } from '@/lib/projection'
+import { usePatchImage } from '@/lib/patchImages'
 
 /**
  * Full-window workspace: the cohort projection on one side, the slide the
@@ -20,6 +22,11 @@ import { parseProjection, pointAtSlideXY, pointPatch, type ProjectionData } from
  * Clusterings are run from the control strip over the projection's reduced
  * matrix (server-side), and come back as a label per point. They colour the plot
  * like any other colour-by, and can be painted onto the slide as a patch mask.
+ *
+ * Overlays place another cohort onto this projection without refitting it
+ * (server: services/projection_overlay.py): its patches are drawn on top of the
+ * map, assigned to the same k-means clusters, and can be compared group vs group
+ * in the Composition panel.
  */
 
 interface GroupScheme {
@@ -31,6 +38,7 @@ interface GroupScheme {
 interface ProjectionInfo {
   id: number
   has_reduced?: boolean
+  has_pca?: boolean
   point_count?: number | null
 }
 
@@ -50,6 +58,31 @@ interface ClusteringRow {
 }
 
 type Algorithm = 'kmeans' | 'hdbscan' | 'leiden' | 'agglomerative'
+
+interface OverlayRow {
+  id: number
+  cohort_id: number
+  cohort_name?: string | null
+  include_held_out: boolean
+  slide_count: number
+  point_count?: number | null
+  status: string
+  progress_pct: number
+  progress_stage?: string | null
+  error_message?: string | null
+  excluded: { slide_hash: string; reason: string }[]
+  warnings: string[]
+  report: {
+    pca?: { relative_error?: number; fit_rows?: number; validate_rows?: number }
+    clusterings?: Record<string, { agreement: number; n_clusters: number; far_share: number }>
+  }
+}
+
+/** Legend rows in cluster mode also carry reference / overlay shares when an overlay is shown. */
+type LegendPct = { refPct?: number; overlayPct?: number }
+
+type OverlayColorBy = 'cluster' | 'slide' | 'single' | `scheme:${number}`
+type RefShow = 'color' | 'grey' | 'hidden'
 
 interface Props {
   projectionId: number
@@ -139,7 +172,26 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
   const [clusterFailure, setClusterFailure] = useState('')
   const autoSelectRef = useRef<number | null>(null)
 
+  // ── Overlay (another cohort placed on this projection) ───────────────
+  const [overlays, setOverlays] = useState<OverlayRow[]>([])
+  const [activeOverlayId, setActiveOverlayId] = useState<number | null>(null)
+  const [overlayData, setOverlayData] = useState<ProjectionData | null>(null)
+  const [overlayError, setOverlayError] = useState('')
+  const [overlaySchemes, setOverlaySchemes] = useState<GroupScheme[]>([])
+  const [overlayLabels, setOverlayLabels] = useState<Map<number, { labels: Int16Array; far: Uint8Array }>>(new Map())
+  const [overlayColorBy, setOverlayColorBy] = useState<OverlayColorBy>('cluster')
+  const [refShow, setRefShow] = useState<RefShow>('grey')
+  const [hideFar, setHideFar] = useState(false)
+  const [overlayOpen, setOverlayOpen] = useState(false)
+  const [allCohorts, setAllCohorts] = useState<{ id: number; name: string }[]>([])
+  const [newOverlayCohort, setNewOverlayCohort] = useState('')
+  const [newOverlayHeldOut, setNewOverlayHeldOut] = useState(false)
+  const [overlayStarting, setOverlayStarting] = useState(false)
+  const [overlayRunError, setOverlayRunError] = useState('')
+  const [compositionOpen, setCompositionOpen] = useState(false)
+
   const [selectedIdx, setSelectedIdx] = useState<number | null>(null)
+  const [selectedSet, setSelectedSet] = useState<PointSet>('base')
   const [patchOpen, setPatchOpen] = useState(false)
   const [patchOrigin, setPatchOrigin] = useState<DOMRect | null>(null)
   const viewerWrapRef = useRef<HTMLDivElement | null>(null)
@@ -291,6 +343,126 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
     refreshClusterings()
   }
 
+  // ── Overlays: list, poll, load the active one ────────────────────────
+  const refreshOverlays = useCallback(async () => {
+    try {
+      const rows: OverlayRow[] | null = await fetch(`${getApiBase()}/projections/${projectionId}/overlays`)
+        .then(r => (r.ok ? r.json() : null))
+      if (rows) setOverlays(rows)
+      return rows
+    } catch {
+      return null
+    }
+  }, [projectionId])
+
+  useEffect(() => { refreshOverlays() }, [refreshOverlays])
+
+  const overlayBusy = overlays.some(o => o.status === 'pending' || o.status === 'running')
+  const pendingOverlayRef = useRef<number | null>(null)
+  useEffect(() => {
+    if (!overlayBusy) return
+    const t = setInterval(async () => {
+      const rows = await refreshOverlays()
+      const want = pendingOverlayRef.current
+      const done = want != null ? rows?.find(o => o.id === want) : null
+      if (done && done.status === 'completed') {
+        pendingOverlayRef.current = null
+        setActiveOverlayId(done.id)
+        refreshClusterings()  // projection info: PCA now recovered
+      } else if (done && done.status === 'failed') {
+        pendingOverlayRef.current = null
+      }
+    }, 2000)
+    return () => clearInterval(t)
+  }, [overlayBusy, refreshOverlays])
+
+  useEffect(() => {
+    if (!overlayOpen || allCohorts.length) return
+    fetch(`${getApiBase()}/cohorts`).then(r => (r.ok ? r.json() : [])).then(setAllCohorts).catch(() => {})
+  }, [overlayOpen, allCohorts.length])
+
+  const activeOverlay = overlays.find(o => o.id === activeOverlayId) ?? null
+
+  useEffect(() => {
+    setOverlayData(null); setOverlayLabels(new Map()); setOverlaySchemes([]); setOverlayError('')
+    if (selectedSet === 'overlay') { setSelectedIdx(null); setSelectedSet('base'); setPatchOpen(false) }
+    if (activeOverlayId == null) return
+    let cancelled = false
+    fetch(`${getApiBase()}/overlays/${activeOverlayId}/points`)
+      .then(async res => {
+        if (!res.ok) {
+          const d = await res.json().catch(() => null)
+          throw new Error(d?.detail || `Could not load overlay (${res.status})`)
+        }
+        return res.arrayBuffer()
+      })
+      .then(buf => { if (!cancelled) setOverlayData(parseProjection(buf)) })
+      .catch(e => { if (!cancelled) setOverlayError(e.message || 'Could not load overlay') })
+    const ov = overlays.find(o => o.id === activeOverlayId)
+    if (ov) {
+      fetch(`${getApiBase()}/cohorts/${ov.cohort_id}/group-schemes`)
+        .then(r => (r.ok ? r.json() : [])).then(rows => { if (!cancelled) setOverlaySchemes(rows) }).catch(() => {})
+    }
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeOverlayId])
+
+  const startOverlay = async () => {
+    if (!newOverlayCohort) return
+    setOverlayStarting(true); setOverlayRunError('')
+    try {
+      const res = await fetch(`${getApiBase()}/projections/${projectionId}/overlays`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cohort_id: Number(newOverlayCohort), include_held_out: newOverlayHeldOut }),
+      })
+      const d = await res.json().catch(() => null)
+      if (!res.ok) throw new Error(d?.detail || `Could not start overlay (${res.status})`)
+      pendingOverlayRef.current = d.id
+      await refreshOverlays()
+    } catch (e: any) {
+      setOverlayRunError(e.message || 'Could not start overlay')
+    } finally {
+      setOverlayStarting(false)
+    }
+  }
+
+  const deleteOverlay = async (id: number) => {
+    const res = await fetch(`${getApiBase()}/overlays/${id}`, { method: 'DELETE' })
+    if (!res.ok) return
+    if (activeOverlayId === id) setActiveOverlayId(null)
+    refreshOverlays()
+  }
+
+  // Overlay assignments exist only for k-means clusterings (they need centroids).
+  const overlayClusterable = activeClustering?.algorithm === 'kmeans'
+
+  useEffect(() => {
+    if (!overlayData || activeOverlayId == null || activeClusterId == null || !overlayClusterable) return
+    if (overlayLabels.has(activeClusterId)) return
+    let cancelled = false
+    const get = (kind: 'labels' | 'far') =>
+      fetch(`${getApiBase()}/overlays/${activeOverlayId}/${kind}?clustering_id=${activeClusterId}`).then(async res => {
+        if (!res.ok) {
+          const d = await res.json().catch(() => null)
+          throw new Error(d?.detail || `Could not load overlay ${kind} (${res.status})`)
+        }
+        return res.arrayBuffer()
+      })
+    Promise.all([get('labels'), get('far')])
+      .then(([lb, fb]) => {
+        if (cancelled) return
+        const labels = new Int16Array(lb), far = new Uint8Array(fb)
+        if (labels.length !== overlayData.pointCount || far.length !== overlayData.pointCount) {
+          throw new Error('Overlay cluster labels don\'t line up with the overlay\'s points.')
+        }
+        setOverlayLabels(prev => new Map(prev).set(activeClusterId, { labels, far }))
+        refreshOverlays()  // picks up agreement / far share in the report
+      })
+      .catch(e => { if (!cancelled) setOverlayError(e.message) })
+    return () => { cancelled = true }
+  }, [overlayData, activeOverlayId, activeClusterId, overlayClusterable, overlayLabels, refreshOverlays])
+
   // ── Colouring ────────────────────────────────────────────────────────
   const baseColors: ScatterColors | null = useMemo(() => {
     if (!data) return null
@@ -350,6 +522,50 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
     }
   }, [baseColors, focusIdx])
 
+  // With an overlay shown, the reference can step back to grey so the overlay reads.
+  const refColors: ScatterColors | null = useMemo(() => {
+    if (!overlayData || refShow !== 'grey' || !data) return colors
+    return { index: colors?.index ?? new Uint8Array(data.pointCount), palette: ['#3f3f46'], unassigned: '#3f3f46' }
+  }, [overlayData, refShow, colors, data])
+
+  /** Overlay points' cluster colours (also used for its slide mask). */
+  const overlayClusterColors: ScatterColors | null = useMemo(() => {
+    if (!overlayData || activeClusterId == null || !baseColors || colorMode.kind !== 'cluster') return null
+    const a = overlayLabels.get(activeClusterId)
+    if (!a) return null
+    const index = new Uint8Array(overlayData.pointCount)
+    for (let i = 0; i < overlayData.pointCount; i++) {
+      index[i] = hideFar && a.far[i] ? 255 : (a.labels[i] < 0 ? 255 : a.labels[i])
+    }
+    return { index, palette: baseColors.palette, unassigned: hideFar ? '' : NOISE_COLOR }
+  }, [overlayData, activeClusterId, baseColors, colorMode, overlayLabels, hideFar])
+
+  const overlayColors: ScatterColors | null = useMemo(() => {
+    if (!overlayData) return null
+    const withFocus = (c: ScatterColors) => focusIdx == null || overlayColorBy !== 'cluster' ? c : {
+      index: c.index,
+      palette: c.palette.map((col, i) => (i === focusIdx ? col : DIMMED)),
+      unassigned: c.unassigned && focusIdx !== 255 ? DIMMED : c.unassigned,
+    }
+    if (overlayColorBy === 'cluster') return overlayClusterColors ? withFocus(overlayClusterColors) : null
+    if (overlayColorBy === 'slide') {
+      const index = new Uint8Array(overlayData.pointCount)
+      for (let i = 0; i < overlayData.pointCount; i++) index[i] = overlayData.slideIdx[i] % 255
+      return { index, palette: overlayData.header.slides.map((_, i) => FALLBACK_COLORS[i % FALLBACK_COLORS.length]), unassigned: '#94a3b8' }
+    }
+    if (overlayColorBy.startsWith('scheme:')) {
+      const scheme = overlaySchemes.find(s => s.id === Number(overlayColorBy.slice(7)))
+      if (!scheme) return null
+      const groupOfSlide = new Map<string, number>()
+      scheme.groups.forEach((g, gi) => g.slide_hashes.forEach(h => groupOfSlide.set(h, gi)))
+      const perSlide = overlayData.header.slides.map(s => groupOfSlide.get(s.slide_hash) ?? 255)
+      const index = new Uint8Array(overlayData.pointCount)
+      for (let i = 0; i < overlayData.pointCount; i++) index[i] = perSlide[overlayData.slideIdx[i]]
+      return { index, palette: scheme.groups.map((g, i) => g.color || FALLBACK_COLORS[i % FALLBACK_COLORS.length]), unassigned: '#71717a' }
+    }
+    return null
+  }, [overlayData, overlayColorBy, overlayClusterColors, overlaySchemes, focusIdx])
+
   const legend = useMemo(() => {
     if (!data) return null
     if (colorMode.kind === 'scheme') {
@@ -385,79 +601,62 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
       const counts = new Array(256).fill(0)
       const idx = baseColors.index
       for (let i = 0; i < idx.length; i++) counts[idx[i]]++
-      const entries = baseColors.palette.map((color, i) => ({
-        idx: i, label: `Cluster ${i + 1}`, color, count: counts[i],
-      }))
+      const oc = new Array(256).fill(0)
+      let oTotal = 0
+      if (overlayClusterColors) {
+        const oi = overlayClusterColors.index
+        for (let i = 0; i < oi.length; i++) oc[oi[i]]++
+        oTotal = oi.length
+      }
+      const refTotal = idx.length || 1
+      const entries: { idx: number; label: string; color: string; count: number; refPct?: number; overlayPct?: number }[] =
+        baseColors.palette.map((color, i) => ({
+          idx: i, label: `Cluster ${i + 1}`, color, count: counts[i],
+          refPct: overlayClusterColors ? (100 * counts[i]) / refTotal : undefined,
+          overlayPct: overlayClusterColors ? (100 * oc[i]) / (oTotal || 1) : undefined,
+        }))
       if (counts[255] > 0) entries.push({ idx: 255, label: 'Noise', color: NOISE_COLOR, count: counts[255] })
       return entries
     }
     return null
-  }, [data, colorMode, schemes, baseColors])
+  }, [data, colorMode, schemes, baseColors, overlayClusterColors])
+
+  /** Overlay groups legend when the overlay is coloured by one of its schemes. */
+  const overlayLegend = useMemo(() => {
+    if (!overlayData || !overlayColorBy.startsWith('scheme:')) return null
+    const scheme = overlaySchemes.find(s => s.id === Number(overlayColorBy.slice(7)))
+    if (!scheme) return null
+    const groupOfSlide = new Map<string, number>()
+    scheme.groups.forEach((g, gi) => g.slide_hashes.forEach(h => groupOfSlide.set(h, gi)))
+    const counts = new Map<number, number>()
+    let none = 0
+    for (const s of overlayData.header.slides) {
+      const gi = groupOfSlide.get(s.slide_hash)
+      if (gi === undefined) none += s.n_patches
+      else counts.set(gi, (counts.get(gi) || 0) + s.n_patches)
+    }
+    const rows = scheme.groups.map((g, gi) => ({ label: g.name, color: g.color || FALLBACK_COLORS[gi % FALLBACK_COLORS.length], count: counts.get(gi) || 0 }))
+    if (none) rows.push({ label: 'Not in a group', color: '#71717a', count: none })
+    return { name: scheme.name, rows }
+  }, [overlayData, overlayColorBy, overlaySchemes])
 
   // ── Selection ────────────────────────────────────────────────────────
+  const selectedData = selectedSet === 'overlay' ? overlayData : data
   const selected = useMemo(() => {
-    if (!data || selectedIdx == null || selectedIdx < 0) return null
-    return pointPatch(data, selectedIdx)
-  }, [data, selectedIdx])
+    if (!selectedData || selectedIdx == null || selectedIdx < 0 || selectedIdx >= selectedData.pointCount) return null
+    return pointPatch(selectedData, selectedIdx)
+  }, [selectedData, selectedIdx])
 
-  // The patch endpoint requires auth, and an <img src> can't carry a bearer
-  // token — it bypasses the fetch interceptor entirely (OSD gets around this
-  // with loadTilesWithAjax/ajaxHeaders). So fetch it properly and hand the <img>
-  // an object URL. A small LRU keeps re-selecting a patch instant; entries are
-  // revoked only on eviction, never while an <img> might still be reading one.
-  const patchCache = useRef<Map<string, string>>(new Map())
-  const [patchUrl, setPatchUrl] = useState<string | null>(null)
-  const [patchError, setPatchError] = useState('')
+  // Auth-carrying blob fetch with a shared LRU (lib/patchImages.ts).
+  const { url: patchUrl, error: patchError } = usePatchImage(
+    selected?.slide
+      ? { slide_hash: selected.slide.slide_hash, x: selected.slide_x, y: selected.slide_y, size: selected.size }
+      : null,
+  )
 
-  const patchKey = useMemo(() => {
-    if (!selected?.slide) return null
-    const { slide, slide_x, slide_y, size } = selected
-    return `${slide.slide_hash}/${slide_x}/${slide_y}/${size}`
-  }, [selected])
-
-  useEffect(() => {
-    if (!patchKey || !selected?.slide) { setPatchUrl(null); return }
-    const cached = patchCache.current.get(patchKey)
-    if (cached) { setPatchUrl(cached); setPatchError(''); return }
-
-    let cancelled = false
-    const { slide, slide_x, slide_y, size } = selected
-    const url = `${getApiBase()}/slides/${slide.slide_hash}/region.jpeg`
-      + `?x=${slide_x}&y=${slide_y}&size=${size}&out=512`
-    setPatchError('')
-    fetch(url)
-      .then(async res => {
-        if (!res.ok) {
-          const d = await res.json().catch(() => null)
-          throw new Error(d?.detail || `Could not load patch image (${res.status})`)
-        }
-        return res.blob()
-      })
-      .then(blob => {
-        if (cancelled) return
-        const obj = URL.createObjectURL(blob)
-        const cache = patchCache.current
-        cache.set(patchKey, obj)
-        while (cache.size > 32) {
-          const oldest = cache.keys().next().value as string
-          const dead = cache.get(oldest)
-          cache.delete(oldest)
-          if (dead) URL.revokeObjectURL(dead)
-        }
-        setPatchUrl(obj)
-      })
-      .catch(e => { if (!cancelled) { setPatchError(e.message); setPatchUrl(null) } })
-    return () => { cancelled = true }
-  }, [patchKey, selected])
-
-  // Release every cached blob when the workspace closes.
-  useEffect(() => () => {
-    patchCache.current.forEach(u => URL.revokeObjectURL(u))
-    patchCache.current.clear()
-  }, [])
-
-  const selectPoint = useCallback((idx: number) => {
+  const selectPoint = useCallback((idx: number, set: PointSet = 'base') => {
     setSelectedIdx(idx)
+    setSelectedSet(set)
     // Capture the highlight box's on-screen rect so the patch can visibly grow
     // out of its place on the slide rather than just appearing.
     const box = viewerWrapRef.current?.querySelector('[data-patch-box="1"]') as HTMLElement | null
@@ -466,12 +665,12 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
   }, [])
 
   const onSlideClick = useCallback((x: number, y: number) => {
-    if (!data || !selected) return
-    const slideIndex = data.header.slides.findIndex(s => s.slide_hash === selected.slide.slide_hash)
+    if (!selectedData || !selected) return
+    const slideIndex = selectedData.header.slides.findIndex(s => s.slide_hash === selected.slide.slide_hash)
     if (slideIndex < 0) return
-    const idx = pointAtSlideXY(data, slideIndex, x, y)
-    if (idx >= 0) selectPoint(idx)
-  }, [data, selected, selectPoint])
+    const idx = pointAtSlideXY(selectedData, slideIndex, x, y)
+    if (idx >= 0) selectPoint(idx, selectedSet)
+  }, [selectedData, selected, selectPoint, selectedSet])
 
   // Escape is shared with SlideViewerOSD, which registers its own window-level
   // handler calling whatever onClose it was given (SlideViewerOSD.tsx:270). Both
@@ -483,8 +682,10 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
   // press consumed (onEscapeKeyDown below). A ref mirroring `runOpen` would not
   // work: React commits the close before this window listener runs.
   const patchOpenRef = useRef(false)
+  const compositionOpenRef = useRef(false)
   const escConsumedAt = useRef(0)
   useEffect(() => { patchOpenRef.current = patchOpen }, [patchOpen])
+  useEffect(() => { compositionOpenRef.current = compositionOpen }, [compositionOpen])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -494,6 +695,10 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
         patchOpenRef.current = false
         escConsumedAt.current = Date.now()
         setPatchOpen(false)
+      } else if (compositionOpenRef.current) {
+        compositionOpenRef.current = false
+        escConsumedAt.current = Date.now()
+        setCompositionOpen(false)
       } else {
         onClose()
       }
@@ -503,8 +708,11 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
   }, [onClose])
 
   /** The embedded viewer's close: its X button should close the workspace, but
-   *  not an Escape we already used to collapse the patch. */
+   *  not an Escape meant for the expanded patch or the Composition panel. The
+   *  viewer's own Escape listener can run before ours, so check what's open
+   *  directly as well as whether we just consumed the press. */
   const viewerClose = useCallback(() => {
+    if (patchOpenRef.current || compositionOpenRef.current) return
     if (Date.now() - escConsumedAt.current > 100) onClose()
   }, [onClose])
 
@@ -512,14 +720,18 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
   const activeSlide = selected?.slide ?? data?.header.slides[0] ?? null
 
   // ── Cluster mask for the slide in the viewer ─────────────────────────
+  const maskSource = selected && selectedSet === 'overlay'
+    ? { d: overlayData, c: overlayClusterColors }
+    : { d: data, c: baseColors }
   const patchMask: PatchMask | null = useMemo(() => {
-    if (!data || !baseColors || colorMode.kind !== 'cluster' || !maskOn || !activeSlide) return null
+    const { d, c } = maskSource
+    if (!d || !c || !baseColors || colorMode.kind !== 'cluster' || !maskOn || !activeSlide) return null
     const { start, n_patches: n, patch_size } = activeSlide
     return {
-      patchX: data.patchX.subarray(start, start + n),
-      patchY: data.patchY.subarray(start, start + n),
+      patchX: d.patchX.subarray(start, start + n),
+      patchY: d.patchY.subarray(start, start + n),
       size: patch_size || 256,
-      index: baseColors.index.subarray(start, start + n),
+      index: c.index.subarray(start, start + n),
       // Focus shows only the focused cluster on tissue; noise is never painted
       // unless it's the focus, so unclustered tissue stays readable.
       palette: focusIdx == null
@@ -528,10 +740,22 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
       unassigned: focusIdx === 255 ? NOISE_COLOR : null,
       opacity: maskOpacity,
     }
-  }, [data, baseColors, colorMode, maskOn, activeSlide, focusIdx, maskOpacity])
+  }, [maskSource.d, maskSource.c, baseColors, colorMode, maskOn, activeSlide, focusIdx, maskOpacity])
 
   const running = clusterings.filter(c => c.status === 'pending' || c.status === 'running')
   const completed = clusterings.filter(c => c.status === 'completed')
+  const completedKmeans = completed.filter(c => c.algorithm === 'kmeans')
+  const selectedLabelInfo = (() => {
+    if (colorMode.kind !== 'cluster' || selectedIdx == null) return null
+    if (selectedSet === 'overlay') {
+      const a = activeClusterId != null ? overlayLabels.get(activeClusterId) : null
+      if (!a || selectedIdx >= a.labels.length) return null
+      return { cluster: a.labels[selectedIdx], far: !!a.far[selectedIdx] }
+    }
+    if (!baseColors) return null
+    const ci = baseColors.index[selectedIdx]
+    return { cluster: ci === 255 ? -1 : ci, far: false }
+  })()
   const algNote = ALGORITHMS.find(a => a.value === algorithm)?.note
 
   return (
@@ -711,6 +935,137 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
           </span>
         ))}
 
+        <span className="mx-1 h-4 w-px bg-neutral-800" />
+        <Popover open={overlayOpen} onOpenChange={setOverlayOpen}>
+          <PopoverTrigger asChild>
+            <button className={`inline-flex items-center gap-1.5 rounded border px-2 py-1 hover:bg-neutral-800 ${activeOverlay ? 'border-orange-500/70 text-orange-200' : 'border-neutral-700'}`}>
+              <SquareStack className="h-3.5 w-3.5" />
+              {activeOverlay ? `Overlay: ${activeOverlay.cohort_name ?? `cohort ${activeOverlay.cohort_id}`}` : 'Overlay…'}
+            </button>
+          </PopoverTrigger>
+          <PopoverContent
+            align="start"
+            onEscapeKeyDown={() => { escConsumedAt.current = Date.now() }}
+            className="!z-[130] w-[380px] border-neutral-700 bg-neutral-900 p-3 text-[12px] text-neutral-100"
+          >
+            <div className="mb-1 text-[13px] font-medium">Overlay another cohort</div>
+            <p className="mb-2 text-[11px] leading-snug text-neutral-400">
+              Places the cohort's patches onto this map without refitting it: same PCA, assigned to this projection's
+              k-means clusters by nearest centre. Slides already in this projection are left out.
+            </p>
+            <div className="space-y-2">
+              <select className={inputCls} value={newOverlayCohort} onChange={e => setNewOverlayCohort(e.target.value)}>
+                <option value="">Choose a cohort…</option>
+                {allCohorts.filter(c => c.id !== cohortId).map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+              </select>
+              <label className="flex items-center gap-1.5 text-[11px] text-neutral-300">
+                <input type="checkbox" checked={newOverlayHeldOut} onChange={e => setNewOverlayHeldOut(e.target.checked)} />
+                Include cases held out of analysis
+              </label>
+              {info && info.has_pca === false && (
+                <p className="text-[11px] leading-snug text-amber-400">
+                  The first overlay on this projection also recovers its PCA from the reference slides' UNI files
+                  (a few minutes on a large cohort).
+                </p>
+              )}
+              {overlayRunError && <p className="text-[11px] text-red-400">{overlayRunError}</p>}
+              <button onClick={startOverlay} disabled={!newOverlayCohort || overlayStarting}
+                      className="inline-flex w-full items-center justify-center gap-1.5 rounded bg-neutral-100 px-2 py-1.5 font-medium text-neutral-900 hover:bg-white disabled:opacity-50">
+                {overlayStarting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
+                Overlay
+              </button>
+            </div>
+
+            {overlays.length > 0 && (
+              <div className="mt-3 border-t border-neutral-800 pt-2">
+                <div className="mb-1 text-[11px] text-neutral-400">Overlays on this projection</div>
+                <div className="max-h-72 space-y-1.5 overflow-auto">
+                  {overlays.map(o => {
+                    const isActive = o.id === activeOverlayId
+                    const agree = activeClusterId != null ? o.report?.clusterings?.[String(activeClusterId)] : undefined
+                    const reasons = o.excluded.reduce<Record<string, number>>((m, e) => { m[e.reason] = (m[e.reason] || 0) + 1; return m }, {})
+                    return (
+                      <div key={o.id} className={`rounded border px-2 py-1.5 ${isActive ? 'border-orange-500/60 bg-orange-500/5' : 'border-neutral-800'}`}>
+                        <div className="flex items-center gap-2">
+                          <button className="min-w-0 flex-1 truncate text-left font-medium disabled:cursor-default"
+                                  disabled={o.status !== 'completed'}
+                                  onClick={() => { setActiveOverlayId(isActive ? null : o.id); setOverlayOpen(false) }}>
+                            {o.cohort_name ?? `Cohort ${o.cohort_id}`}
+                          </button>
+                          {o.status === 'completed' && (
+                            <span className="text-[10px] text-neutral-400">{isActive ? 'showing · click to hide' : 'click to show'}</span>
+                          )}
+                          {o.status !== 'pending' && o.status !== 'running' && (
+                            <button onClick={() => deleteOverlay(o.id)} title="Delete this overlay"
+                                    className="rounded p-0.5 text-neutral-500 hover:bg-neutral-800 hover:text-red-400">
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          )}
+                        </div>
+                        <div className="text-[10px] leading-snug text-neutral-500">
+                          {(o.status === 'pending' || o.status === 'running') && `${o.progress_pct}% · ${o.progress_stage || o.status}`}
+                          {o.status === 'failed' && <span className="text-red-400">{o.error_message || 'failed'}</span>}
+                          {o.status === 'completed' && (
+                            <>
+                              {o.slide_count} slides · {(o.point_count ?? 0).toLocaleString()} patches
+                              {o.report?.pca?.relative_error != null && ` · PCA recovery error ${o.report.pca.relative_error.toExponential(1)}`}
+                              {agree && ` · agreement ${(agree.agreement * 100).toFixed(1)}% · far ${(agree.far_share * 100).toFixed(1)}%`}
+                            </>
+                          )}
+                        </div>
+                        {Object.keys(reasons).length > 0 && (
+                          <div className="text-[10px] text-neutral-500">
+                            Left out: {Object.entries(reasons).map(([r, n]) => `${n} ${r}`).join(' · ')}
+                          </div>
+                        )}
+                        {o.warnings.map(w => <div key={w} className="text-[10px] text-amber-400">⚠ {w}</div>)}
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
+          </PopoverContent>
+        </Popover>
+
+        {overlays.filter(o => o.status === 'pending' || o.status === 'running').map(o => (
+          <span key={o.id} className="inline-flex items-center gap-1 rounded border border-neutral-700 px-1.5 py-0.5 text-[11px] text-neutral-300"
+                title={o.progress_stage || undefined}>
+            <Loader2 className="h-3 w-3 animate-spin" /> overlay {o.progress_pct}%
+          </span>
+        ))}
+
+        {activeOverlay && (
+          <>
+            <select className="rounded border border-neutral-700 bg-neutral-900 px-1.5 py-1 text-[12px]"
+                    value={refShow} onChange={e => setRefShow(e.target.value as RefShow)} title="How the reference points are drawn">
+              <option value="grey">Reference: grey</option>
+              <option value="color">Reference: coloured</option>
+              <option value="hidden">Reference: hidden</option>
+            </select>
+            <select className="rounded border border-neutral-700 bg-neutral-900 px-1.5 py-1 text-[12px]"
+                    value={overlayColorBy} onChange={e => setOverlayColorBy(e.target.value as OverlayColorBy)} title="How the overlay points are coloured">
+              <option value="cluster">Overlay: by cluster</option>
+              {overlaySchemes.map(s => <option key={s.id} value={`scheme:${s.id}`}>Overlay: {s.name}</option>)}
+              <option value="slide">Overlay: by slide</option>
+              <option value="single">Overlay: one colour</option>
+            </select>
+            <label className="inline-flex items-center gap-1 text-[11px] text-neutral-300"
+                   title="Hide overlay patches farther from their cluster centre than 99% of the reference's own patches">
+              <input type="checkbox" checked={hideFar} onChange={e => setHideFar(e.target.checked)} /> hide far
+            </label>
+            <button onClick={() => setCompositionOpen(true)} disabled={completedKmeans.length === 0}
+                    className="inline-flex items-center gap-1.5 rounded border border-neutral-700 px-2 py-1 hover:bg-neutral-800 disabled:opacity-40"
+                    title={completedKmeans.length ? 'Compare cluster composition between two groups of the overlay cohort' : 'Needs a k-means clustering on this projection'}>
+              <BarChart3 className="h-3.5 w-3.5" /> Composition
+            </button>
+          </>
+        )}
+        {activeOverlay && colorMode.kind === 'cluster' && overlayColorBy === 'cluster' && !overlayClusterable && (
+          <span className="text-[11px] text-amber-400">overlay needs a k-means clustering</span>
+        )}
+        {overlayError && <span className="text-[11px] text-red-400">{overlayError}</span>}
+
         {activeClustering && (
           <span className="text-[11px] text-neutral-400">
             {activeClustering.silhouette != null && `silhouette ${activeClustering.silhouette.toFixed(2)}`}
@@ -779,10 +1134,25 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
             <>
               <CohortScatter
                 data={data}
-                colors={colors}
-                highlightIdx={selectedIdx}
+                colors={refColors}
+                highlightIdx={selectedSet === 'base' ? selectedIdx : null}
+                overlay={overlayData ? { data: overlayData, colors: overlayColors } : null}
+                baseHidden={!!overlayData && refShow === 'hidden'}
+                overlayHighlightIdx={selectedSet === 'overlay' ? selectedIdx : null}
                 onSelectPoint={selectPoint}
               />
+              {overlayLegend && showLegend && (
+                <div className="absolute right-14 top-3 max-h-[45%] min-w-[150px] overflow-auto rounded border border-orange-500/40 bg-neutral-900/90 p-2 text-[11px]">
+                  <div className="mb-1 text-[10px] uppercase tracking-wide text-orange-300">Overlay · {overlayLegend.name}</div>
+                  {overlayLegend.rows.map(r => (
+                    <div key={r.label} className="flex items-center gap-2 px-1 py-0.5">
+                      <span className="h-2.5 w-2.5 shrink-0 rounded-[2px]" style={{ backgroundColor: r.color }} />
+                      <span className="truncate">{r.label}</span>
+                      <span className="ml-auto pl-3 tabular-nums text-neutral-400">{r.count.toLocaleString()}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
               {colorMode.kind === 'cluster' && !baseColors && !labelsError && (
                 <div className="absolute left-3 top-3 flex items-center gap-2 rounded border border-neutral-700 bg-neutral-900/90 px-2 py-1 text-[11px] text-neutral-400">
                   <Loader2 className="h-3 w-3 animate-spin" /> Loading cluster labels…
@@ -802,12 +1172,21 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
                         <span className="h-2.5 w-2.5 shrink-0 rounded-[2px]"
                               style={{ backgroundColor: e.color }} />
                         <span className="truncate">{e.label}</span>
-                        <span className="ml-auto pl-3 tabular-nums text-neutral-400">
-                          {e.count.toLocaleString()}
-                        </span>
+                        {(e as LegendPct).overlayPct != null ? (
+                          <span className="ml-auto pl-3 tabular-nums text-neutral-400" title="Share of reference / overlay patches">
+                            {(e as LegendPct).refPct!.toFixed(1)}% <span className="text-orange-300">{(e as LegendPct).overlayPct!.toFixed(1)}%</span>
+                          </span>
+                        ) : (
+                          <span className="ml-auto pl-3 tabular-nums text-neutral-400">
+                            {e.count.toLocaleString()}
+                          </span>
+                        )}
                       </button>
                     )
                   })}
+                  {legend.some(e => (e as LegendPct).overlayPct != null) && (
+                    <div className="mt-1 text-[10px] text-neutral-500">reference % · <span className="text-orange-300">overlay %</span></div>
+                  )}
                   {focusIdx != null && (
                     <button onClick={() => setFocusIdx(null)}
                             className="mt-1 w-full rounded border border-neutral-700 px-1 py-0.5 text-neutral-300 hover:bg-neutral-800">
@@ -879,8 +1258,10 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
                   <div className="text-neutral-400">
                     patch at ({selected.slide_x.toLocaleString()}, {selected.slide_y.toLocaleString()})
                     · {selected.size}px
-                    {colorMode.kind === 'cluster' && selectedIdx != null && baseColors && (
-                      <> · {baseColors.index[selectedIdx] === 255 ? 'noise' : `cluster ${baseColors.index[selectedIdx] + 1}`}</>
+                    {selectedSet === 'overlay' && <> · <span className="text-orange-300">overlay</span></>}
+                    {selectedLabelInfo && (
+                      <> · {selectedLabelInfo.cluster < 0 ? 'noise' : `cluster ${selectedLabelInfo.cluster + 1}`}
+                        {selectedLabelInfo.far && <span className="text-amber-400"> (far from its centre)</span>}</>
                     )}
                     {' '}· click outside or press Esc to collapse
                   </div>
@@ -890,6 +1271,21 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
           )}
         </div>
       </div>
+
+      {compositionOpen && activeOverlay && (
+        <CompositionPanel
+          overlayId={activeOverlay.id}
+          overlayCohortId={activeOverlay.cohort_id}
+          projectionId={projectionId}
+          clusterings={completedKmeans.map(c => ({
+            id: c.id,
+            label: typeof c.params?.label === 'string' ? c.params.label : `k-means k=${c.n_clusters ?? '?'} (#${c.id})`,
+            n_clusters: c.n_clusters ?? 0,
+          }))}
+          clusterColor={clusterColor}
+          onClose={() => setCompositionOpen(false)}
+        />
+      )}
 
       <style>{`
         @keyframes sc-patch-grow {
