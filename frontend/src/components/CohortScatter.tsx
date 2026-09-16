@@ -265,7 +265,12 @@ export function CohortScatter({
   /** Nearest point under the cursor, overlay first (it's drawn on top). */
   const hitTest = useCallback((dx: number, dy: number, radius: number): { idx: number; set: PointSet } | null => {
     if (overlayShown && overlayGrid) {
-      const o = overlayGrid.nearest(dx, dy, radius)
+      // Points drawn with an empty colour are hidden; don't let them be picked.
+      const oc = overlay?.colors
+      const visible = oc
+        ? (i: number) => { const ci = oc.index[i]; return ci === 255 ? !!oc.unassigned : !!(oc.palette[ci] ?? oc.unassigned) }
+        : undefined
+      const o = overlayGrid.nearest(dx, dy, radius, visible)
       if (o >= 0) return { idx: o, set: 'overlay' }
     }
     if (!(baseHidden && overlayShown)) {
@@ -273,7 +278,7 @@ export function CohortScatter({
       if (b >= 0) return { idx: b, set: 'base' }
     }
     return null
-  }, [overlayShown, overlayGrid, baseHidden, grid])
+  }, [overlayShown, overlayGrid, overlay?.colors, baseHidden, grid])
 
   useEffect(() => { paint() }, [paint])
 

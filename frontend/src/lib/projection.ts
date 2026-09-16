@@ -163,8 +163,8 @@ export class PointGrid {
     return cy * this.cols + cx
   }
 
-  /** Nearest point to (x, y) within `radius` data units, or -1. */
-  nearest(x: number, y: number, radius: number): number {
+  /** Nearest point to (x, y) within `radius` data units, or -1. `accept` skips points (e.g. hidden ones). */
+  nearest(x: number, y: number, radius: number, accept?: (i: number) => boolean): number {
     const { x: px, y: py } = this.data
     const spanX = Math.ceil(radius / this.cellW)
     const spanY = Math.ceil(radius / this.cellH)
@@ -182,7 +182,7 @@ export class PointGrid {
           const i = this.cells[k]
           const dx = px[i] - x, dy = py[i] - y
           const d = dx * dx + dy * dy
-          if (d < bestD) { bestD = d; best = i }
+          if (d < bestD && (!accept || accept(i))) { bestD = d; best = i }
         }
       }
     }

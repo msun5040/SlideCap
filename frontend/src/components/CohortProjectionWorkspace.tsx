@@ -182,6 +182,8 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
   const [overlayColorBy, setOverlayColorBy] = useState<OverlayColorBy>('cluster')
   const [refShow, setRefShow] = useState<RefShow>('grey')
   const [hideFar, setHideFar] = useState(false)
+  // Overlay groups hidden from the map (group ordinal in the colouring scheme; 255 = not in a group).
+  const [overlayHiddenGroups, setOverlayHiddenGroups] = useState<Set<number>>(new Set())
   const [overlayOpen, setOverlayOpen] = useState(false)
   const [allCohorts, setAllCohorts] = useState<{ id: number; name: string }[]>([])
   const [newOverlayCohort, setNewOverlayCohort] = useState('')
@@ -383,6 +385,14 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
 
   const activeOverlay = overlays.find(o => o.id === activeOverlayId) ?? null
 
+  useEffect(() => { setOverlayHiddenGroups(new Set()) }, [activeOverlayId, overlayColorBy])
+
+  const toggleOverlayGroup = (idx: number) => setOverlayHiddenGroups(prev => {
+    const next = new Set(prev)
+    if (next.has(idx)) next.delete(idx); else next.add(idx)
+    return next
+  })
+
   useEffect(() => {
     setOverlayData(null); setOverlayLabels(new Map()); setOverlaySchemes([]); setOverlayError('')
     if (selectedSet === 'overlay') { setSelectedIdx(null); setSelectedSet('base'); setPatchOpen(false) }
@@ -561,10 +571,15 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
       const perSlide = overlayData.header.slides.map(s => groupOfSlide.get(s.slide_hash) ?? 255)
       const index = new Uint8Array(overlayData.pointCount)
       for (let i = 0; i < overlayData.pointCount; i++) index[i] = perSlide[overlayData.slideIdx[i]]
-      return { index, palette: scheme.groups.map((g, i) => g.color || FALLBACK_COLORS[i % FALLBACK_COLORS.length]), unassigned: '#71717a' }
+      // Hidden groups draw with an empty colour, which the scatter skips.
+      return {
+        index,
+        palette: scheme.groups.map((g, i) => overlayHiddenGroups.has(i) ? '' : (g.color || FALLBACK_COLORS[i % FALLBACK_COLORS.length])),
+        unassigned: overlayHiddenGroups.has(255) ? '' : '#71717a',
+      }
     }
     return null
-  }, [overlayData, overlayColorBy, overlayClusterColors, overlaySchemes, focusIdx])
+  }, [overlayData, overlayColorBy, overlayClusterColors, overlaySchemes, focusIdx, overlayHiddenGroups])
 
   const legend = useMemo(() => {
     if (!data) return null
@@ -635,8 +650,8 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
       if (gi === undefined) none += s.n_patches
       else counts.set(gi, (counts.get(gi) || 0) + s.n_patches)
     }
-    const rows = scheme.groups.map((g, gi) => ({ label: g.name, color: g.color || FALLBACK_COLORS[gi % FALLBACK_COLORS.length], count: counts.get(gi) || 0 }))
-    if (none) rows.push({ label: 'Not in a group', color: '#71717a', count: none })
+    const rows = scheme.groups.map((g, gi) => ({ idx: gi, label: g.name, color: g.color || FALLBACK_COLORS[gi % FALLBACK_COLORS.length], count: counts.get(gi) || 0 }))
+    if (none) rows.push({ idx: 255, label: 'Not in a group', color: '#71717a', count: none })
     return { name: scheme.name, rows }
   }, [overlayData, overlayColorBy, overlaySchemes])
 
@@ -950,8 +965,10 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
           >
             <div className="mb-1 text-[13px] font-medium">Overlay another cohort</div>
             <p className="mb-2 text-[11px] leading-snug text-neutral-400">
-              Places the cohort's patches onto this map without refitting it: same PCA, assigned to this projection's
-              k-means clusters by nearest centre. Slides already in this projection are left out.
+              Places the cohort's patches onto this map without refitting anything. Each patch goes through this
+              projection's 50-d PCA (the step the {data?.header.method === 'tsne' ? 't-SNE' : data?.header.method === 'umap' ? 'UMAP' : 'map'} and k-means were computed
+              from), joins the nearest k-means cluster centre there, and is drawn at its nearest reference patch's
+              position on the map. Slides already in this projection are left out.
             </p>
             <div className="space-y-2">
               <select className={inputCls} value={newOverlayCohort} onChange={e => setNewOverlayCohort(e.target.value)}>
@@ -1144,13 +1161,26 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
               {overlayLegend && showLegend && (
                 <div className="absolute right-14 top-3 max-h-[45%] min-w-[150px] overflow-auto rounded border border-orange-500/40 bg-neutral-900/90 p-2 text-[11px]">
                   <div className="mb-1 text-[10px] uppercase tracking-wide text-orange-300">Overlay · {overlayLegend.name}</div>
-                  {overlayLegend.rows.map(r => (
-                    <div key={r.label} className="flex items-center gap-2 px-1 py-0.5">
-                      <span className="h-2.5 w-2.5 shrink-0 rounded-[2px]" style={{ backgroundColor: r.color }} />
-                      <span className="truncate">{r.label}</span>
-                      <span className="ml-auto pl-3 tabular-nums text-neutral-400">{r.count.toLocaleString()}</span>
-                    </div>
-                  ))}
+                  {overlayLegend.rows.map(r => {
+                    const hidden = overlayHiddenGroups.has(r.idx)
+                    return (
+                      <button key={r.idx}
+                              onClick={() => toggleOverlayGroup(r.idx)}
+                              className={`flex w-full items-center gap-2 rounded px-1 py-0.5 text-left hover:bg-neutral-800 ${hidden ? 'opacity-40' : ''}`}
+                              title={hidden ? 'Show this group' : 'Hide this group'}>
+                        <span className="h-2.5 w-2.5 shrink-0 rounded-[2px]" style={{ backgroundColor: r.color }} />
+                        <span className={`truncate ${hidden ? 'line-through' : ''}`}>{r.label}</span>
+                        <span className="ml-auto pl-3 tabular-nums text-neutral-400">{r.count.toLocaleString()}</span>
+                        {hidden ? <EyeOff className="h-3 w-3 shrink-0 text-neutral-500" /> : <Eye className="h-3 w-3 shrink-0 text-neutral-500" />}
+                      </button>
+                    )
+                  })}
+                  {overlayHiddenGroups.size > 0 && (
+                    <button onClick={() => setOverlayHiddenGroups(new Set())}
+                            className="mt-1 w-full rounded border border-neutral-700 px-1 py-0.5 text-neutral-300 hover:bg-neutral-800">
+                      Show all
+                    </button>
+                  )}
                 </div>
               )}
               {colorMode.kind === 'cluster' && !baseColors && !labelsError && (
