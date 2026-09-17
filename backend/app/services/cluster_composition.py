@@ -37,7 +37,7 @@ contributor's share after all of that.
 Patches are not independent, so the pooled test is still anchored to patients: the
 label is randomised in whole patient blocks (swap that patient's A and B slides;
 a patient present in only one group moves wholesale to the other), the pooled
-shares are recomputed each time, and the observed CLR difference is scored against
+shares are recomputed each time, and the observed percentage-point difference is scored against
 that null. The 95% intervals are a patient-level bootstrap of the same statistic.
 """
 from __future__ import annotations
@@ -59,11 +59,12 @@ MIN_BLOCKS_FOR_POOLED_TEST = 4
 class SlideInfo:
     slide_hash: str
     case_hash: Optional[str]
-    patient: Optional[str]        # patient label, None if unassigned
+    patient: Optional[str]        # stable cohort-patient ID, None if unassigned
     in_a: bool
     in_b: bool
     start: int
     count: int
+    patient_label: Optional[str] = None
 
 
 @dataclass
@@ -153,6 +154,32 @@ def _cap_weights(n: np.ndarray, cap: float) -> np.ndarray:
         else:
             lo = mid
     return np.minimum(n, lo)
+
+
+def _capped_shares(counts: np.ndarray, multiplicity: np.ndarray, cap: float) -> np.ndarray:
+    """Recompute case caps for each resampled group (rows × original units).
+
+    Multiplicity counts bootstrap copies separately: two draws of a patient are
+    two independent copies of its cases, each subject to the same per-case cap.
+    Empty groups return NaN so they cannot enter a test as zero composition.
+    """
+    n = counts.sum(axis=1)
+    props = counts / np.maximum(n, 1e-12)[:, None]
+    m = multiplicity.sum(axis=1)
+    lo = np.zeros(len(m))
+    hi = np.max(np.where(multiplicity > 0, n[None, :], 0), axis=1)
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        total = (multiplicity * np.minimum(n[None, :], mid[:, None])).sum(axis=1)
+        too_high = mid > cap * total
+        hi = np.where(too_high, mid, hi)
+        lo = np.where(too_high, lo, mid)
+    weights = np.minimum(n[None, :], lo[:, None])
+    weights = np.where((cap <= 1 / np.maximum(m, 1))[:, None], 1.0, weights)
+    weights *= multiplicity
+    total = weights.sum(axis=1)
+    return np.divide(weights @ props, total[:, None],
+                     out=np.full((len(m), counts.shape[1]), np.nan), where=total[:, None] > 0)
 
 
 def _pooled(inp: CompositionInput, slide_counts: Dict[str, np.ndarray],
@@ -284,6 +311,11 @@ def _pooled(inp: CompositionInput, slide_counts: Dict[str, np.ndarray],
     sum_wp = grand_wp.sum(axis=0)
     sum_w = grand_w.sum()
 
+    unit_rows = list(units.values())
+    unit_counts = np.array([u["counts"] for u in unit_rows])
+    unit_blocks = np.array([u["block"] for u in unit_rows])
+    unit_a = np.array([u["g"] == "a" for u in unit_rows])
+
     def stats_from_sel(sel: np.ndarray) -> np.ndarray:
         """sel (m × nb) of 1 = keep the block's labels, 0 = swap them → Δ in pp.
 
@@ -292,11 +324,18 @@ def _pooled(inp: CompositionInput, slide_counts: Dict[str, np.ndarray],
         a cluster whose own share held steady while its neighbours moved should
         not come out "changed".
         """
+        if cap is not None:
+            membership_a = np.where(unit_a, sel[:, unit_blocks], 1 - sel[:, unit_blocks])
+            a = _capped_shares(unit_counts, membership_a, cap)
+            b = _capped_shares(unit_counts, 1 - membership_a, cap)
+            return (b - a) * 100.0
         wp_a = sel @ WP["a"] + (1.0 - sel) @ WP["b"]
         w_a = sel @ W["a"] + (1.0 - sel) @ W["b"]
         a = wp_a / np.maximum(w_a, 1e-12)[:, None]
         b = (sum_wp - wp_a) / np.maximum(sum_w - w_a, 1e-12)[:, None]
-        return (b - a) * 100.0
+        d = (b - a) * 100.0
+        d[(w_a <= 0) | (sum_w - w_a <= 0)] = np.nan
+        return d
 
     tested = nb >= MIN_BLOCKS_FOR_POOLED_TEST
     pvals: List[Optional[float]] = [None] * kk
@@ -309,10 +348,11 @@ def _pooled(inp: CompositionInput, slide_counts: Dict[str, np.ndarray],
         total = 0
         if nb <= EXACT_PERMUTATION_MAX_N:
             sel = ((np.arange(2 ** nb)[:, None] >> np.arange(nb)[None, :]) & 1).astype(float)
-            d = stats_from_sel(sel)
+            d = np.concatenate([stats_from_sel(sel[i:i + 250]) for i in range(0, len(sel), 250)])
+            d = d[np.isfinite(d).all(axis=1)]
             hits = (np.abs(d) >= obs_abs - 1e-12).sum(axis=0).astype(float)
             hits_glob = int(((d ** 2).sum(axis=1) >= obs_glob - 1e-12).sum())
-            total = sel.shape[0]
+            total = d.shape[0]
             pvals = [float(h / total) for h in hits]
             global_p = float(hits_glob / total)
         else:
@@ -321,9 +361,10 @@ def _pooled(inp: CompositionInput, slide_counts: Dict[str, np.ndarray],
                 m = min(500, RANDOM_PERMUTATIONS - start)
                 sel = rng.integers(0, 2, size=(m, nb)).astype(float)
                 d = stats_from_sel(sel)
+                d = d[np.isfinite(d).all(axis=1)]
                 hits += (np.abs(d) >= obs_abs - 1e-12).sum(axis=0)
                 hits_glob += int(((d ** 2).sum(axis=1) >= obs_glob - 1e-12).sum())
-                total += m
+                total += d.shape[0]
             pvals = [float((h + 1) / (total + 1)) for h in hits]
             global_p = float((hits_glob + 1) / (total + 1))
 
@@ -340,6 +381,12 @@ def _pooled(inp: CompositionInput, slide_counts: Dict[str, np.ndarray],
             ok = (wa > 0) & (wb > 0)
             a = WP["a"][idx].sum(axis=1) / np.maximum(wa, 1e-12)[:, None]
             b = WP["b"][idx].sum(axis=1) / np.maximum(wb, 1e-12)[:, None]
+            if cap is not None:
+                repetitions = np.zeros((m, nb))
+                np.add.at(repetitions, (np.repeat(np.arange(m), nb), idx.ravel()), 1)
+                copies = repetitions[:, unit_blocks]
+                a = _capped_shares(unit_counts, copies * unit_a, cap)
+                b = _capped_shares(unit_counts, copies * ~unit_a, cap)
             d = (b - a) * 100.0
             d[~ok] = np.nan
             draws[start:start + m] = d
@@ -383,8 +430,6 @@ def _pooled(inp: CompositionInput, slide_counts: Dict[str, np.ndarray],
 
 
 def compute(inp: CompositionInput) -> dict:
-    from scipy.stats import wilcoxon
-
     k = inp.n_clusters
     kept = [c for c in range(k) if c not in set(inp.exclude_clusters)]
     if len(kept) < 2:
@@ -451,14 +496,14 @@ def compute(inp: CompositionInput) -> dict:
         p = patients[label]
         if p["a"] and p["b"]:
             paired.append({
-                "patient": label,
+                "patient": label, "patient_label": p["a"][0].patient_label or label,
                 "a": group_comp(p["a"]), "b": group_comp(p["b"]),
                 "a_slides": len(p["a"]), "b_slides": len(p["b"]),
                 "a_patches": int(sum(slide_counts[s.slide_hash].sum() for s in p["a"])),
                 "b_patches": int(sum(slide_counts[s.slide_hash].sum() for s in p["b"])),
             })
         else:
-            unpaired.append({"patient": label, "has": "a" if p["a"] else "b"})
+            unpaired.append({"patient_id": label, "patient": (p["a"] or p["b"])[0].patient_label or label, "has": "a" if p["a"] else "b"})
 
     n = len(paired)
     ref = np.asarray(inp.ref_share, dtype=float)[kept]
@@ -483,6 +528,7 @@ def compute(inp: CompositionInput) -> dict:
             p = None
             if n >= MIN_PAIRS_FOR_TEST and np.any(Dclr[:, j] != 0):
                 try:
+                    from scipy.stats import wilcoxon
                     p = float(wilcoxon(Dclr[:, j], zero_method="wilcox", alternative="two-sided").pvalue)
                 except ValueError:
                     p = None
@@ -503,7 +549,7 @@ def compute(inp: CompositionInput) -> dict:
         "global_p": _permutation_p(Dclr) if n >= MIN_PAIRS_FOR_TEST else None,
         "clusters": clusters,
         "patients": [
-            {"patient": r["patient"], "a_pct": (r["a"] * 100).round(3).tolist(), "b_pct": (r["b"] * 100).round(3).tolist(),
+            {"patient_id": r["patient"], "patient": r["patient_label"], "a_pct": (r["a"] * 100).round(3).tolist(), "b_pct": (r["b"] * 100).round(3).tolist(),
              "a_slides": r["a_slides"], "b_slides": r["b_slides"],
              "a_patches": r["a_patches"], "b_patches": r["b_patches"]}
             for r in paired

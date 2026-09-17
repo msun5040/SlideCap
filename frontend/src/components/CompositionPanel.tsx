@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowLeftRight, Download, Loader2, Play, X } from 'lucide-react'
 import { getApiBase } from '@/api'
 import { saveBlob } from '@/lib/download'
 import { usePatchImage } from '@/lib/patchImages'
+import { CompositionExportDialog } from './CompositionExportDialog'
 
 /**
  * Cluster composition for an overlay cohort: how the share of each reference
@@ -45,6 +46,7 @@ interface ClusterStat {
 }
 
 interface PatientRow {
+  patient_id: string
   patient: string
   a_pct: number[]
   b_pct: number[]
@@ -155,7 +157,7 @@ function SlopeChart({ result, clusterIdx, groupA, groupB }: {
 }) {
   const col = result.kept_clusters.indexOf(clusterIdx)
   if (col < 0) return <p className="text-[11px] text-neutral-500">This cluster is excluded.</p>
-  const pts = result.patients.map(p => ({ label: p.patient, a: p.a_pct[col], b: p.b_pct[col] }))
+  const pts = result.patients.map(p => ({ id: p.patient_id, label: p.patient, a: p.a_pct[col], b: p.b_pct[col] }))
   const W = 300, H = 220, padL = 40, padR = 70, padT = 12, padB = 26
   const max = Math.max(1, ...pts.flatMap(p => [p.a, p.b])) * 1.08
   const y = (v: number) => padT + (H - padT - padB) * (1 - v / max)
@@ -175,7 +177,7 @@ function SlopeChart({ result, clusterIdx, groupA, groupB }: {
       {pts.map(p => {
         const up = p.b > p.a
         return (
-          <g key={p.label}>
+          <g key={p.id}>
             <title>{`${p.label}: ${p.a.toFixed(1)}% → ${p.b.toFixed(1)}%`}</title>
             <line x1={xA} x2={xB} y1={y(p.a)} y2={y(p.b)} stroke={up ? '#f87171' : '#60a5fa'} strokeOpacity={0.7} strokeWidth={1.5} />
             <circle cx={xA} cy={y(p.a)} r={2.5} fill="#a1a1aa" />
@@ -256,7 +258,20 @@ export function CompositionPanel({ overlayId, overlayCohortId, projectionId, clu
   const [chosen, setChosen] = useState<Set<number>>(() => new Set(clusterings.map(c => c.id)))
   const [excluded, setExcluded] = useState<Record<number, number[]>>({})
 
-  const [results, setResults] = useState<ClusteringResult[] | null>(null)
+  const [resultState, setResultState] = useState<{ key: string; data: ClusteringResult[] } | null>(null)
+  const [exportOpen, setExportOpen] = useState(false)
+  const requestVersion = useRef(0)
+  const requestParams = {
+    clustering_ids: clusterings.filter(c => chosen.has(c.id)).map(c => c.id),
+    scheme_id: schemeId, group_a_id: groupA, group_b_id: groupB,
+    weighting, exclude_far: excludeFar, restrict_group_id: restrictId,
+    pool_unit: poolUnit, pool_cap_pct: poolUnit === 'patch' ? poolCap : null,
+    exclude_clusters: excluded,
+  }
+  const requestKey = JSON.stringify(requestParams)
+  // A response is usable only for the exact inputs that produced it, even if
+  // controls change while a request is in flight.
+  const results = resultState?.key === requestKey ? resultState.data : null
   const [running, setRunning] = useState(false)
   const [error, setError] = useState('')
   const [sel, setSel] = useState<{ clusteringId: number; cluster: number } | null>(null)
@@ -297,39 +312,36 @@ export function CompositionPanel({ overlayId, overlayCohortId, projectionId, clu
   const run = useCallback(async (excl = excluded) => {
     if (!schemeId || !groupA || !groupB) { setError('Choose a scheme and two groups to compare.'); return }
     if (chosen.size === 0) { setError('Choose at least one clustering.'); return }
+    const version = ++requestVersion.current
+    const body = JSON.stringify({ ...requestParams, exclude_clusters: excl })
     setRunning(true); setError('')
     try {
       const res = await fetch(`${getApiBase()}/overlays/${overlayId}/composition`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          clustering_ids: clusterings.filter(c => chosen.has(c.id)).map(c => c.id),
-          scheme_id: schemeId, group_a_id: groupA, group_b_id: groupB,
-          weighting, exclude_far: excludeFar, restrict_group_id: restrictId,
-          pool_unit: poolUnit, pool_cap_pct: poolUnit === 'patch' ? poolCap : null,
-          exclude_clusters: Object.fromEntries(Object.entries(excl).map(([k, v]) => [k, v])),
-        }),
+        body,
       })
       const d = await res.json().catch(() => null)
       if (!res.ok) throw new Error(d?.detail || `Composition failed (${res.status})`)
-      setResults(d.results)
-      if (!sel && d.results.length) {
+      if (version !== requestVersion.current) return
+      setResultState({ key: body, data: d.results })
+      if (d.results.length && (!sel || !d.results.some((r: ClusteringResult) => r.clustering_id === sel.clusteringId))) {
         // Start on the largest shift in the first clustering.
         const r0: ClusteringResult = d.results[0]
         const best = [...r0.clusters].sort((x, y) => Math.abs(y.median_delta_pp ?? 0) - Math.abs(x.median_delta_pp ?? 0))[0]
         if (best) setSel({ clusteringId: r0.clustering_id, cluster: best.cluster })
       }
     } catch (e: any) {
-      setError(e.message || 'Composition failed')
+      if (version === requestVersion.current) setError(e.message || 'Composition failed')
     } finally {
-      setRunning(false)
+      if (version === requestVersion.current) setRunning(false)
     }
-  }, [overlayId, schemeId, groupA, groupB, weighting, excludeFar, restrictId, chosen, clusterings, excluded, sel,
+  }, [requestKey, overlayId, schemeId, groupA, groupB, weighting, excludeFar, restrictId, chosen, clusterings, excluded, sel,
       poolUnit, poolCap])
 
   // ── Tiles for the selected cluster ───────────────────────────────────
   useEffect(() => {
-    if (!sel || !groupA || !groupB) { setTiles(null); return }
+    if (!results || !sel || !groupA || !groupB) { setTiles(null); return }
     let cancelled = false
     setTilesLoading(true)
     const base = `${getApiBase()}/overlays/${overlayId}/tiles?clustering_id=${sel.clusteringId}&cluster=${sel.cluster}`
@@ -339,7 +351,7 @@ export function CompositionPanel({ overlayId, overlayCohortId, projectionId, clu
       .catch(() => { if (!cancelled) setTiles(null) })
       .finally(() => { if (!cancelled) setTilesLoading(false) })
     return () => { cancelled = true }
-  }, [sel, groupA, groupB, overlayId])
+  }, [sel, groupA, groupB, overlayId, results])
 
   // ── Crosswalk ────────────────────────────────────────────────────────
   useEffect(() => {
@@ -381,12 +393,12 @@ export function CompositionPanel({ overlayId, overlayCohortId, projectionId, clu
     }
     const rows: unknown[][] = []
     if (kind === 'patients') {
-      rows.push(['clustering', 'cluster', 'patient', 'group', 'share_pct', 'n_slides', 'n_patches', 'weighting'])
+      rows.push(['clustering', 'cluster', 'patient_id', 'patient', 'group', 'share_pct', 'n_slides', 'n_patches', 'weighting'])
       for (const r of results) {
         r.kept_clusters.forEach((c, j) => {
           for (const p of r.patients) {
-            rows.push([r.label, c + 1, p.patient, a, p.a_pct[j], p.a_slides, p.a_patches, weighting])
-            rows.push([r.label, c + 1, p.patient, b, p.b_pct[j], p.b_slides, p.b_patches, weighting])
+            rows.push([r.label, c + 1, p.patient_id, p.patient, a, p.a_pct[j], p.a_slides, p.a_patches, weighting])
+            rows.push([r.label, c + 1, p.patient_id, p.patient, b, p.b_pct[j], p.b_slides, p.b_patches, weighting])
           }
         })
       }
@@ -439,15 +451,21 @@ export function CompositionPanel({ overlayId, overlayCohortId, projectionId, clu
                   className="inline-flex items-center gap-1 rounded border border-neutral-700 px-2 py-1 text-[12px] hover:bg-neutral-800 disabled:opacity-40">
             <Download className="h-3.5 w-3.5" /> Stats CSV
           </button>
-          <button onClick={() => exportCsv('patients')} disabled={!results}
+          <button onClick={() => setExportOpen(true)} disabled={clusterings.length === 0}
                   className="inline-flex items-center gap-1 rounded border border-neutral-700 px-2 py-1 text-[12px] hover:bg-neutral-800 disabled:opacity-40">
-            <Download className="h-3.5 w-3.5" /> Per-patient CSV
+            <Download className="h-3.5 w-3.5" /> Export data
           </button>
           <button onClick={onClose} className="rounded p-1 hover:bg-neutral-800" title="Close composition">
             <X className="h-4 w-4" />
           </button>
         </div>
       </div>
+
+      <CompositionExportDialog open={exportOpen} onOpenChange={setExportOpen}
+        overlayId={overlayId} clusterings={clusterings} groupA={groupA} groupB={groupB}
+        groupAName={groupName(groupA)} groupBName={groupName(groupB)} schemeId={schemeId}
+        groups={allGroups} excluded={excluded}
+        onExportPaired={results ? () => exportCsv('patients') : undefined} />
 
       {/* Settings */}
       <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-neutral-800 bg-neutral-900/60 px-4 py-2 text-[12px]">
@@ -545,6 +563,9 @@ export function CompositionPanel({ overlayId, overlayCohortId, projectionId, clu
 
       <div className="min-h-0 flex-1 overflow-auto px-4 py-3 text-[12px]">
         {error && <div className="mb-3 rounded border border-red-900 bg-red-950/40 p-2 text-red-300">{error}</div>}
+        {resultState && !results && !running && !error && (
+          <p className="mb-2 text-amber-300">Settings changed. Run the comparison again to update results and summary exports.</p>
+        )}
         {!results && !running && !error && (
           <p className="text-neutral-400">
             Choose the two groups to compare and the clusterings to test, then Run. You get both readings: per patient

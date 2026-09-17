@@ -1303,7 +1303,7 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
       </div>
 
       {compositionOpen && activeOverlay && (
-        <CompositionPanel
+        <CompositionPanel key={activeOverlay.id}
           overlayId={activeOverlay.id}
           overlayCohortId={activeOverlay.cohort_id}
           projectionId={projectionId}

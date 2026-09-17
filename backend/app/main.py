@@ -6256,7 +6256,7 @@ _overlay_ref_locks_guard = threading.Lock()
 
 def _overlay_ref_lock(projection_id: int) -> threading.Lock:
     with _overlay_ref_locks_guard:
-        return _overlay_ref_locks.setdefault(projection_id, threading.Lock())
+        return _overlay_ref_locks.setdefault(projection_id, threading.RLock())
 
 
 def _uni_analysis_id(db: Session) -> Optional[int]:
@@ -6360,27 +6360,32 @@ def _check_overlayable_clustering(ov: ProjectionOverlay, cl: Optional[Projection
 def _overlay_assignment(ov: ProjectionOverlay, cl: ProjectionClustering):
     """(labels int16, far uint8) for the overlay under one clustering, cached as sidecars."""
     from .services import projection_overlay as po
-    root = _projection_root()
-    lab_p = root / f"overlay-{ov.id}-c{cl.id}.labels"
-    far_p = root / f"overlay-{ov.id}-c{cl.id}.far"
-    if not (lab_p.exists() and far_p.exists()):
-        pr = ov.projection
-        cent = _clustering_centroids(pr, cl)
-        Q = po.open_reduced(settings.local_data_path / ov.reduced_path, ov.point_count, pr.reduced_dim)
-        lab, far, _ = po.assign(Q, cent)
-        del Q
-        for path, arr in ((lab_p, lab.astype("<i2")), (far_p, far)):
-            tmp = path.with_suffix(path.suffix + ".tmp")
-            arr.tofile(tmp)
-            tmp.replace(path)
-        report = ov.get_report()
-        report.setdefault("clusterings", {})[str(cl.id)] = {
-            "agreement": cent["report"]["agreement"],
-            "n_clusters": cent["report"]["n_clusters"],
-            "far_share": float(far.mean()) if far.size else 0.0,
-        }
-        _update_model_row(ProjectionOverlay, ov.id, report_json=json.dumps(report))
-    return np.fromfile(lab_p, dtype="<i2"), np.fromfile(far_p, dtype=np.uint8)
+    with _overlay_ref_lock(ov.projection_id):
+        root = _projection_root()
+        lab_p = root / f"overlay-{ov.id}-c{cl.id}.labels"
+        far_p = root / f"overlay-{ov.id}-c{cl.id}.far"
+        if not (lab_p.exists() and far_p.exists()):
+            pr = ov.projection
+            cent = _clustering_centroids(pr, cl)
+            Q = po.open_reduced(settings.local_data_path / ov.reduced_path, ov.point_count, pr.reduced_dim)
+            lab, far, _ = po.assign(Q, cent)
+            del Q
+            for path, arr in ((lab_p, lab.astype("<i2")), (far_p, far)):
+                tmp = path.with_suffix(path.suffix + ".tmp")
+                arr.tofile(tmp)
+                tmp.replace(path)
+            from sqlalchemy.orm import object_session
+            session = object_session(ov)
+            if session is not None:
+                session.refresh(ov, ["report_json"])
+            report = ov.get_report()
+            report.setdefault("clusterings", {})[str(cl.id)] = {
+                "agreement": cent["report"]["agreement"],
+                "n_clusters": cent["report"]["n_clusters"],
+                "far_share": float(far.mean()) if far.size else 0.0,
+            }
+            _update_model_row(ProjectionOverlay, ov.id, report_json=json.dumps(report))
+        return np.fromfile(lab_p, dtype="<i2"), np.fromfile(far_p, dtype=np.uint8)
 
 
 def _run_overlay_background(overlay_id: int) -> None:
@@ -6631,7 +6636,7 @@ def overlay_composition(overlay_id: int, data: OverlayCompositionRequest, db: Se
                 .filter_by(cohort_id=ov.cohort_id).all()):
         for sg in p.surgeries:
             if sg.case:
-                patient_of_case[sg.case.accession_hash] = p.label
+                patient_of_case[sg.case.accession_hash] = (p.id, p.label)
 
     slides = []
     for s in header["slides"]:
@@ -6640,7 +6645,8 @@ def overlay_composition(overlay_id: int, data: OverlayCompositionRequest, db: Se
             continue
         row = slide_rows.get(h)
         case_hash = row.case.accession_hash if row and row.case else None
-        slides.append(cc.SlideInfo(slide_hash=h, case_hash=case_hash, patient=patient_of_case.get(case_hash),
+        slides.append(cc.SlideInfo(slide_hash=h, case_hash=case_hash, patient=str(patient_of_case[case_hash][0]) if case_hash in patient_of_case else None,
+                                   patient_label=patient_of_case[case_hash][1] if case_hash in patient_of_case else None,
                                    in_a=h in a, in_b=h in b, start=int(s["start"]), count=int(s["n_patches"])))
 
     results = []
@@ -6687,6 +6693,9 @@ def overlay_composition_export(overlay_id: int, data: OverlayExportRequest, db: 
     if not data.clustering_ids:
         raise HTTPException(status_code=400, detail="Choose at least one clustering.")
 
+    if data.group_a_id is not None and data.group_a_id == data.group_b_id:
+        raise HTTPException(status_code=400, detail="Choose two different groups.")
+
     group_names: Dict[str, str] = {}
     a_hashes: set = set()
     b_hashes: set = set()
@@ -6717,7 +6726,7 @@ def overlay_composition_export(overlay_id: int, data: OverlayExportRequest, db: 
                 .filter_by(cohort_id=ov.cohort_id).all()):
         for sg in p.surgeries:
             if sg.case:
-                patient_of_case[sg.case.accession_hash] = p.label
+                patient_of_case[sg.case.accession_hash] = (p.id, p.label)
 
     a_name = group_names.get(str(data.group_a_id), "A")
     b_name = group_names.get(str(data.group_b_id), "B")
@@ -6739,94 +6748,34 @@ def overlay_composition_export(overlay_id: int, data: OverlayExportRequest, db: 
             "slide_name": "" if _is_demo() else (sl.get("display_name") or ""),
             "case_id": case.slidecap_id if case else "",
             "case_hash": case.accession_hash if case else "",
-            "patient": patient_of_case.get(case.accession_hash if case else None) or "",
+            "patient_id": str(patient_of_case[case.accession_hash][0]) if case and case.accession_hash in patient_of_case else "",
+            "patient": patient_of_case[case.accession_hash][1] if case and case.accession_hash in patient_of_case else "",
             "group": group,
+            "group_key": "both" if in_a and in_b else "a" if in_a else "b" if in_b else "",
             "start": int(sl["start"]),
             "count": int(sl["n_patches"]),
         })
     if not slides:
         raise HTTPException(status_code=400, detail="No slides match this selection.")
 
-    id_cols = {
-        "slide": ["slide_id", "slide_name", "case_id", "patient", "group"],
-        "case": ["case_id", "patient", "group"],
-        "patient": ["patient", "group"],
-    }[data.level]
+    from .services.composition_export import composition_csv
 
-    def unit_key(sl: dict) -> tuple:
-        if data.level == "slide":
-            return (sl["slide_id"] or sl["slide_hash"], sl["group"])
-        if data.level == "case":
-            return (sl["case_id"] or sl["case_hash"] or sl["slide_hash"], sl["group"])
-        return (sl["patient"] or "(no patient)", sl["group"])
+    def clusterings():
+        for cid in dict.fromkeys(data.clustering_ids):
+            cl = db.query(ProjectionClustering).filter_by(id=cid).first()
+            _check_overlayable_clustering(ov, cl)
+            labels, far = _overlay_assignment(ov, cl)
+            cent = _clustering_centroids(ov.projection, cl)
+            yield {"id": cl.id, "label": cl.get_params().get("label") or f"k={cl.n_clusters}",
+                   "k": int(cent["report"]["n_clusters"]), "labels": labels, "far": far,
+                   "excluded": data.exclude_clusters.get(str(cid), [])}
 
-    out: List[List] = []
-    wide_header: List[str] = []
-    for cid in data.clustering_ids:
-        cl = db.query(ProjectionClustering).filter_by(id=cid).first()
-        _check_overlayable_clustering(ov, cl)
-        labels, far = _overlay_assignment(ov, cl)
-        cent = _clustering_centroids(ov.projection, cl)
-        k = int(cent["report"]["n_clusters"])
-        dropped = set(data.exclude_clusters.get(str(cid), []))
-        kept = [c for c in range(k) if c not in dropped]
-        label = cl.get_params().get("label") or f"k={cl.n_clusters}"
-
-        units: Dict[tuple, dict] = {}
-        for sl in slides:
-            lab = labels[sl["start"]:sl["start"] + sl["count"]].astype(np.int64)
-            fr = far[sl["start"]:sl["start"] + sl["count"]] if far is not None else None
-            m = lab >= 0
-            n_far = int((fr == 1).sum()) if fr is not None else 0
-            if data.exclude_far and fr is not None:
-                m &= fr == 0
-            sel = lab[m]
-            counts = np.bincount(sel, minlength=k)[:k] if sel.size else np.zeros(k, dtype=np.int64)
-            u = units.get(unit_key(sl))
-            if u is None:
-                u = units[unit_key(sl)] = {"ids": {c: sl.get(c, "") for c in id_cols},
-                                           "counts": np.zeros(k, dtype=np.int64),
-                                           "total": 0, "far": 0, "n_slides": 0}
-            u["counts"] += counts
-            u["total"] += sl["count"]
-            u["far"] += n_far
-            u["n_slides"] += 1
-
-        # Group A first, then B, then anything else — matches how the panel reads.
-        order = {a_name: 0, b_name: 1, "both": 2, "": 3}
-        for key in sorted(units, key=lambda t: (order.get(str(t[1]), 4), str(t[1]), str(t[0]))):
-            u = units[key]
-            kept_total = int(u["counts"][kept].sum())
-            ids = [u["ids"].get(c, "") for c in id_cols]
-            base = ids + [label, u["n_slides"], kept_total, u["total"], u["far"]]
-            if data.layout == "long":
-                for c in kept:
-                    n = int(u["counts"][c])
-                    out.append(base + [c + 1, n, round(n / kept_total * 100, 6) if kept_total else 0.0])
-            else:
-                row = list(base)
-                for c in kept:
-                    n = int(u["counts"][c])
-                    row += [n, round(n / kept_total * 100, 6) if kept_total else 0.0]
-                out.append(row)
-                if not wide_header:
-                    wide_header = [f"cluster_{c + 1}_{suffix}" for c in kept for suffix in ("n", "pct")]
-
-    meta_cols = ["clustering", "n_slides", "kept_patches", "total_patches", "far_patches"]
-    cols = id_cols + meta_cols + (["cluster", "n_patches", "pct_of_unit"] if data.layout == "long" else wide_header)
-
-    buf = io.StringIO()
-    w = csv.writer(buf)
-    w.writerow(cols)
-    w.writerows(out)
-    stem = f"composition-per-{data.level}"
-    if data.scope == "groups":
-        stem += f"-{a_name}-vs-{b_name}"
-    return Response(
-        content=buf.getvalue(),
-        media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="{stem.replace(" ", "_")}.csv"'},
-    )
+    try:
+        content = composition_csv(slides, clusterings(), data.level, data.layout, data.exclude_far)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return Response(content=content, media_type="text/csv",
+                    headers={"Content-Disposition": f'attachment; filename="composition-per-{data.level}.csv"'})
 
 
 @app.get("/overlays/{overlay_id}/tiles")
