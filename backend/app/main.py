@@ -6234,6 +6234,20 @@ class OverlayCompositionRequest(BaseModel):
     restrict_group_id: Optional[int] = None      # e.g. a "Resection" group, for a sensitivity check
 
 
+class OverlayExportRequest(BaseModel):
+    """Raw per-unit cluster counts, for analysis outside SlideCap."""
+    clustering_ids: List[int]
+    level: str = "slide"                         # slide | case | patient
+    layout: str = "long"                         # long (row per cluster) | wide (column per cluster)
+    scope: str = "groups"                        # groups (the two compared) | all (every slide in the overlay)
+    scheme_id: Optional[int] = None
+    group_a_id: Optional[int] = None
+    group_b_id: Optional[int] = None
+    exclude_clusters: Dict[str, List[int]] = {}
+    exclude_far: bool = False
+    restrict_group_id: Optional[int] = None
+
+
 # One lock per reference projection, so two overlays started together don't both
 # recover the PCA or build the same centroids.
 _overlay_ref_locks: dict[int, threading.Lock] = {}
@@ -6650,6 +6664,169 @@ def overlay_composition(overlay_id: int, data: OverlayCompositionRequest, db: Se
 
     counts = {"a": sum(1 for s in slides if s.in_a and not s.in_b), "b": sum(1 for s in slides if s.in_b and not s.in_a)}
     return {"overlay_id": ov.id, "slides_in_groups": counts, "results": results}
+
+
+@app.post("/overlays/{overlay_id}/composition/export")
+def overlay_composition_export(overlay_id: int, data: OverlayExportRequest, db: Session = Depends(get_db)):
+    """
+    Cluster counts per slide, case or patient as CSV — the numbers behind the
+    composition panel, for analysing elsewhere. Every row carries both the raw
+    patch count and its percentage of that unit, so the reader can re-weight
+    however they like.
+    """
+    from .services import projection_overlay as po
+
+    ov = _get_overlay(db, overlay_id)
+    _require_completed_overlay(ov)
+    if data.level not in ("slide", "case", "patient"):
+        raise HTTPException(status_code=400, detail="level must be 'slide', 'case' or 'patient'.")
+    if data.layout not in ("long", "wide"):
+        raise HTTPException(status_code=400, detail="layout must be 'long' or 'wide'.")
+    if data.scope not in ("groups", "all"):
+        raise HTTPException(status_code=400, detail="scope must be 'groups' or 'all'.")
+    if not data.clustering_ids:
+        raise HTTPException(status_code=400, detail="Choose at least one clustering.")
+
+    group_names: Dict[str, str] = {}
+    a_hashes: set = set()
+    b_hashes: set = set()
+    if data.scope == "groups":
+        if not (data.group_a_id and data.group_b_id):
+            raise HTTPException(status_code=400, detail="Two groups are needed unless scope is 'all'.")
+        a_hashes = _group_slide_hashes(db, data.group_a_id, ov.cohort_id)
+        b_hashes = _group_slide_hashes(db, data.group_b_id, ov.cohort_id)
+        for gid in (data.group_a_id, data.group_b_id):
+            g = db.query(CohortGroup).filter_by(id=gid).first()
+            group_names[str(gid)] = g.name if g else str(gid)
+    elif data.group_a_id and data.group_b_id:
+        # Still label the groups when they were given, so "all slides" exports
+        # can be split by timepoint afterwards.
+        a_hashes = _group_slide_hashes(db, data.group_a_id, ov.cohort_id)
+        b_hashes = _group_slide_hashes(db, data.group_b_id, ov.cohort_id)
+        for gid in (data.group_a_id, data.group_b_id):
+            g = db.query(CohortGroup).filter_by(id=gid).first()
+            group_names[str(gid)] = g.name if g else str(gid)
+    restrict = _group_slide_hashes(db, data.restrict_group_id, ov.cohort_id) if data.restrict_group_id else None
+
+    header = po.read_artifact_header(settings.local_data_path / ov.artifact_path)
+    hashes = [s["slide_hash"] for s in header["slides"]]
+    slide_rows = {s.slide_hash: s for s in
+                  db.query(Slide).options(joinedload(Slide.case)).filter(Slide.slide_hash.in_(hashes)).all()}
+    patient_of_case: dict = {}
+    for p in (db.query(CohortPatient).options(joinedload(CohortPatient.surgeries).joinedload(CohortPatientCase.case))
+                .filter_by(cohort_id=ov.cohort_id).all()):
+        for sg in p.surgeries:
+            if sg.case:
+                patient_of_case[sg.case.accession_hash] = p.label
+
+    a_name = group_names.get(str(data.group_a_id), "A")
+    b_name = group_names.get(str(data.group_b_id), "B")
+
+    slides = []
+    for sl in header["slides"]:
+        h = sl["slide_hash"]
+        if restrict is not None and h not in restrict:
+            continue
+        in_a, in_b = h in a_hashes, h in b_hashes
+        group = a_name if (in_a and not in_b) else b_name if (in_b and not in_a) else ("both" if in_a else "")
+        if data.scope == "groups" and not group:
+            continue
+        row = slide_rows.get(h)
+        case = row.case if row else None
+        slides.append({
+            "slide_hash": h,
+            "slide_id": row.slidecap_id if row else "",
+            "slide_name": "" if _is_demo() else (sl.get("display_name") or ""),
+            "case_id": case.slidecap_id if case else "",
+            "case_hash": case.accession_hash if case else "",
+            "patient": patient_of_case.get(case.accession_hash if case else None) or "",
+            "group": group,
+            "start": int(sl["start"]),
+            "count": int(sl["n_patches"]),
+        })
+    if not slides:
+        raise HTTPException(status_code=400, detail="No slides match this selection.")
+
+    id_cols = {
+        "slide": ["slide_id", "slide_name", "case_id", "patient", "group"],
+        "case": ["case_id", "patient", "group"],
+        "patient": ["patient", "group"],
+    }[data.level]
+
+    def unit_key(sl: dict) -> tuple:
+        if data.level == "slide":
+            return (sl["slide_id"] or sl["slide_hash"], sl["group"])
+        if data.level == "case":
+            return (sl["case_id"] or sl["case_hash"] or sl["slide_hash"], sl["group"])
+        return (sl["patient"] or "(no patient)", sl["group"])
+
+    out: List[List] = []
+    wide_header: List[str] = []
+    for cid in data.clustering_ids:
+        cl = db.query(ProjectionClustering).filter_by(id=cid).first()
+        _check_overlayable_clustering(ov, cl)
+        labels, far = _overlay_assignment(ov, cl)
+        cent = _clustering_centroids(ov.projection, cl)
+        k = int(cent["report"]["n_clusters"])
+        dropped = set(data.exclude_clusters.get(str(cid), []))
+        kept = [c for c in range(k) if c not in dropped]
+        label = cl.get_params().get("label") or f"k={cl.n_clusters}"
+
+        units: Dict[tuple, dict] = {}
+        for sl in slides:
+            lab = labels[sl["start"]:sl["start"] + sl["count"]].astype(np.int64)
+            fr = far[sl["start"]:sl["start"] + sl["count"]] if far is not None else None
+            m = lab >= 0
+            n_far = int((fr == 1).sum()) if fr is not None else 0
+            if data.exclude_far and fr is not None:
+                m &= fr == 0
+            sel = lab[m]
+            counts = np.bincount(sel, minlength=k)[:k] if sel.size else np.zeros(k, dtype=np.int64)
+            u = units.get(unit_key(sl))
+            if u is None:
+                u = units[unit_key(sl)] = {"ids": {c: sl.get(c, "") for c in id_cols},
+                                           "counts": np.zeros(k, dtype=np.int64),
+                                           "total": 0, "far": 0, "n_slides": 0}
+            u["counts"] += counts
+            u["total"] += sl["count"]
+            u["far"] += n_far
+            u["n_slides"] += 1
+
+        # Group A first, then B, then anything else — matches how the panel reads.
+        order = {a_name: 0, b_name: 1, "both": 2, "": 3}
+        for key in sorted(units, key=lambda t: (order.get(str(t[1]), 4), str(t[1]), str(t[0]))):
+            u = units[key]
+            kept_total = int(u["counts"][kept].sum())
+            ids = [u["ids"].get(c, "") for c in id_cols]
+            base = ids + [label, u["n_slides"], kept_total, u["total"], u["far"]]
+            if data.layout == "long":
+                for c in kept:
+                    n = int(u["counts"][c])
+                    out.append(base + [c + 1, n, round(n / kept_total * 100, 6) if kept_total else 0.0])
+            else:
+                row = list(base)
+                for c in kept:
+                    n = int(u["counts"][c])
+                    row += [n, round(n / kept_total * 100, 6) if kept_total else 0.0]
+                out.append(row)
+                if not wide_header:
+                    wide_header = [f"cluster_{c + 1}_{suffix}" for c in kept for suffix in ("n", "pct")]
+
+    meta_cols = ["clustering", "n_slides", "kept_patches", "total_patches", "far_patches"]
+    cols = id_cols + meta_cols + (["cluster", "n_patches", "pct_of_unit"] if data.layout == "long" else wide_header)
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(cols)
+    w.writerows(out)
+    stem = f"composition-per-{data.level}"
+    if data.scope == "groups":
+        stem += f"-{a_name}-vs-{b_name}"
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{stem.replace(" ", "_")}.csv"'},
+    )
 
 
 @app.get("/overlays/{overlay_id}/tiles")
