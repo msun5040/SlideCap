@@ -6226,7 +6226,9 @@ class OverlayCompositionRequest(BaseModel):
     scheme_id: int
     group_a_id: int
     group_b_id: int
-    weighting: str = "slide"                     # slide | patch
+    weighting: str = "slide"                     # slide | patch — paired view only
+    pool_unit: str = "patch"                     # patch | slide | case | patient — group-totals weighting
+    pool_cap_pct: Optional[float] = None         # patch pooling: no case above this share of its group
     exclude_clusters: Dict[str, List[int]] = {}  # clustering_id → cluster labels
     exclude_far: bool = False
     restrict_group_id: Optional[int] = None      # e.g. a "Resection" group, for a sensitivity check
@@ -6588,7 +6590,7 @@ def _group_slide_hashes(db: Session, group_id: int, cohort_id: int) -> set:
 
 @app.post("/overlays/{overlay_id}/composition")
 def overlay_composition(overlay_id: int, data: OverlayCompositionRequest, db: Session = Depends(get_db)):
-    """Patient-paired cluster composition, group A → group B, for each chosen clustering."""
+    """Cluster composition A → B for each chosen clustering: patient-paired, plus group totals."""
     from .services import projection_overlay as po
     from .services import cluster_composition as cc
 
@@ -6596,6 +6598,10 @@ def overlay_composition(overlay_id: int, data: OverlayCompositionRequest, db: Se
     _require_completed_overlay(ov)
     if data.weighting not in ("slide", "patch"):
         raise HTTPException(status_code=400, detail="weighting must be 'slide' or 'patch'.")
+    if data.pool_unit not in ("patch", "slide", "case", "patient"):
+        raise HTTPException(status_code=400, detail="pool_unit must be 'patch', 'slide', 'case' or 'patient'.")
+    if data.pool_cap_pct is not None and not 1 <= data.pool_cap_pct <= 100:
+        raise HTTPException(status_code=400, detail="pool_cap_pct must be between 1 and 100.")
     if data.group_a_id == data.group_b_id:
         raise HTTPException(status_code=400, detail="Choose two different groups to compare.")
     a = _group_slide_hashes(db, data.group_a_id, ov.cohort_id)
@@ -6633,7 +6639,8 @@ def overlay_composition(overlay_id: int, data: OverlayCompositionRequest, db: Se
             res = cc.compute(cc.CompositionInput(
                 slides=slides, labels=labels, far=far, n_clusters=int(cent["report"]["n_clusters"]),
                 ref_share=cent["ref_share"], exclude_clusters=data.exclude_clusters.get(str(cid), []),
-                exclude_far=data.exclude_far, weighting=data.weighting))
+                exclude_far=data.exclude_far, weighting=data.weighting,
+                pool_unit=data.pool_unit, pool_cap_pct=data.pool_cap_pct))
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         res.update({"clustering_id": cl.id, "n_clusters": int(cent["report"]["n_clusters"]),

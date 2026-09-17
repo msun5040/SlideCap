@@ -59,7 +59,7 @@ interface PooledStat {
   a_pct: number
   b_pct: number
   delta_pp: number
-  log2_ratio: number
+  log2_ratio: number | null
   ci_lo_pp: number | null
   ci_hi_pp: number | null
   a_patches: number
@@ -73,6 +73,10 @@ interface Pooled {
   n_paired_blocks?: number
   n_slides_a?: number
   n_slides_b?: number
+  n_units_a?: number
+  n_units_b?: number
+  pool_unit?: 'patch' | 'slide' | 'case' | 'patient'
+  pool_cap_pct?: number | null
   n_patches_a?: number
   n_patches_b?: number
   dominance_a?: number
@@ -245,6 +249,9 @@ export function CompositionPanel({ overlayId, overlayCohortId, projectionId, clu
   const [weighting, setWeighting] = useState<'slide' | 'patch'>('slide')
   /** Which reading is on show: each patient's own change, or the two group piles. */
   const [mode, setMode] = useState<'patient' | 'group'>('patient')
+  /** Group totals: what carries equal weight, and an optional cap on one case. */
+  const [poolUnit, setPoolUnit] = useState<'patch' | 'slide' | 'case' | 'patient'>('patch')
+  const [poolCap, setPoolCap] = useState<number | null>(null)
   const [excludeFar, setExcludeFar] = useState(false)
   const [chosen, setChosen] = useState<Set<number>>(() => new Set(clusterings.map(c => c.id)))
   const [excluded, setExcluded] = useState<Record<number, number[]>>({})
@@ -299,6 +306,7 @@ export function CompositionPanel({ overlayId, overlayCohortId, projectionId, clu
           clustering_ids: clusterings.filter(c => chosen.has(c.id)).map(c => c.id),
           scheme_id: schemeId, group_a_id: groupA, group_b_id: groupB,
           weighting, exclude_far: excludeFar, restrict_group_id: restrictId,
+          pool_unit: poolUnit, pool_cap_pct: poolUnit === 'patch' ? poolCap : null,
           exclude_clusters: Object.fromEntries(Object.entries(excl).map(([k, v]) => [k, v])),
         }),
       })
@@ -316,7 +324,8 @@ export function CompositionPanel({ overlayId, overlayCohortId, projectionId, clu
     } finally {
       setRunning(false)
     }
-  }, [overlayId, schemeId, groupA, groupB, weighting, excludeFar, restrictId, chosen, clusterings, excluded, sel])
+  }, [overlayId, schemeId, groupA, groupB, weighting, excludeFar, restrictId, chosen, clusterings, excluded, sel,
+      poolUnit, poolCap])
 
   // ── Tiles for the selected cluster ───────────────────────────────────
   useEffect(() => {
@@ -384,13 +393,15 @@ export function CompositionPanel({ overlayId, overlayCohortId, projectionId, clu
     } else if (kind === 'groups') {
       rows.push(['clustering', 'cluster', 'ref_pct', `${a}_pct_of_group`, `${b}_pct_of_group`, 'delta_pp',
                  'ci_lo_pp', 'ci_hi_pp', 'log2_ratio', `${a}_patches`, `${b}_patches`, 'permutation_p', 'bh_q',
-                 'global_permutation_p', 'n_patients', 'excluded_far', 'restricted_to'])
+                 'global_permutation_p', 'n_patients', 'weighting', 'cap_pct_per_case', 'excluded_far', 'restricted_to'])
       for (const r of results) {
         const ref = new Map(r.clusters.map(c => [c.cluster, c.ref_pct]))
         for (const c of r.pooled.clusters) {
           rows.push([r.label, c.cluster + 1, ref.get(c.cluster), c.a_pct, c.b_pct, c.delta_pp,
                      c.ci_lo_pp, c.ci_hi_pp, c.log2_ratio, c.a_patches, c.b_patches, c.p, c.q,
-                     r.pooled.global_p, r.pooled.n_blocks, excludeFar, restrictId ? groupName(restrictId) : ''])
+                     r.pooled.global_p, r.pooled.n_blocks,
+                     r.pooled.pool_unit === 'patch' ? 'every patch' : `each ${r.pooled.pool_unit} equally`,
+                     r.pooled.pool_cap_pct ?? '', excludeFar, restrictId ? groupName(restrictId) : ''])
         }
       }
     } else {
@@ -492,6 +503,29 @@ export function CompositionPanel({ overlayId, overlayCohortId, projectionId, clu
               </button>
             ))}
           </div>
+          {mode === 'group' && (
+            <>
+              <select className={selectCls} value={poolUnit}
+                      onChange={e => setPoolUnit(e.target.value as typeof poolUnit)}
+                      title="What carries equal weight in the group totals. Nothing is ever discarded — a slide that counts for less still contributes all of its patches.">
+                <option value="patch">Every patch counts once</option>
+                <option value="slide">Each slide counts once</option>
+                <option value="case">Each case counts once</option>
+                <option value="patient">Each patient counts once</option>
+              </select>
+              {poolUnit === 'patch' && (
+                <select className={selectCls} value={poolCap ?? ''}
+                        onChange={e => setPoolCap(e.target.value ? Number(e.target.value) : null)}
+                        title="Scale down any case that would otherwise carry more than this share of its group. Its patches all still count, just for less each.">
+                  <option value="">No cap per case</option>
+                  <option value="30">Cap a case at 30%</option>
+                  <option value="20">Cap a case at 20%</option>
+                  <option value="10">Cap a case at 10%</option>
+                  <option value="5">Cap a case at 5%</option>
+                </select>
+              )}
+            </>
+          )}
           <span className="text-[11px] text-neutral-400">Clusterings</span>
           {clusterings.map(c => (
             <label key={c.id} className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 ${chosen.has(c.id) ? 'border-neutral-500 bg-neutral-800' : 'border-neutral-800 text-neutral-500'}`}>
@@ -602,7 +636,8 @@ export function CompositionPanel({ overlayId, overlayCohortId, projectionId, clu
                       {selPooled.delta_pp.toFixed(1)} pp
                       {selPooled.ci_lo_pp != null && selPooled.ci_hi_pp != null &&
                         ` (95% CI ${selPooled.ci_lo_pp.toFixed(1)} to ${selPooled.ci_hi_pp.toFixed(1)})`}
-                      {' '}· ×{Math.pow(2, selPooled.log2_ratio).toFixed(2)} · p {fmtP(selPooled.p)} · q {fmtP(selPooled.q)}
+                      {selPooled.log2_ratio != null && ` · ×${Math.pow(2, selPooled.log2_ratio).toFixed(2)}`}
+                      {' '}· p {fmtP(selPooled.p)} · q {fmtP(selPooled.q)}
                     </span>
                   ) : selStat && (
                     <span className="text-[11px] text-neutral-400">
@@ -629,6 +664,18 @@ export function CompositionPanel({ overlayId, overlayCohortId, projectionId, clu
                 )}
                 {mode === 'group' && (
                   <div className="mb-3 space-y-2">
+                    <div className="text-[11px] text-neutral-500">
+                      {selResult.pooled.pool_unit === 'patch'
+                        ? (selResult.pooled.pool_cap_pct
+                            ? `Every patch counts once, with no case above ${selResult.pooled.pool_cap_pct}% of its group.`
+                            : 'Every patch counts once — a bigger slide has more say.')
+                        : `Each ${selResult.pooled.pool_unit} counts once: `
+                          + `${selResult.pooled.n_units_a ?? 0} in ${groupName(groupA)}, `
+                          + `${selResult.pooled.n_units_b ?? 0} in ${groupName(groupB)}. Every patch still counts.`}
+                      {selResult.pooled.dominance_a != null && selResult.pooled.dominance_b != null &&
+                        ` Biggest single contributor: ${(selResult.pooled.dominance_a * 100).toFixed(0)}% of `
+                        + `${groupName(groupA)}, ${(selResult.pooled.dominance_b * 100).toFixed(0)}% of ${groupName(groupB)}.`}
+                    </div>
                     <CompositionBars pooled={selResult.pooled} clusterColor={clusterColor}
                                      groupA={groupName(groupA)} groupB={groupName(groupB)}
                                      selected={sel.cluster}
@@ -671,7 +718,9 @@ export function CompositionPanel({ overlayId, overlayCohortId, projectionId, clu
                                   {c.ci_lo_pp != null && c.ci_hi_pp != null
                                     ? `${c.ci_lo_pp.toFixed(1)} … ${c.ci_hi_pp.toFixed(1)}` : '—'}
                                 </td>
-                                <td className="py-1 pr-2 text-neutral-400">×{Math.pow(2, c.log2_ratio).toFixed(2)}</td>
+                                <td className="py-1 pr-2 text-neutral-400">
+                                  {c.log2_ratio == null ? '—' : `×${Math.pow(2, c.log2_ratio).toFixed(2)}`}
+                                </td>
                                 <td className="py-1 pr-2">{fmtP(c.p)}</td>
                                 <td className="py-1 pr-2">{c.q != null && c.q < 0.05 ? <b>{fmtP(c.q)}</b> : fmtP(c.q)}</td>
                               </tr>
@@ -755,8 +804,10 @@ export function CompositionPanel({ overlayId, overlayCohortId, projectionId, clu
             <p className="text-[10px] text-neutral-500">
               {mode === 'group' ? (
                 <>
-                  Group totals pool every patch in the group, so a patient with several large resections weighs more than
-                  one small biopsy — the per-patient view is the counterweight. Patches within a patient aren't
+                  Group totals pool every patch in the group, so by default a patient with several large resections
+                  weighs more than one small biopsy; the weighting control makes each slide, case or patient count once
+                  instead, or caps how much of a group one case can carry. Either way every patch is counted — a
+                  down-weighted slide contributes all of its patches, just for less each. Patches within a patient aren't
                   independent, so the p-values come from randomising the group label in whole patients (a patient's own
                   slides swap sides; a patient present in only one group moves wholesale) and rescoring the pooled
                   difference, Benjamini–Hochberg within each clustering. The 95% intervals resample patients.

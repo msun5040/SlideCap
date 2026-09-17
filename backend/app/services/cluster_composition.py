@@ -19,10 +19,20 @@ percentage points.
 
 Alongside that, `pooled` answers the other question people ask: throw every patch
 of group A into one pile and every patch of group B into another — what share of
-each pile is each cluster? Those percentages are of all patches in the group, so a
-patient with three big resections counts three times as much as one small biopsy.
-That is the intended reading, but it also means the numbers are not a patient
-average, so `dominance` reports the largest single patient's share of each pile.
+each pile is each cluster? By default those percentages are of all patches in the
+group, so a patient with three big resections counts three times as much as one
+small biopsy. Unlike the paired path these are plain counts with no pseudocount:
+a group total of zero for a cluster is a true zero.
+
+When that is too much sway, `pool_unit` and `pool_cap_pct` rebalance the pile
+without throwing a single patch away. Every slide/case/patient becomes its own
+percentage first; the group's figure is then a weighted mean of those percentages.
+`pool_unit` picks the weight: "patch" (weight = patches, the raw pile), or "slide"
+/ "case" / "patient" (one vote each, whatever the tissue area). `pool_cap_pct`
+keeps patch weighting but caps any one case at that share of its group, scaling it
+down rather than dropping its patches — the cap is found by bisection so the
+capped cases land exactly on the limit. `dominance` reports the largest single
+contributor's share after all of that.
 
 Patches are not independent, so the pooled test is still anchored to patients: the
 label is randomised in whole patient blocks (swap that patient's A and B slides;
@@ -65,7 +75,9 @@ class CompositionInput:
     ref_share: np.ndarray          # reference share per cluster (all clusters)
     exclude_clusters: List[int] = field(default_factory=list)
     exclude_far: bool = False
-    weighting: str = "slide"      # slide | patch
+    weighting: str = "slide"      # slide | patch — how a patient's slides combine (paired view)
+    pool_unit: str = "patch"      # patch | slide | case | patient — what carries equal weight in the pooled view
+    pool_cap_pct: Optional[float] = None   # patch pooling only: no case above this share of its group
 
 
 def _bh(p: List[Optional[float]]) -> List[Optional[float]]:
@@ -116,14 +128,45 @@ def _shares(counts: np.ndarray, kk: int) -> np.ndarray:
     return c / c.sum(axis=-1, keepdims=True)
 
 
+def _cap_weights(n: np.ndarray, cap: float) -> np.ndarray:
+    """
+    Weights min(n_i, C), with C set so no unit exceeds `cap` of the total.
+
+    Nothing is discarded: an over-large case still contributes every one of its
+    patches, they just carry less weight each. C is found by bisection because
+    capping one unit lowers the total, which can push the next one over the line.
+    """
+    n = np.asarray(n, dtype=float)
+    m = n.size
+    if m == 0 or n.sum() <= 0:
+        return n
+    if cap <= 1.0 / m:                       # below an even share: even is the best we can do
+        return np.where(n > 0, 1.0, 0.0)
+    if n.max() / n.sum() <= cap + 1e-12:     # already within the cap
+        return n
+    lo, hi = 0.0, float(n.max())
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        w = np.minimum(n, mid)
+        if w.sum() <= 0 or w.max() / w.sum() > cap:
+            hi = mid
+        else:
+            lo = mid
+    return np.minimum(n, lo)
+
+
 def _pooled(inp: CompositionInput, slide_counts: Dict[str, np.ndarray],
             kept: List[int], kk: int, seed: int = 0) -> dict:
     """
-    Group totals: every patch of group A in one pile, every patch of B in another.
+    Group totals: everything in group A on one side, everything in group B on the
+    other, as a single composition per group.
 
-    Shares are of all patches in the group — the plain "what is this group made
-    of?" number. Significance is judged by randomising the group label in whole
-    patient blocks, because patches within a patient are anything but independent.
+    With the default `pool_unit="patch"` and no cap that is the plain pile of
+    patches. Otherwise each slide / case / patient becomes its own percentage and
+    the group's figure is a weighted mean of those, so no patch is dropped and no
+    single slide can run away with the group. Significance is judged by randomising
+    the group label in whole patient blocks, because patches within a patient are
+    anything but independent.
     """
     warnings: List[str] = []
     usable = [s for s in inp.slides if (s.in_a != s.in_b) and slide_counts[s.slide_hash].sum() > 0]
@@ -131,51 +174,115 @@ def _pooled(inp: CompositionInput, slide_counts: Dict[str, np.ndarray],
         return {"n_blocks": 0, "clusters": [], "warnings": ["No slides left in either group."],
                 "tested": False, "global_p": None}
 
-    # One block per patient; slides without a patient fall back to their case, then
-    # to themselves, so they still count towards the totals.
-    blocks: Dict[str, List[SlideInfo]] = {}
+    unit = inp.pool_unit if inp.pool_unit in ("patch", "slide", "case", "patient") else "patch"
+    cap = inp.pool_cap_pct / 100.0 if (unit == "patch" and inp.pool_cap_pct) else None
+
+    def block_key(s: SlideInfo) -> str:
+        # One block per patient; slides without a patient fall back to their case,
+        # then to themselves, so they still count towards the totals.
+        return s.patient or (f"case:{s.case_hash}" if s.case_hash else f"slide:{s.slide_hash}")
+
+    def unit_key(s: SlideInfo) -> str:
+        if unit == "patient":
+            return block_key(s)
+        if unit == "case" or cap is not None:
+            return f"case:{s.case_hash}" if s.case_hash else f"slide:{s.slide_hash}"
+        return f"slide:{s.slide_hash}"
+
+    keys = sorted({block_key(s) for s in usable})
+    block_of = {k: i for i, k in enumerate(keys)}
+    nb = len(keys)
+
+    # Counts per (unit, group). A unit that appears in both groups is two units:
+    # the same case before and after is two separate observations.
+    units: Dict[tuple, dict] = {}
     for s in usable:
-        key = s.patient or (f"case:{s.case_hash}" if s.case_hash else f"slide:{s.slide_hash}")
-        blocks.setdefault(key, []).append(s)
-    keys = sorted(blocks)
+        g = "a" if s.in_a else "b"
+        u = units.setdefault((unit_key(s), g), {"block": block_of[block_key(s)], "g": g,
+                                                "counts": np.zeros(kk)})
+        u["counts"] += slide_counts[s.slide_hash]
 
-    Ab = np.zeros((len(keys), kk))
-    Bb = np.zeros((len(keys), kk))
-    for i, key in enumerate(keys):
-        for s in blocks[key]:
-            (Ab if s.in_a else Bb)[i] += slide_counts[s.slide_hash]
-
-    tot_a, tot_b = Ab.sum(axis=0), Bb.sum(axis=0)
-    n_a, n_b = float(tot_a.sum()), float(tot_b.sum())
-    if n_a == 0 or n_b == 0:
-        return {"n_blocks": len(keys), "clusters": [], "tested": False, "global_p": None,
+    raw_a = float(sum(u["counts"].sum() for u in units.values() if u["g"] == "a"))
+    raw_b = float(sum(u["counts"].sum() for u in units.values() if u["g"] == "b"))
+    if raw_a == 0 or raw_b == 0:
+        return {"n_blocks": nb, "clusters": [], "tested": False, "global_p": None,
                 "warnings": ["One of the groups has no patches left."]}
 
-    share_a, share_b = _shares(tot_a, kk), _shares(tot_b, kk)
+    # Weight per unit, worked out inside its own group.
+    cap_notes: List[str] = []
+    for g in ("a", "b"):
+        sel = [u for u in units.values() if u["g"] == g]
+        n = np.array([u["counts"].sum() for u in sel])
+        if unit == "patch":
+            w = _cap_weights(n, cap) if cap is not None else n
+        else:
+            w = np.where(n > 0, 1.0, 0.0)
+        for u, wi in zip(sel, w):
+            u["w"] = float(wi)
+        if cap is not None and len(sel):
+            even = 1.0 / len(sel)
+            if cap < even - 1e-9:
+                cap_notes.append(f"a {inp.pool_cap_pct:.0f}% cap is below an even share of the {len(sel)} case(s) "
+                                 f"in group {g.upper()} ({even * 100:.0f}% each), so they simply count once each")
+            else:
+                over = sum(1 for u, raw in zip(sel, n) if u["w"] < raw - 1e-9)
+                if over:
+                    cap_notes.append(f"{over} case(s) in group {g.upper()} were over the {inp.pool_cap_pct:.0f}% cap "
+                                     f"and were scaled down")
+
+    small = [u for u in units.values() if unit != "patch" and 0 < u["counts"].sum() < 50]
+    if small:
+        warnings.append(f"{len(small)} {unit}(s) have fewer than 50 patches but count as much as the biggest; "
+                        f"their percentages are noisy.")
+    if cap_notes:
+        warnings.append("Cap: " + "; ".join(cap_notes) + ". No patches were dropped.")
+
+    # Per block: weighted composition contributions on each side, so a permutation
+    # only has to swap which side a block lands on.
+    WP = {"a": np.zeros((nb, kk)), "b": np.zeros((nb, kk))}
+    W = {"a": np.zeros(nb), "b": np.zeros(nb)}
+    RAW = {"a": np.zeros((nb, kk)), "b": np.zeros((nb, kk))}
+    for u in units.values():
+        i, g = u["block"], u["g"]
+        n = u["counts"].sum()
+        p = u["counts"] / n if n > 0 else u["counts"]   # this unit's own percentages
+        WP[g][i] += u["w"] * p
+        W[g][i] += u["w"]
+        RAW[g][i] += u["counts"]
+
+    tot_a = RAW["a"].sum(axis=0)
+    tot_b = RAW["b"].sum(axis=0)
+    share_a = WP["a"].sum(axis=0) / W["a"].sum()
+    share_b = WP["b"].sum(axis=0) / W["b"].sum()
     obs_pp = (share_b - share_a) * 100.0
 
-    both_blocks = [i for i in range(len(keys)) if Ab[i].sum() > 0 and Bb[i].sum() > 0]
-    one_sided = len(keys) - len(both_blocks)
+    both_blocks = [i for i in range(nb) if W["a"][i] > 0 and W["b"][i] > 0]
+    one_sided = nb - len(both_blocks)
     if one_sided:
-        share = float((Ab[[i for i in range(len(keys)) if i not in both_blocks]].sum() +
-                       Bb[[i for i in range(len(keys)) if i not in both_blocks]].sum()) / (n_a + n_b))
+        others = [i for i in range(nb) if i not in both_blocks]
+        share = float((RAW["a"][others].sum() + RAW["b"][others].sum()) / (raw_a + raw_b))
         warnings.append(f"{one_sided} patient(s) have slides in only one group; they are in the totals "
                         f"({share * 100:.0f}% of all patches) but say nothing about a within-patient shift.")
 
-    # How much of each pile comes from its biggest contributor.
-    dom_a = float(Ab.sum(axis=1).max() / n_a)
-    dom_b = float(Bb.sum(axis=1).max() / n_b)
-    # Only worth flagging when one patient is well above an even share — with
+    # How much of each group's figure comes from its biggest single contributor,
+    # after weighting — this is the number the cap is there to hold down.
+    def dominance(g: str) -> float:
+        w = np.array([u["w"] for u in units.values() if u["g"] == g])
+        return float(w.max() / w.sum()) if w.size and w.sum() > 0 else 0.0
+
+    dom_a, dom_b = dominance("a"), dominance("b")
+    # Only worth flagging when one contributor is well above an even share — with
     # three patients a third each is simply what even looks like.
-    dom_threshold = max(0.25, 1.5 / len(keys))
+    dom_threshold = max(0.25, 1.5 / max(1, nb))
     for lab, dom in (("A", dom_a), ("B", dom_b)):
         if dom > dom_threshold:
-            warnings.append(f"One patient contributes {dom * 100:.0f}% of the group-{lab} patches; "
-                            f"the pooled percentages lean on them.")
+            warnings.append(f"One {unit if unit != 'patch' else 'case'} carries {dom * 100:.0f}% of the group-{lab} "
+                            f"figure; the pooled percentages lean on it.")
 
-    nb = len(keys)
-    Tot = Ab + Bb
-    grand = Tot.sum(axis=0)
+    grand_wp = WP["a"] + WP["b"]
+    grand_w = W["a"] + W["b"]
+    sum_wp = grand_wp.sum(axis=0)
+    sum_w = grand_w.sum()
 
     def stats_from_sel(sel: np.ndarray) -> np.ndarray:
         """sel (m × nb) of 1 = keep the block's labels, 0 = swap them → Δ in pp.
@@ -185,9 +292,11 @@ def _pooled(inp: CompositionInput, slide_counts: Dict[str, np.ndarray],
         a cluster whose own share held steady while its neighbours moved should
         not come out "changed".
         """
-        a = sel @ Ab + (1.0 - sel) @ Bb
-        b = grand - a
-        return (_shares(b, kk) - _shares(a, kk)) * 100.0
+        wp_a = sel @ WP["a"] + (1.0 - sel) @ WP["b"]
+        w_a = sel @ W["a"] + (1.0 - sel) @ W["b"]
+        a = wp_a / np.maximum(w_a, 1e-12)[:, None]
+        b = (sum_wp - wp_a) / np.maximum(sum_w - w_a, 1e-12)[:, None]
+        return (b - a) * 100.0
 
     tested = nb >= MIN_BLOCKS_FOR_POOLED_TEST
     pvals: List[Optional[float]] = [None] * kk
@@ -218,7 +327,7 @@ def _pooled(inp: CompositionInput, slide_counts: Dict[str, np.ndarray],
             pvals = [float((h + 1) / (total + 1)) for h in hits]
             global_p = float((hits_glob + 1) / (total + 1))
 
-    # Patient-level bootstrap of the same pooled difference.
+    # Patient-level bootstrap of the same difference.
     ci_lo = np.full(kk, np.nan)
     ci_hi = np.full(kk, np.nan)
     if nb >= 2:
@@ -227,10 +336,11 @@ def _pooled(inp: CompositionInput, slide_counts: Dict[str, np.ndarray],
         for start in range(0, BOOTSTRAP_RESAMPLES, 250):
             m = min(250, BOOTSTRAP_RESAMPLES - start)
             idx = rng.integers(0, nb, size=(m, nb))
-            a = Ab[idx].sum(axis=1)
-            b = Bb[idx].sum(axis=1)
-            ok = (a.sum(axis=1) > 0) & (b.sum(axis=1) > 0)
-            d = (_shares(b, kk) - _shares(a, kk)) * 100.0
+            wa, wb = W["a"][idx].sum(axis=1), W["b"][idx].sum(axis=1)
+            ok = (wa > 0) & (wb > 0)
+            a = WP["a"][idx].sum(axis=1) / np.maximum(wa, 1e-12)[:, None]
+            b = WP["b"][idx].sum(axis=1) / np.maximum(wb, 1e-12)[:, None]
+            d = (b - a) * 100.0
             d[~ok] = np.nan
             draws[start:start + m] = d
         with np.errstate(invalid="ignore"):
@@ -244,7 +354,10 @@ def _pooled(inp: CompositionInput, slide_counts: Dict[str, np.ndarray],
             "cluster": c,
             "a_pct": float(share_a[j] * 100), "b_pct": float(share_b[j] * 100),
             "delta_pp": float(obs_pp[j]),
-            "log2_ratio": float(np.log2(share_b[j] / share_a[j])),
+            # Undefined when a cluster is empty on one side — reported as nothing
+            # rather than an infinity the UI would have to special-case anyway.
+            "log2_ratio": (float(np.log2(share_b[j] / share_a[j]))
+                           if share_a[j] > 0 and share_b[j] > 0 else None),
             "ci_lo_pp": None if not np.isfinite(ci_lo[j]) else float(ci_lo[j]),
             "ci_hi_pp": None if not np.isfinite(ci_hi[j]) else float(ci_hi[j]),
             "a_patches": int(round(tot_a[j])), "b_patches": int(round(tot_b[j])),
@@ -256,7 +369,11 @@ def _pooled(inp: CompositionInput, slide_counts: Dict[str, np.ndarray],
         "n_paired_blocks": len(both_blocks),
         "n_slides_a": sum(1 for s in usable if s.in_a),
         "n_slides_b": sum(1 for s in usable if s.in_b),
-        "n_patches_a": int(round(n_a)), "n_patches_b": int(round(n_b)),
+        "n_units_a": sum(1 for u in units.values() if u["g"] == "a"),
+        "n_units_b": sum(1 for u in units.values() if u["g"] == "b"),
+        "n_patches_a": int(round(raw_a)), "n_patches_b": int(round(raw_b)),
+        "pool_unit": unit,
+        "pool_cap_pct": inp.pool_cap_pct if cap is not None else None,
         "dominance_a": dom_a, "dominance_b": dom_b,
         "tested": tested,
         "global_p": global_p,
