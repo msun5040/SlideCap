@@ -16,6 +16,19 @@ percentage points.
     within the clustering. Below MIN_PAIRS_FOR_TEST patients only effect sizes.
   * Per clustering: a sign-flip permutation test (flipping swaps a patient's A and
     B) on Σ_j (mean CLR difference_j)² — "did the composition change at all?".
+
+Alongside that, `pooled` answers the other question people ask: throw every patch
+of group A into one pile and every patch of group B into another — what share of
+each pile is each cluster? Those percentages are of all patches in the group, so a
+patient with three big resections counts three times as much as one small biopsy.
+That is the intended reading, but it also means the numbers are not a patient
+average, so `dominance` reports the largest single patient's share of each pile.
+
+Patches are not independent, so the pooled test is still anchored to patients: the
+label is randomised in whole patient blocks (swap that patient's A and B slides;
+a patient present in only one group moves wholesale to the other), the pooled
+shares are recomputed each time, and the observed CLR difference is scored against
+that null. The 95% intervals are a patient-level bootstrap of the same statistic.
 """
 from __future__ import annotations
 
@@ -28,6 +41,8 @@ PSEUDOCOUNT = 0.5
 MIN_PAIRS_FOR_TEST = 6
 EXACT_PERMUTATION_MAX_N = 15
 RANDOM_PERMUTATIONS = 10_000
+BOOTSTRAP_RESAMPLES = 2_000
+MIN_BLOCKS_FOR_POOLED_TEST = 4
 
 
 @dataclass
@@ -93,6 +108,161 @@ def _permutation_p(D: np.ndarray, seed: int = 0) -> Optional[float]:
         stats = (((signs @ D) / n) ** 2).sum(axis=1)
         hits += int((stats >= obs - 1e-12).sum())
     return (hits + 1) / (RANDOM_PERMUTATIONS + 1)
+
+
+def _shares(counts: np.ndarray, kk: int) -> np.ndarray:
+    """Counts (…, kk) → shares, with the pseudocount that keeps CLR finite."""
+    c = counts + PSEUDOCOUNT
+    return c / c.sum(axis=-1, keepdims=True)
+
+
+def _pooled(inp: CompositionInput, slide_counts: Dict[str, np.ndarray],
+            kept: List[int], kk: int, seed: int = 0) -> dict:
+    """
+    Group totals: every patch of group A in one pile, every patch of B in another.
+
+    Shares are of all patches in the group — the plain "what is this group made
+    of?" number. Significance is judged by randomising the group label in whole
+    patient blocks, because patches within a patient are anything but independent.
+    """
+    warnings: List[str] = []
+    usable = [s for s in inp.slides if (s.in_a != s.in_b) and slide_counts[s.slide_hash].sum() > 0]
+    if not usable:
+        return {"n_blocks": 0, "clusters": [], "warnings": ["No slides left in either group."],
+                "tested": False, "global_p": None}
+
+    # One block per patient; slides without a patient fall back to their case, then
+    # to themselves, so they still count towards the totals.
+    blocks: Dict[str, List[SlideInfo]] = {}
+    for s in usable:
+        key = s.patient or (f"case:{s.case_hash}" if s.case_hash else f"slide:{s.slide_hash}")
+        blocks.setdefault(key, []).append(s)
+    keys = sorted(blocks)
+
+    Ab = np.zeros((len(keys), kk))
+    Bb = np.zeros((len(keys), kk))
+    for i, key in enumerate(keys):
+        for s in blocks[key]:
+            (Ab if s.in_a else Bb)[i] += slide_counts[s.slide_hash]
+
+    tot_a, tot_b = Ab.sum(axis=0), Bb.sum(axis=0)
+    n_a, n_b = float(tot_a.sum()), float(tot_b.sum())
+    if n_a == 0 or n_b == 0:
+        return {"n_blocks": len(keys), "clusters": [], "tested": False, "global_p": None,
+                "warnings": ["One of the groups has no patches left."]}
+
+    share_a, share_b = _shares(tot_a, kk), _shares(tot_b, kk)
+    obs_pp = (share_b - share_a) * 100.0
+
+    both_blocks = [i for i in range(len(keys)) if Ab[i].sum() > 0 and Bb[i].sum() > 0]
+    one_sided = len(keys) - len(both_blocks)
+    if one_sided:
+        share = float((Ab[[i for i in range(len(keys)) if i not in both_blocks]].sum() +
+                       Bb[[i for i in range(len(keys)) if i not in both_blocks]].sum()) / (n_a + n_b))
+        warnings.append(f"{one_sided} patient(s) have slides in only one group; they are in the totals "
+                        f"({share * 100:.0f}% of all patches) but say nothing about a within-patient shift.")
+
+    # How much of each pile comes from its biggest contributor.
+    dom_a = float(Ab.sum(axis=1).max() / n_a)
+    dom_b = float(Bb.sum(axis=1).max() / n_b)
+    # Only worth flagging when one patient is well above an even share — with
+    # three patients a third each is simply what even looks like.
+    dom_threshold = max(0.25, 1.5 / len(keys))
+    for lab, dom in (("A", dom_a), ("B", dom_b)):
+        if dom > dom_threshold:
+            warnings.append(f"One patient contributes {dom * 100:.0f}% of the group-{lab} patches; "
+                            f"the pooled percentages lean on them.")
+
+    nb = len(keys)
+    Tot = Ab + Bb
+    grand = Tot.sum(axis=0)
+
+    def stats_from_sel(sel: np.ndarray) -> np.ndarray:
+        """sel (m × nb) of 1 = keep the block's labels, 0 = swap them → Δ in pp.
+
+        The pooled test scores the same percentage-point difference the table
+        shows, not a CLR of it: a permutation test needs no particular scale, and
+        a cluster whose own share held steady while its neighbours moved should
+        not come out "changed".
+        """
+        a = sel @ Ab + (1.0 - sel) @ Bb
+        b = grand - a
+        return (_shares(b, kk) - _shares(a, kk)) * 100.0
+
+    tested = nb >= MIN_BLOCKS_FOR_POOLED_TEST
+    pvals: List[Optional[float]] = [None] * kk
+    global_p: Optional[float] = None
+    if tested:
+        obs_abs = np.abs(obs_pp)
+        obs_glob = float((obs_pp ** 2).sum())
+        hits = np.zeros(kk)
+        hits_glob = 0
+        total = 0
+        if nb <= EXACT_PERMUTATION_MAX_N:
+            sel = ((np.arange(2 ** nb)[:, None] >> np.arange(nb)[None, :]) & 1).astype(float)
+            d = stats_from_sel(sel)
+            hits = (np.abs(d) >= obs_abs - 1e-12).sum(axis=0).astype(float)
+            hits_glob = int(((d ** 2).sum(axis=1) >= obs_glob - 1e-12).sum())
+            total = sel.shape[0]
+            pvals = [float(h / total) for h in hits]
+            global_p = float(hits_glob / total)
+        else:
+            rng = np.random.default_rng(seed)
+            for start in range(0, RANDOM_PERMUTATIONS, 500):
+                m = min(500, RANDOM_PERMUTATIONS - start)
+                sel = rng.integers(0, 2, size=(m, nb)).astype(float)
+                d = stats_from_sel(sel)
+                hits += (np.abs(d) >= obs_abs - 1e-12).sum(axis=0)
+                hits_glob += int(((d ** 2).sum(axis=1) >= obs_glob - 1e-12).sum())
+                total += m
+            pvals = [float((h + 1) / (total + 1)) for h in hits]
+            global_p = float((hits_glob + 1) / (total + 1))
+
+    # Patient-level bootstrap of the same pooled difference.
+    ci_lo = np.full(kk, np.nan)
+    ci_hi = np.full(kk, np.nan)
+    if nb >= 2:
+        rng = np.random.default_rng(seed + 1)
+        draws = np.empty((BOOTSTRAP_RESAMPLES, kk))
+        for start in range(0, BOOTSTRAP_RESAMPLES, 250):
+            m = min(250, BOOTSTRAP_RESAMPLES - start)
+            idx = rng.integers(0, nb, size=(m, nb))
+            a = Ab[idx].sum(axis=1)
+            b = Bb[idx].sum(axis=1)
+            ok = (a.sum(axis=1) > 0) & (b.sum(axis=1) > 0)
+            d = (_shares(b, kk) - _shares(a, kk)) * 100.0
+            d[~ok] = np.nan
+            draws[start:start + m] = d
+        with np.errstate(invalid="ignore"):
+            ci_lo = np.nanpercentile(draws, 2.5, axis=0)
+            ci_hi = np.nanpercentile(draws, 97.5, axis=0)
+
+    qvals = _bh(pvals)
+    clusters = []
+    for j, c in enumerate(kept):
+        clusters.append({
+            "cluster": c,
+            "a_pct": float(share_a[j] * 100), "b_pct": float(share_b[j] * 100),
+            "delta_pp": float(obs_pp[j]),
+            "log2_ratio": float(np.log2(share_b[j] / share_a[j])),
+            "ci_lo_pp": None if not np.isfinite(ci_lo[j]) else float(ci_lo[j]),
+            "ci_hi_pp": None if not np.isfinite(ci_hi[j]) else float(ci_hi[j]),
+            "a_patches": int(round(tot_a[j])), "b_patches": int(round(tot_b[j])),
+            "p": pvals[j], "q": qvals[j],
+        })
+
+    return {
+        "n_blocks": nb,
+        "n_paired_blocks": len(both_blocks),
+        "n_slides_a": sum(1 for s in usable if s.in_a),
+        "n_slides_b": sum(1 for s in usable if s.in_b),
+        "n_patches_a": int(round(n_a)), "n_patches_b": int(round(n_b)),
+        "dominance_a": dom_a, "dominance_b": dom_b,
+        "tested": tested,
+        "global_p": global_p,
+        "clusters": clusters,
+        "warnings": warnings,
+    }
 
 
 def compute(inp: CompositionInput) -> dict:
@@ -209,6 +379,7 @@ def compute(inp: CompositionInput) -> dict:
 
     return {
         "n_pairs": n,
+        "pooled": _pooled(inp, slide_counts, kept, kk),
         "kept_clusters": kept,
         "weighting": inp.weighting,
         "tested": n >= MIN_PAIRS_FOR_TEST,

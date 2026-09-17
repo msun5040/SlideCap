@@ -5,12 +5,19 @@ import { saveBlob } from '@/lib/download'
 import { usePatchImage } from '@/lib/patchImages'
 
 /**
- * Patient-paired cluster composition for an overlay cohort: how the share of each
- * reference cluster shifts from group A to group B (e.g. Pre → Post) within the
- * same patients, across several clusterings at once. Statistics are computed
- * server-side (services/cluster_composition.py); this panel sets them up and
- * shows the results — heatmap across clusterings, per-patient slope chart, the
- * patches behind a cluster, and how clusters nest between clusterings.
+ * Cluster composition for an overlay cohort: how the share of each reference
+ * cluster differs between group A and group B (e.g. Pre → Post), across several
+ * clusterings at once. Two readings, switched by the Per patient / Group totals
+ * toggle:
+ *
+ *   • Per patient — each patient's own before/after change, paired.
+ *   • Group totals — every patch of a group pooled into one pile, so the
+ *     percentages are of all tiles in that group.
+ *
+ * Statistics come from services/cluster_composition.py; this panel sets them up
+ * and shows the results — heatmap across clusterings, slope chart or stacked
+ * composition bars, the patches behind a cluster, and how clusters nest between
+ * clusterings.
  */
 
 interface SchemeRow {
@@ -47,6 +54,35 @@ interface PatientRow {
   b_patches: number
 }
 
+interface PooledStat {
+  cluster: number
+  a_pct: number
+  b_pct: number
+  delta_pp: number
+  log2_ratio: number
+  ci_lo_pp: number | null
+  ci_hi_pp: number | null
+  a_patches: number
+  b_patches: number
+  p: number | null
+  q: number | null
+}
+
+interface Pooled {
+  n_blocks: number
+  n_paired_blocks?: number
+  n_slides_a?: number
+  n_slides_b?: number
+  n_patches_a?: number
+  n_patches_b?: number
+  dominance_a?: number
+  dominance_b?: number
+  tested: boolean
+  global_p: number | null
+  clusters: PooledStat[]
+  warnings: string[]
+}
+
 interface ClusteringResult {
   clustering_id: number
   label: string
@@ -57,6 +93,7 @@ interface ClusteringResult {
   kept_clusters: number[]
   global_p: number | null
   clusters: ClusterStat[]
+  pooled: Pooled
   patients: PatientRow[]
   unpaired: { patient: string; has: 'a' | 'b' }[]
   warnings: string[]
@@ -156,6 +193,49 @@ function SlopeChart({ result, clusterIdx, groupA, groupB }: {
   )
 }
 
+/** Two stacked bars — the whole of group A and the whole of group B, split by cluster. */
+function CompositionBars({ pooled, clusterColor, groupA, groupB, selected, onSelect }: {
+  pooled: Pooled
+  clusterColor: (i: number) => string
+  groupA: string
+  groupB: string
+  selected: number | null
+  onSelect: (c: number) => void
+}) {
+  const rows: { label: string; key: 'a' | 'b'; patches?: number; slides?: number }[] = [
+    { label: groupA, key: 'a', patches: pooled.n_patches_a, slides: pooled.n_slides_a },
+    { label: groupB, key: 'b', patches: pooled.n_patches_b, slides: pooled.n_slides_b },
+  ]
+  return (
+    <div className="space-y-1.5">
+      {rows.map(r => (
+        <div key={r.key} className="flex items-center gap-2">
+          <span className="w-24 shrink-0 truncate text-[11px] text-neutral-300" title={r.label}>{r.label}</span>
+          <div className="flex h-6 flex-1 overflow-hidden rounded border border-neutral-800">
+            {pooled.clusters.map(c => {
+              const pct = r.key === 'a' ? c.a_pct : c.b_pct
+              const isSel = selected === c.cluster
+              return (
+                <button key={c.cluster} onClick={() => onSelect(c.cluster)}
+                        className="h-full border-r border-neutral-950/60 last:border-r-0"
+                        style={{ width: `${pct}%`, backgroundColor: clusterColor(c.cluster),
+                                 opacity: selected == null || isSel ? 1 : 0.35,
+                                 outline: isSel ? '1px solid #fafafa' : undefined, outlineOffset: '-1px' }}
+                        title={`Cluster ${c.cluster + 1}: ${pct.toFixed(1)}% of ${r.label} `
+                               + `(${(r.key === 'a' ? c.a_patches : c.b_patches).toLocaleString()} patches)`} />
+              )
+            })}
+          </div>
+          <span className="w-28 shrink-0 text-right text-[10px] tabular-nums text-neutral-500">
+            {r.patches?.toLocaleString() ?? '—'} patches
+            {r.slides != null ? ` · ${r.slides} slides` : ''}
+          </span>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 export function CompositionPanel({ overlayId, overlayCohortId, projectionId, clusterings, clusterColor, onClose }: Props) {
   const [schemes, setSchemes] = useState<SchemeRow[]>([])
   const [schemeId, setSchemeId] = useState<number | null>(null)
@@ -163,6 +243,8 @@ export function CompositionPanel({ overlayId, overlayCohortId, projectionId, clu
   const [groupB, setGroupB] = useState<number | null>(null)
   const [restrictId, setRestrictId] = useState<number | null>(null)
   const [weighting, setWeighting] = useState<'slide' | 'patch'>('slide')
+  /** Which reading is on show: each patient's own change, or the two group piles. */
+  const [mode, setMode] = useState<'patient' | 'group'>('patient')
   const [excludeFar, setExcludeFar] = useState(false)
   const [chosen, setChosen] = useState<Set<number>>(() => new Set(clusterings.map(c => c.id)))
   const [excluded, setExcluded] = useState<Record<number, number[]>>({})
@@ -261,12 +343,16 @@ export function CompositionPanel({ overlayId, overlayCohortId, projectionId, clu
 
   const maxAbs = useMemo(() => {
     if (!results) return 1
-    return Math.max(1, ...results.flatMap(r => r.clusters.map(c => Math.abs(c.median_delta_pp ?? 0))))
-  }, [results])
+    return Math.max(1, ...results.flatMap(r => mode === 'group'
+      ? r.pooled.clusters.map(c => Math.abs(c.delta_pp))
+      : r.clusters.map(c => Math.abs(c.median_delta_pp ?? 0))))
+  }, [results, mode])
 
   const selResult = results?.find(r => r.clustering_id === sel?.clusteringId) ?? null
   const selStat = selResult?.clusters.find(c => c.cluster === sel?.cluster) ?? null
-  const warnings = useMemo(() => Array.from(new Set((results ?? []).flatMap(r => r.warnings))), [results])
+  const selPooled = selResult?.pooled.clusters.find(c => c.cluster === sel?.cluster) ?? null
+  const warnings = useMemo(() => Array.from(new Set((results ?? []).flatMap(
+    r => mode === 'group' ? [...r.warnings, ...(r.pooled.warnings ?? [])] : r.warnings))), [results, mode])
   const unpaired = results?.[0]?.unpaired ?? []
 
   const toggleExclude = (clusteringId: number, cluster: number) => {
@@ -277,7 +363,7 @@ export function CompositionPanel({ overlayId, overlayCohortId, projectionId, clu
     run(next)
   }
 
-  const exportCsv = (kind: 'patients' | 'stats') => {
+  const exportCsv = (kind: 'patients' | 'stats' | 'groups') => {
     if (!results) return
     const a = groupName(groupA), b = groupName(groupB)
     const esc = (v: unknown) => {
@@ -294,6 +380,18 @@ export function CompositionPanel({ overlayId, overlayCohortId, projectionId, clu
             rows.push([r.label, c + 1, p.patient, b, p.b_pct[j], p.b_slides, p.b_patches, weighting])
           }
         })
+      }
+    } else if (kind === 'groups') {
+      rows.push(['clustering', 'cluster', 'ref_pct', `${a}_pct_of_group`, `${b}_pct_of_group`, 'delta_pp',
+                 'ci_lo_pp', 'ci_hi_pp', 'log2_ratio', `${a}_patches`, `${b}_patches`, 'permutation_p', 'bh_q',
+                 'global_permutation_p', 'n_patients', 'excluded_far', 'restricted_to'])
+      for (const r of results) {
+        const ref = new Map(r.clusters.map(c => [c.cluster, c.ref_pct]))
+        for (const c of r.pooled.clusters) {
+          rows.push([r.label, c.cluster + 1, ref.get(c.cluster), c.a_pct, c.b_pct, c.delta_pp,
+                     c.ci_lo_pp, c.ci_hi_pp, c.log2_ratio, c.a_patches, c.b_patches, c.p, c.q,
+                     r.pooled.global_p, r.pooled.n_blocks, excludeFar, restrictId ? groupName(restrictId) : ''])
+        }
       }
     } else {
       rows.push(['clustering', 'cluster', 'ref_pct', `${a}_median_pct`, `${b}_median_pct`, 'median_delta_pp',
@@ -317,9 +415,15 @@ export function CompositionPanel({ overlayId, overlayCohortId, projectionId, clu
       <div className="flex shrink-0 items-center gap-3 border-b border-neutral-800 px-4 py-2">
         <span className="text-sm font-medium">Composition</span>
         <span className="text-[11px] text-neutral-400">
-          patient-paired shift in reference-cluster shares, {groupName(groupA)} → {groupName(groupB)}
+          {mode === 'group'
+            ? <>share of all patches in each group, {groupName(groupA)} vs {groupName(groupB)}</>
+            : <>patient-paired shift in reference-cluster shares, {groupName(groupA)} → {groupName(groupB)}</>}
         </span>
         <div className="ml-auto flex items-center gap-2">
+          <button onClick={() => exportCsv('groups')} disabled={!results}
+                  className="inline-flex items-center gap-1 rounded border border-neutral-700 px-2 py-1 text-[12px] hover:bg-neutral-800 disabled:opacity-40">
+            <Download className="h-3.5 w-3.5" /> Group CSV
+          </button>
           <button onClick={() => exportCsv('stats')} disabled={!results}
                   className="inline-flex items-center gap-1 rounded border border-neutral-700 px-2 py-1 text-[12px] hover:bg-neutral-800 disabled:opacity-40">
             <Download className="h-3.5 w-3.5" /> Stats CSV
@@ -361,7 +465,7 @@ export function CompositionPanel({ overlayId, overlayCohortId, projectionId, clu
             </select>
             <span className="mx-1 h-4 w-px bg-neutral-800" />
             <select className={selectCls} value={weighting} onChange={e => setWeighting(e.target.value as 'slide' | 'patch')}
-                    title="How a patient's slides in one group combine">
+                    title="How a patient's slides in one group combine — per-patient reading only; group totals always pool every patch">
               <option value="slide">Each slide weighted equally</option>
               <option value="patch">Pool patches</option>
             </select>
@@ -377,6 +481,17 @@ export function CompositionPanel({ overlayId, overlayCohortId, projectionId, clu
           </>
         )}
         <div className="flex w-full flex-wrap items-center gap-1.5 pt-1">
+          <div className="mr-1 inline-flex overflow-hidden rounded border border-neutral-700">
+            {([['patient', 'Per patient'], ['group', 'Group totals']] as const).map(([k, label]) => (
+              <button key={k} onClick={() => setMode(k)}
+                      title={k === 'patient'
+                        ? 'Each patient paired with themselves; the test is on patients'
+                        : 'All patches of a group pooled — percentages are of every tile in that group'}
+                      className={`px-2 py-0.5 text-[11px] ${mode === k ? 'bg-neutral-100 text-neutral-900' : 'hover:bg-neutral-800'}`}>
+                {label}
+              </button>
+            ))}
+          </div>
           <span className="text-[11px] text-neutral-400">Clusterings</span>
           {clusterings.map(c => (
             <label key={c.id} className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 ${chosen.has(c.id) ? 'border-neutral-500 bg-neutral-800' : 'border-neutral-800 text-neutral-500'}`}>
@@ -398,17 +513,18 @@ export function CompositionPanel({ overlayId, overlayCohortId, projectionId, clu
         {error && <div className="mb-3 rounded border border-red-900 bg-red-950/40 p-2 text-red-300">{error}</div>}
         {!results && !running && !error && (
           <p className="text-neutral-400">
-            Choose the two groups to compare and the clusterings to test, then Run. Each patient needs slides in both
-            groups; the test is on patients, not patches.
+            Choose the two groups to compare and the clusterings to test, then Run. You get both readings: per patient
+            (each patient paired with themselves — they need slides in both groups) and group totals (every patch of a
+            group pooled, so percentages are of all tiles in that group).
           </p>
         )}
 
         {results && (
           <div className="space-y-4">
-            {(warnings.length > 0 || unpaired.length > 0) && (
+            {(warnings.length > 0 || (mode === 'patient' && unpaired.length > 0)) && (
               <div className="rounded border border-amber-900/60 bg-amber-950/30 p-2 text-[11px] text-amber-300">
                 {warnings.map(w => <div key={w}>• {w}</div>)}
-                {unpaired.length > 0 && (
+                {mode === 'patient' && unpaired.length > 0 && (
                   <div>• {unpaired.length} patient(s) only have slides in one group and aren't in the paired test
                     ({unpaired.slice(0, 8).map(u => u.patient).join(', ')}{unpaired.length > 8 ? '…' : ''}).</div>
                 )}
@@ -418,7 +534,9 @@ export function CompositionPanel({ overlayId, overlayCohortId, projectionId, clu
             {/* Heatmap across clusterings */}
             <div>
               <div className="mb-1.5 flex items-baseline gap-2">
-                <span className="font-medium">Median change per cluster</span>
+                <span className="font-medium">
+                  {mode === 'group' ? 'Change in group share per cluster' : 'Median change per cluster'}
+                </span>
                 <span className="text-[11px] text-neutral-500">
                   percentage points, {groupName(groupA)} → {groupName(groupB)} · ● BH q &lt; 0.05 · click a cell for detail ·
                   cluster numbers aren't comparable between clusterings
@@ -430,27 +548,36 @@ export function CompositionPanel({ overlayId, overlayCohortId, projectionId, clu
                     <div className="w-40 shrink-0">
                       <div className="font-medium">{r.label}</div>
                       <div className="text-[10px] text-neutral-500">
-                        {r.n_pairs} pairs · global p {fmtP(r.global_p)} · agreement {(r.agreement * 100).toFixed(1)}%
+                        {mode === 'group'
+                          ? <>{r.pooled.n_blocks} patients · global p {fmtP(r.pooled.global_p)}</>
+                          : <>{r.n_pairs} pairs · global p {fmtP(r.global_p)}</>}
+                        {' · '}agreement {(r.agreement * 100).toFixed(1)}%
                       </div>
                     </div>
                     <div className="flex flex-wrap gap-1">
                       {Array.from({ length: r.n_clusters }, (_, c) => {
                         const st = r.clusters.find(x => x.cluster === c)
+                        const pl = r.pooled.clusters.find(x => x.cluster === c)
+                        const shown = mode === 'group' ? pl : st
+                        const delta = mode === 'group' ? pl?.delta_pp : st?.median_delta_pp
+                        const q = mode === 'group' ? pl?.q : st?.q
                         const isSel = sel?.clusteringId === r.clustering_id && sel.cluster === c
-                        const sig = st?.q != null && st.q < 0.05
+                        const sig = q != null && q < 0.05
                         return (
                           <button key={c}
                                   onClick={() => setSel({ clusteringId: r.clustering_id, cluster: c })}
                                   className={`relative flex h-11 w-12 flex-col items-center justify-center rounded border text-[10px] ${isSel ? 'border-white' : 'border-neutral-800'}`}
-                                  style={{ backgroundColor: st ? deltaColor(st.median_delta_pp, maxAbs) : 'transparent',
-                                           backgroundImage: st ? undefined : 'repeating-linear-gradient(45deg,#27272a 0 4px,transparent 4px 8px)' }}
-                                  title={st
-                                    ? `Cluster ${c + 1}: ${st.median_delta_pp?.toFixed(1)} pp (${st.n_up}↑ ${st.n_down}↓), p ${fmtP(st.p)}, q ${fmtP(st.q)}`
-                                    : `Cluster ${c + 1}: excluded`}>
+                                  style={{ backgroundColor: shown ? deltaColor(delta, maxAbs) : 'transparent',
+                                           backgroundImage: shown ? undefined : 'repeating-linear-gradient(45deg,#27272a 0 4px,transparent 4px 8px)' }}
+                                  title={!shown ? `Cluster ${c + 1}: excluded`
+                                    : mode === 'group' && pl
+                                      ? `Cluster ${c + 1}: ${pl.a_pct.toFixed(1)}% → ${pl.b_pct.toFixed(1)}% of all patches `
+                                        + `(${pl.delta_pp > 0 ? '+' : ''}${pl.delta_pp.toFixed(1)} pp), p ${fmtP(pl.p)}, q ${fmtP(pl.q)}`
+                                      : `Cluster ${c + 1}: ${st?.median_delta_pp?.toFixed(1)} pp (${st?.n_up}↑ ${st?.n_down}↓), p ${fmtP(st?.p)}, q ${fmtP(st?.q)}`}>
                             <span className="absolute left-1 top-1 h-1.5 w-1.5 rounded-full" style={{ backgroundColor: clusterColor(c) }} />
                             <span className="font-medium">{c + 1}{sig ? ' ●' : ''}</span>
                             <span className="tabular-nums">
-                              {st?.median_delta_pp != null ? `${st.median_delta_pp > 0 ? '+' : ''}${st.median_delta_pp.toFixed(1)}` : '—'}
+                              {delta != null ? `${delta > 0 ? '+' : ''}${delta.toFixed(1)}` : '—'}
                             </span>
                           </button>
                         )
@@ -467,7 +594,17 @@ export function CompositionPanel({ overlayId, overlayCohortId, projectionId, clu
                 <div className="mb-2 flex flex-wrap items-center gap-2">
                   <span className="h-3 w-3 rounded-[2px]" style={{ backgroundColor: clusterColor(sel.cluster) }} />
                   <span className="text-[13px] font-medium">{selResult.label} · cluster {sel.cluster + 1}</span>
-                  {selStat && (
+                  {mode === 'group' ? selPooled && (
+                    <span className="text-[11px] text-neutral-400">
+                      reference {selStat?.ref_pct.toFixed(1)}% · {groupName(groupA)} {selPooled.a_pct.toFixed(1)}%
+                      ({selPooled.a_patches.toLocaleString()} patches) · {groupName(groupB)} {selPooled.b_pct.toFixed(1)}%
+                      ({selPooled.b_patches.toLocaleString()} patches) · Δ {selPooled.delta_pp > 0 ? '+' : ''}
+                      {selPooled.delta_pp.toFixed(1)} pp
+                      {selPooled.ci_lo_pp != null && selPooled.ci_hi_pp != null &&
+                        ` (95% CI ${selPooled.ci_lo_pp.toFixed(1)} to ${selPooled.ci_hi_pp.toFixed(1)})`}
+                      {' '}· ×{Math.pow(2, selPooled.log2_ratio).toFixed(2)} · p {fmtP(selPooled.p)} · q {fmtP(selPooled.q)}
+                    </span>
+                  ) : selStat && (
                     <span className="text-[11px] text-neutral-400">
                       reference {selStat.ref_pct.toFixed(1)}% · {groupName(groupA)} median {selStat.a_median_pct?.toFixed(1)}%
                       · {groupName(groupB)} median {selStat.b_median_pct?.toFixed(1)}%
@@ -481,14 +618,75 @@ export function CompositionPanel({ overlayId, overlayCohortId, projectionId, clu
                     {(excluded[selResult.clustering_id] ?? []).includes(sel.cluster) ? 'Include cluster again' : 'Exclude cluster & re-run'}
                   </button>
                 </div>
-                {!selResult.tested && (
+                {mode === 'group' ? !selResult.pooled.tested && (
+                  <p className="mb-2 text-[11px] text-amber-400">
+                    Fewer than 4 patients in the two groups — percentages only, no test.
+                  </p>
+                ) : !selResult.tested && (
                   <p className="mb-2 text-[11px] text-amber-400">
                     Fewer than 6 paired patients — effect sizes only, no tests.
                   </p>
                 )}
-                <div className="grid gap-4 lg:grid-cols-[340px_1fr]">
-                  <SlopeChart result={selResult} clusterIdx={sel.cluster}
-                              groupA={groupName(groupA)} groupB={groupName(groupB)} />
+                {mode === 'group' && (
+                  <div className="mb-3 space-y-2">
+                    <CompositionBars pooled={selResult.pooled} clusterColor={clusterColor}
+                                     groupA={groupName(groupA)} groupB={groupName(groupB)}
+                                     selected={sel.cluster}
+                                     onSelect={c => setSel({ clusteringId: selResult.clustering_id, cluster: c })} />
+                    <div className="overflow-auto">
+                      <table className="w-full border-collapse text-[11px] tabular-nums">
+                        <thead className="text-neutral-500">
+                          <tr className="border-b border-neutral-800 text-left">
+                            <th className="py-1 pr-2 font-normal">Cluster</th>
+                            <th className="py-1 pr-2 font-normal">Reference</th>
+                            <th className="py-1 pr-2 font-normal">{groupName(groupA)}</th>
+                            <th className="py-1 pr-2 font-normal">{groupName(groupB)}</th>
+                            <th className="py-1 pr-2 font-normal">Δ pp</th>
+                            <th className="py-1 pr-2 font-normal">95% CI</th>
+                            <th className="py-1 pr-2 font-normal">Fold</th>
+                            <th className="py-1 pr-2 font-normal">p</th>
+                            <th className="py-1 pr-2 font-normal">q</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {selResult.pooled.clusters.map(c => {
+                            const ref = selResult.clusters.find(x => x.cluster === c.cluster)?.ref_pct
+                            const isSel = c.cluster === sel.cluster
+                            return (
+                              <tr key={c.cluster}
+                                  onClick={() => setSel({ clusteringId: selResult.clustering_id, cluster: c.cluster })}
+                                  className={`cursor-pointer border-b border-neutral-900 ${isSel ? 'bg-neutral-800/60' : 'hover:bg-neutral-900'}`}>
+                                <td className="py-1 pr-2">
+                                  <span className="mr-1 inline-block h-2 w-2 rounded-[2px] align-middle"
+                                        style={{ backgroundColor: clusterColor(c.cluster) }} />
+                                  {c.cluster + 1}
+                                </td>
+                                <td className="py-1 pr-2 text-neutral-500">{ref?.toFixed(1)}%</td>
+                                <td className="py-1 pr-2">{c.a_pct.toFixed(1)}%</td>
+                                <td className="py-1 pr-2">{c.b_pct.toFixed(1)}%</td>
+                                <td className="py-1 pr-2" style={{ color: c.delta_pp > 0 ? '#f87171' : '#60a5fa' }}>
+                                  {c.delta_pp > 0 ? '+' : ''}{c.delta_pp.toFixed(1)}
+                                </td>
+                                <td className="py-1 pr-2 text-neutral-500">
+                                  {c.ci_lo_pp != null && c.ci_hi_pp != null
+                                    ? `${c.ci_lo_pp.toFixed(1)} … ${c.ci_hi_pp.toFixed(1)}` : '—'}
+                                </td>
+                                <td className="py-1 pr-2 text-neutral-400">×{Math.pow(2, c.log2_ratio).toFixed(2)}</td>
+                                <td className="py-1 pr-2">{fmtP(c.p)}</td>
+                                <td className="py-1 pr-2">{c.q != null && c.q < 0.05 ? <b>{fmtP(c.q)}</b> : fmtP(c.q)}</td>
+                              </tr>
+                            )
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
+                <div className={`grid gap-4 ${mode === 'group' ? '' : 'lg:grid-cols-[340px_1fr]'}`}>
+                  {mode === 'patient' && (
+                    <SlopeChart result={selResult} clusterIdx={sel.cluster}
+                                groupA={groupName(groupA)} groupB={groupName(groupB)} />
+                  )}
                   <div className="space-y-2">
                     {tilesLoading && <div className="flex items-center gap-2 text-neutral-500"><Loader2 className="h-3 w-3 animate-spin" /> Loading patches…</div>}
                     {tiles && ([['a', groupName(groupA)], ['b', groupName(groupB)], ['ref', 'Reference cohort']] as const).map(([k, label]) => (
@@ -555,10 +753,23 @@ export function CompositionPanel({ overlayId, overlayCohortId, projectionId, clu
             )}
 
             <p className="text-[10px] text-neutral-500">
-              Shares per slide use a 0.5-patch pseudocount; tests use centred log-ratios (Wilcoxon signed-rank on patient
-              differences, Benjamini–Hochberg within each clustering; global test = within-patient sign-flip permutation).
-              With few patients treat results as hypotheses. Assignments are nearest reference centroid in PCA space and
-              don't depend on positions in the map.
+              {mode === 'group' ? (
+                <>
+                  Group totals pool every patch in the group, so a patient with several large resections weighs more than
+                  one small biopsy — the per-patient view is the counterweight. Patches within a patient aren't
+                  independent, so the p-values come from randomising the group label in whole patients (a patient's own
+                  slides swap sides; a patient present in only one group moves wholesale) and rescoring the pooled
+                  difference, Benjamini–Hochberg within each clustering. The 95% intervals resample patients.
+                </>
+              ) : (
+                <>
+                  Shares per slide use a 0.5-patch pseudocount; tests use centred log-ratios (Wilcoxon signed-rank on
+                  patient differences, Benjamini–Hochberg within each clustering; global test = within-patient sign-flip
+                  permutation).
+                </>
+              )}
+              {' '}With few patients treat results as hypotheses. Assignments are nearest reference centroid in PCA space
+              and don't depend on positions in the map.
             </p>
           </div>
         )}
