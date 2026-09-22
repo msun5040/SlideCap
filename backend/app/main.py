@@ -6191,6 +6191,33 @@ def get_projection_clustering_labels(clustering_id: int, db: Session = Depends(g
                         headers={"Cache-Control": "private, max-age=86400"})
 
 
+@app.get("/clusterings/{clustering_id}/tiles")
+def clustering_tiles(clustering_id: int, cluster: int, n: int = Query(10, ge=1, le=100),
+                     db: Session = Depends(get_db)):
+    """
+    Representative patches of one cluster of this clustering: those nearest the cluster
+    centroid, spread across the projection's slides. Feeds the workspace's cluster gallery.
+    """
+    from .services import projection_overlay as po
+    cl = db.query(ProjectionClustering).filter_by(id=clustering_id).first()
+    if not cl:
+        raise HTTPException(status_code=404, detail="Clustering not found")
+    if cl.status != "completed" or not cl.labels_path:
+        raise HTTPException(status_code=409, detail=f"Clustering is {cl.status}; tiles need a completed run.")
+    if not 0 <= cluster < (cl.n_clusters or 0):
+        raise HTTPException(status_code=400, detail="No such cluster.")
+    pr = cl.projection
+    if not pr.reduced_path or not (settings.local_data_path / pr.reduced_path).exists():
+        raise HTTPException(status_code=409,
+                            detail="This projection has no reduced matrix, so distance to the cluster "
+                                   "centre can't be computed. Run a clustering on it to rebuild one.")
+    cent = _clustering_centroids(pr, cl)
+    art = po.read_artifact(settings.local_data_path / pr.artifact_path)
+    labels = np.fromfile(settings.local_data_path / cl.labels_path, dtype="<i2")
+    reduced = po.open_reduced(settings.local_data_path / pr.reduced_path, pr.point_count, pr.reduced_dim)
+    return {"tiles": _representative_tiles(art, labels, reduced, cent["centroids"][cluster], cluster, n)}
+
+
 @app.delete("/clusterings/{clustering_id}")
 def delete_projection_clustering(clustering_id: int, db: Session = Depends(get_db)):
     cl = db.query(ProjectionClustering).filter_by(id=clustering_id).first()
@@ -6778,6 +6805,47 @@ def overlay_composition_export(overlay_id: int, data: OverlayExportRequest, db: 
                     headers={"Content-Disposition": f'attachment; filename="composition-per-{data.level}.csv"'})
 
 
+def _representative_tiles(art, labels, reduced, centroid, cluster: int, n: int,
+                          allowed: Optional[set] = None) -> list:
+    """
+    The n patches of `cluster` nearest its centroid, spread across slides.
+
+    Nearest-first would often return n patches of one slide; each slide is capped at
+    ceil(n / slides available) so a cluster's tiles show how it looks across the cohort.
+    `allowed` restricts to a set of slide hashes (a group of an overlay cohort).
+    """
+    slides = art.header["slides"]
+    cand = np.flatnonzero(labels == cluster)
+    if allowed is not None:
+        ok = np.array([slides[i]["slide_hash"] in allowed for i in range(len(slides))], dtype=bool)
+        cand = cand[ok[np.asarray(art.slide_idx)[cand]]]
+    if cand.size == 0:
+        return []
+    dist = np.empty(cand.size, dtype=np.float32)
+    for s in range(0, cand.size, 65536):
+        sel = cand[s:s + 65536]
+        dist[s:s + 65536] = np.linalg.norm(np.asarray(reduced[sel], dtype=np.float32) - centroid, axis=1)
+    order = cand[np.argsort(dist)]
+    dist_sorted = np.sort(dist)
+    sidx = np.asarray(art.slide_idx)[order]
+    n_slides = len(np.unique(sidx))
+    cap = max(1, int(np.ceil(n / max(1, min(n_slides, n)))))
+    taken: dict = {}
+    tiles = []
+    for i, row in enumerate(order):
+        si = int(sidx[i])
+        if taken.get(si, 0) >= cap:
+            continue
+        taken[si] = taken.get(si, 0) + 1
+        sl = slides[si]
+        tiles.append({"slide_hash": sl["slide_hash"], "display_name": sl.get("display_name"),
+                      "x": int(art.patch_x[row]), "y": int(art.patch_y[row]),
+                      "size": int(sl.get("patch_size") or 256), "dist": float(dist_sorted[i])})
+        if len(tiles) >= n:
+            break
+    return tiles
+
+
 @app.get("/overlays/{overlay_id}/tiles")
 def overlay_tiles(overlay_id: int, clustering_id: int, cluster: int, group_id: Optional[int] = None,
                   source: str = "overlay", n: int = Query(24, ge=1, le=100), db: Session = Depends(get_db)):
@@ -6809,37 +6877,8 @@ def overlay_tiles(overlay_id: int, clustering_id: int, cluster: int, group_id: O
     else:
         raise HTTPException(status_code=400, detail="source must be 'overlay' or 'reference'.")
 
-    slides = art.header["slides"]
-    cand = np.flatnonzero(labels == cluster)
-    if allowed is not None:
-        ok = np.array([slides[i]["slide_hash"] in allowed for i in range(len(slides))], dtype=bool)
-        cand = cand[ok[np.asarray(art.slide_idx)[cand]]]
-    if cand.size == 0:
-        return {"tiles": []}
-    C = cent["centroids"][cluster]
-    dist = np.empty(cand.size, dtype=np.float32)
-    for s in range(0, cand.size, 65536):
-        sel = cand[s:s + 65536]
-        dist[s:s + 65536] = np.linalg.norm(np.asarray(reduced[sel], dtype=np.float32) - C, axis=1)
-    order = cand[np.argsort(dist)]
-    dist_sorted = np.sort(dist)
-    sidx = np.asarray(art.slide_idx)[order]
-    n_slides = len(np.unique(sidx))
-    cap = max(1, int(np.ceil(n / max(1, min(n_slides, n)))))
-    taken: dict = {}
-    tiles = []
-    for i, row in enumerate(order):
-        si = int(sidx[i])
-        if taken.get(si, 0) >= cap:
-            continue
-        taken[si] = taken.get(si, 0) + 1
-        sl = slides[si]
-        tiles.append({"slide_hash": sl["slide_hash"], "display_name": sl.get("display_name"),
-                      "x": int(art.patch_x[row]), "y": int(art.patch_y[row]),
-                      "size": int(sl.get("patch_size") or 256), "dist": float(dist_sorted[i])})
-        if len(tiles) >= n:
-            break
-    return {"tiles": tiles}
+    return {"tiles": _representative_tiles(art, labels, reduced, cent["centroids"][cluster],
+                                           cluster, n, allowed)}
 
 
 @app.get("/projections/{projection_id}/crosswalk")

@@ -5,6 +5,7 @@ import { SlideViewerOSD } from '@/components/SlideViewerOSD'
 import { CohortScatter, type PointSet, type ScatterColors } from '@/components/CohortScatter'
 import type { PatchMask } from '@/components/PatchClusterOverlay'
 import { CompositionPanel } from '@/components/CompositionPanel'
+import { ClusterGallery } from '@/components/ClusterGallery'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { parseProjection, pointAtSlideXY, pointPatch, type ProjectionData } from '@/lib/projection'
 import { usePatchImage } from '@/lib/patchImages'
@@ -191,6 +192,7 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
   const [overlayStarting, setOverlayStarting] = useState(false)
   const [overlayRunError, setOverlayRunError] = useState('')
   const [compositionOpen, setCompositionOpen] = useState(false)
+  const [galleryOpen, setGalleryOpen] = useState(false)
 
   const [selectedIdx, setSelectedIdx] = useState<number | null>(null)
   const [selectedSet, setSelectedSet] = useState<PointSet>('base')
@@ -698,9 +700,11 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
   // work: React commits the close before this window listener runs.
   const patchOpenRef = useRef(false)
   const compositionOpenRef = useRef(false)
+  const galleryOpenRef = useRef(false)
   const escConsumedAt = useRef(0)
   useEffect(() => { patchOpenRef.current = patchOpen }, [patchOpen])
   useEffect(() => { compositionOpenRef.current = compositionOpen }, [compositionOpen])
+  useEffect(() => { galleryOpenRef.current = galleryOpen }, [galleryOpen])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -710,6 +714,10 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
         patchOpenRef.current = false
         escConsumedAt.current = Date.now()
         setPatchOpen(false)
+      } else if (galleryOpenRef.current) {
+        galleryOpenRef.current = false
+        escConsumedAt.current = Date.now()
+        setGalleryOpen(false)
       } else if (compositionOpenRef.current) {
         compositionOpenRef.current = false
         escConsumedAt.current = Date.now()
@@ -727,7 +735,7 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
    *  viewer's own Escape listener can run before ours, so check what's open
    *  directly as well as whether we just consumed the press. */
   const viewerClose = useCallback(() => {
-    if (patchOpenRef.current || compositionOpenRef.current) return
+    if (patchOpenRef.current || compositionOpenRef.current || galleryOpenRef.current) return
     if (Date.now() - escConsumedAt.current > 100) onClose()
   }, [onClose])
 
@@ -1083,6 +1091,13 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
         )}
         {overlayError && <span className="text-[11px] text-red-400">{overlayError}</span>}
 
+        <button onClick={() => setGalleryOpen(true)}
+                disabled={!activeClustering || activeClustering.algorithm !== 'kmeans' || !activeClustering.n_clusters}
+                className="inline-flex items-center gap-1.5 rounded border border-neutral-700 px-2 py-1 hover:bg-neutral-800 disabled:opacity-40"
+                title={activeClustering ? 'Representative patches of every cluster'
+                                        : 'Pick a clustering under “Colour by” first'}>
+          <SquareStack className="h-3.5 w-3.5" /> Cluster patches
+        </button>
         {activeClustering && (
           <span className="text-[11px] text-neutral-400">
             {activeClustering.silhouette != null && `silhouette ${activeClustering.silhouette.toFixed(2)}`}
@@ -1301,6 +1316,24 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
           )}
         </div>
       </div>
+
+      {galleryOpen && activeClustering && (
+        <ClusterGallery key={activeClustering.id}
+          clusteringId={activeClustering.id}
+          title={clusteringLabel(activeClustering)}
+          nClusters={activeClustering.n_clusters ?? 0}
+          clusterColor={clusterColor}
+          onClose={() => setGalleryOpen(false)}
+          onPick={t => {
+            // Jump the workspace to that patch: find its slide, then the point at the patch centre.
+            if (!data) return
+            const si = data.header.slides.findIndex(s => s.slide_hash === t.slide_hash)
+            if (si < 0) return
+            const idx = pointAtSlideXY(data, si, t.x + t.size / 2, t.y + t.size / 2)
+            if (idx >= 0) { setGalleryOpen(false); selectPoint(idx) }
+          }}
+        />
+      )}
 
       {compositionOpen && activeOverlay && (
         <CompositionPanel key={activeOverlay.id}
