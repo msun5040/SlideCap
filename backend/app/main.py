@@ -770,6 +770,7 @@ def search_slides(
     year: Optional[int] = Query(None, description="Filter by year"),
     stain: Optional[str] = Query(None, description="Filter by stain type: HE (exact), IHC (prefix match), Special (not HE or IHC)"),
     tag: Optional[str] = Query(None, description="Filter by tag name"),
+    untagged: bool = Query(False, description="Only slides with no tags at all (on the slide or its case); overrides `tag`"),
     external: str = Query("exclude", description="exclude | include | only — whether to include external (non-clinical) slides"),
     scanner: Optional[str] = Query(None, description="Filter by scanner id (e.g. SS12340, 'Grundium Ocus'); 'unknown' = header not read yet"),
     exclude_scanner: Optional[str] = Query(None, description="Drop slides from this scanner; slides whose header was never read are kept"),
@@ -799,12 +800,13 @@ def search_slides(
         limit=limit,
         scanner=scanner,
         exclude_scanner=exclude_scanner,
+        untagged=untagged,
     )
 
     # External (non-clinical) slides come from the DB (no parseable filename).
     if external in ("include", "only") and len(results) < limit:
         results = results + _search_external_slides(
-            db, q, year, stain, tag, limit - len(results)
+            db, q, year, stain, tag, limit - len(results), untagged
         )
 
     # Enrich results with request sheet info
@@ -831,7 +833,7 @@ def search_slides(
 
     return {
         "query": q,
-        "filters": {"year": year, "stain": stain, "tag": tag},
+        "filters": {"year": year, "stain": stain, "tag": tag, "untagged": untagged},
         "count": len(results),
         "truncated": len(results) == limit,
         "results": results
@@ -865,7 +867,7 @@ def _external_slide_to_result(s: Slide) -> dict:
     }
 
 
-def _search_external_slides(db, q, year, stain, tag, limit):
+def _search_external_slides(db, q, year, stain, tag, limit, untagged=False):
     """Query external (non-clinical) slides matching the filters."""
     if limit <= 0:
         return []
@@ -892,7 +894,10 @@ def _search_external_slides(db, q, year, stain, tag, limit):
             query = query.filter(Slide.stain_type.ilike("ihc%"))
         elif sl != "special":
             query = query.filter(func.lower(Slide.stain_type) == sl)
-    if tag:
+    if untagged:
+        # Same meaning as the clinical path: no tag on the slide and none on its case.
+        query = query.filter(~Slide.tags.any()).filter(~Slide.case.has(Case.tags.any()))
+    elif tag:
         query = query.filter(Slide.tags.any(func.lower(Tag.name) == tag.lower()))
 
     rows = query.limit(limit).all()
@@ -4618,7 +4623,8 @@ def create_cohort_from_filter(
     query: Optional[str] = None,
     year: Optional[int] = None,
     stain: Optional[str] = None,
-    tag: Optional[str] = None
+    tag: Optional[str] = None,
+    untagged: bool = False
 ):
     """Create a cohort from slides matching filter criteria."""
     # Use the search function to find matching slides
@@ -4628,6 +4634,7 @@ def create_cohort_from_filter(
         year=year,
         stain_type=stain,
         tags=[tag] if tag else None,
+        untagged=untagged,
         limit=10000  # Higher limit for cohort building
     )
 
@@ -4648,7 +4655,8 @@ def create_cohort_from_filter(
                 "query": query,
                 "year": year,
                 "stain": stain,
-                "tag": tag
+                "tag": tag,
+                "untagged": untagged
             }),
             created_by=created_by
         )

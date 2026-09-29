@@ -129,7 +129,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
   const [searchTerm, setSearchTerm] = useState('')
   const [yearFilter, setYearFilter] = useState<string>('all')
   const [stainFilter, setStainFilter] = useState<string>('all')
-  const [tagFilter, setTagFilter] = useState<string>('all')
+  const [tagFilter, setTagFilter] = useState<string>('all')  // 'all' | '__untagged__' | tag name
   const [analysisFilter, setAnalysisFilter] = useState<string>('all')
   const { stainTypes } = useStainTypes()
   const [availableAnalyses, setAvailableAnalyses] = useState<string[]>([])
@@ -796,7 +796,8 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
       if (searchTerm.trim()) params.append('q', normalizeAccession(searchTerm))
       if (yearFilter !== 'all') params.append('year', yearFilter)
       if (stainFilter !== 'all') params.append('stain', stainFilter)
-      if (tagFilter !== 'all') params.append('tag', tagFilter)
+      if (tagFilter === '__untagged__') params.append('untagged', 'true')
+      else if (tagFilter !== 'all') params.append('tag', tagFilter)
       params.append('external', externalFilter)
       const res = await fetch(`${getApiBase()}/search?${params}`)
       if (res.ok) {
@@ -2392,6 +2393,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                     </SelectTrigger>
                     <SelectContent>
                       <SelectItem value="all">All Tags</SelectItem>
+                      <SelectItem value="__untagged__">No tags</SelectItem>
                       {availableTags.filter(t => (t.slide_count ?? 0) > 0).map(tag => (
                         <SelectItem key={tag.id} value={tag.name}>
                           <div className="flex items-center gap-2">

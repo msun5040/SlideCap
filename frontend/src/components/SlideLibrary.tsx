@@ -68,7 +68,7 @@ export function SlideLibrary() {
   const [stainFilter, setStainFilter] = useState<string>('all')
   const [yearFilter, setYearFilter] = useState<string>('all')
   const [statusFilter, setStatusFilter] = useState<string>('all')
-  const [tagFilter, setTagFilter] = useState<string>('all')
+  const [tagFilter, setTagFilter] = useState<string>('all')  // 'all' | '__untagged__' | tag name
   const [availableTags, setAvailableTags] = useState<Tag[]>([])
   const [selectedSlide, setSelectedSlide] = useState<Slide | null>(null)
   const [isTagDialogOpen, setIsTagDialogOpen] = useState(false)
@@ -306,7 +306,8 @@ export function SlideLibrary() {
         if (raw) params.append('q', normalizeAccession(raw))
         if (yearFilter !== 'all') params.append('year', yearFilter)
         if (stainFilter !== 'all') params.append('stain', stainFilter)
-        if (tagFilter !== 'all') params.append('tag', tagFilter)
+        if (tagFilter === '__untagged__') params.append('untagged', 'true')
+        else if (tagFilter !== 'all') params.append('tag', tagFilter)
         params.append('external', externalFilter)
         applyScannerParams(params, scannerFilter)
 
@@ -326,7 +327,8 @@ export function SlideLibrary() {
           params.append('q', normalizeAccession(q))
           if (yearFilter !== 'all') params.append('year', yearFilter)
           if (stainFilter !== 'all') params.append('stain', stainFilter)
-          if (tagFilter !== 'all') params.append('tag', tagFilter)
+          if (tagFilter === '__untagged__') params.append('untagged', 'true')
+          else if (tagFilter !== 'all') params.append('tag', tagFilter)
           params.append('external', externalFilter)
           applyScannerParams(params, scannerFilter)
 
@@ -996,6 +998,7 @@ export function SlideLibrary() {
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="all">All Tags</SelectItem>
+              <SelectItem value="__untagged__">No tags</SelectItem>
               {availableTags.map((tag) => (
                 <SelectItem key={tag.id} value={tag.name}>
                   <div className="flex items-center gap-2">

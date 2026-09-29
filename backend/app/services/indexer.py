@@ -531,6 +531,7 @@ class SlideIndexer:
         limit: int = 100,
         scanner: Optional[str] = None,
         exclude_scanner: Optional[str] = None,
+        untagged: bool = False,
     ) -> Optional[list[dict]]:
         """
         Search by SlideCap ID (SL, CS, or PT prefix).
@@ -554,7 +555,7 @@ class SlideIndexer:
             ).limit(limit).all()
             if not slides:
                 return None
-            return [self._slide_to_result(s) for s in slides if self._slide_passes_filters(s, year, stain_type, tags, scanner, exclude_scanner)]
+            return [self._slide_to_result(s) for s in slides if self._slide_passes_filters(s, year, stain_type, tags, scanner, exclude_scanner, untagged)]
 
         elif prefix == "CS":
             # Find all slides belonging to matching cases
@@ -573,7 +574,7 @@ class SlideIndexer:
             ).filter(
                 Slide.case_id.in_(case_ids)
             ).limit(limit).all()
-            return [self._slide_to_result(s) for s in slides if self._slide_passes_filters(s, year, stain_type, tags, scanner, exclude_scanner)]
+            return [self._slide_to_result(s) for s in slides if self._slide_passes_filters(s, year, stain_type, tags, scanner, exclude_scanner, untagged)]
 
         elif prefix == "PT":
             # Find all slides belonging to matching patients
@@ -596,7 +597,7 @@ class SlideIndexer:
             ).filter(
                 Slide.case_id.in_(case_ids)
             ).limit(limit).all()
-            return [self._slide_to_result(s) for s in slides if self._slide_passes_filters(s, year, stain_type, tags, scanner, exclude_scanner)]
+            return [self._slide_to_result(s) for s in slides if self._slide_passes_filters(s, year, stain_type, tags, scanner, exclude_scanner, untagged)]
 
         elif prefix == "JB":
             # Find all slides that were part of matching jobs
@@ -621,7 +622,7 @@ class SlideIndexer:
             ).filter(
                 Slide.id.in_(slide_ids)
             ).limit(limit).all()
-            return [self._slide_to_result(s) for s in slides if self._slide_passes_filters(s, year, stain_type, tags, scanner, exclude_scanner)]
+            return [self._slide_to_result(s) for s in slides if self._slide_passes_filters(s, year, stain_type, tags, scanner, exclude_scanner, untagged)]
 
         return None
 
@@ -661,8 +662,12 @@ class SlideIndexer:
         self, slide: Slide,
         year: Optional[int], stain_type: Optional[str], tags: Optional[list[str]],
         scanner: Optional[str] = None, exclude_scanner: Optional[str] = None,
+        untagged: bool = False,
     ) -> bool:
         """Check if a slide passes year/stain/tag/scanner filters."""
+        if untagged:
+            if slide.tags or (slide.case and slide.case.tags):
+                return False
         if scanner:
             if scanner.lower() == UNKNOWN_SCANNER:
                 if slide.scanner:
@@ -702,6 +707,7 @@ class SlideIndexer:
         limit: int = 100,
         scanner: Optional[str] = None,
         exclude_scanner: Optional[str] = None,
+        untagged: bool = False,
     ) -> list[dict]:
         """
         Search for slides by accession number (partial match supported).
@@ -718,6 +724,8 @@ class SlideIndexer:
             limit: Maximum results to return
             scanner: Only slides from this scanner ("unknown" = header not read)
             exclude_scanner: Drop slides from this scanner, KEEPING un-probed ones
+            untagged: Only slides carrying no tag at all, on the slide OR its case
+                      (takes precedence over `tags`, which asks the opposite question)
 
         Returns:
             List of slide info dicts
@@ -730,7 +738,7 @@ class SlideIndexer:
         sid_match = re.match(r'^(SL|CS|PT|JB)\d+$', query_upper)
         if sid_match:
             sid_results = self._search_by_slidecap_id(db, query_upper, year, stain_type, tags, limit,
-                                                      scanner, exclude_scanner)
+                                                      scanner, exclude_scanner, untagged)
             if sid_results is not None:
                 return sid_results
 
@@ -741,7 +749,19 @@ class SlideIndexer:
         # slide hashes up front (direct + via case) and iterating only those —
         # restricted to live/indexed slides — makes tag search complete.
         tag_candidate_hashes: Optional[set] = None
-        if tags:
+        if untagged:
+            # "No tags" is the exact complement of the tag filter above, so it is
+            # resolved the same way — up front, not after the limit*2 break. A tag
+            # on the CASE tags every slide under it, so an untagged slide must have
+            # neither its own tags nor its case's.
+            tag_candidate_hashes = {
+                h for (h,) in db.query(Slide.slide_hash)
+                .filter(~Slide.tags.any())
+                .filter(~Slide.case.has(Case.tags.any()))
+                .all()
+            }
+            tags = None
+        elif tags:
             tag_set = {t.lower() for t in tags}
             tag_rows = db.query(Tag).options(
                 joinedload(Tag.slides),
