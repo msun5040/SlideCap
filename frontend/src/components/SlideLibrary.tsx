@@ -1020,7 +1020,11 @@ export function SlideLibrary() {
                   <ScanLine className="mr-2 h-4 w-4" />
                   {scannerDetect.running
                     ? `Reading headers... ${scannerDetect.left ?? scannerSummary?.unread} left`
-                    : `Read scanner headers (${scannerSummary?.unread.toLocaleString()})`}
+                    : scannerDetect.error
+                      // Usually the share went away mid-run. Nothing was lost — each
+                      // batch commits — so say what happened and let them run it again.
+                      ? `Retry — ${scannerDetect.error}`
+                      : `Read scanner headers (${scannerSummary?.unread.toLocaleString()})`}
                 </DropdownMenuItem>
               </>
             )}
