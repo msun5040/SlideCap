@@ -107,8 +107,10 @@ export function SlideFilterBar({
 
   return (
     <div className="flex flex-col gap-2">
-      <div className="flex flex-wrap items-center gap-2">
-        <div className={`relative ${h} min-w-[200px] flex-1`}>
+      {/* Line 1: the field and the action that runs it, nothing else — the
+          search box is what gets used most, so it gets the whole width. */}
+      <div className="flex items-center gap-2">
+        <div className={`relative ${h} min-w-0 flex-1`}>
           <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
           <Input
             placeholder={searchPlaceholder}
@@ -122,7 +124,10 @@ export function SlideFilterBar({
         <Button onClick={onSearch} disabled={loading} className={h} size={compact ? 'sm' : 'default'}>
           {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Search'}
         </Button>
+      </div>
 
+      {/* Line 2: how you narrow, and what you have narrowed to. */}
+      <div className="flex flex-wrap items-center gap-2">
         {filters.length > 0 && (
           <Popover onOpenChange={open => { if (open) onFiltersOpen?.() }}>
             <PopoverTrigger asChild>
@@ -136,7 +141,7 @@ export function SlideFilterBar({
                 )}
               </Button>
             </PopoverTrigger>
-            <PopoverContent align="end" className="w-[30rem] max-w-[calc(100vw-2rem)] p-4">
+            <PopoverContent align="start" className="w-[30rem] max-w-[calc(100vw-2rem)] p-4">
               <div className="grid grid-cols-2 gap-3">
                 {filters.map(f => (
                   <label key={f.key} className="flex flex-col gap-1.5">
@@ -195,33 +200,34 @@ export function SlideFilterBar({
                 <MoreHorizontal className="h-4 w-4" />
               </Button>
             </DropdownMenuTrigger>
-            <DropdownMenuContent align="end">{actions}</DropdownMenuContent>
+            <DropdownMenuContent align="start">{actions}</DropdownMenuContent>
           </DropdownMenu>
         )}
-      </div>
 
-      {active.length > 0 && (
-        <div className="flex flex-wrap items-center gap-1.5">
-          {active.map(f => (
-            <button
-              key={f.key}
-              type="button"
-              onClick={() => apply(f, f.inactiveValue)}
-              title={`Remove ${f.label.toLowerCase()} filter`}
-              className="group inline-flex items-center gap-1.5 rounded-full border bg-muted/40 py-1 pl-2.5 pr-1.5
-                         text-xs text-foreground transition-colors hover:bg-muted"
-            >
-              <span className="text-muted-foreground">{f.label}</span>
-              <span className="font-medium">{chipTextFor(f)}</span>
-              <X className="h-3 w-3 text-muted-foreground group-hover:text-foreground" />
+        {active.length > 0 && (
+          <>
+            <span className="mx-1 h-5 w-px shrink-0 bg-border" aria-hidden />
+            {active.map(f => (
+              <button
+                key={f.key}
+                type="button"
+                onClick={() => apply(f, f.inactiveValue)}
+                title={`Remove ${f.label.toLowerCase()} filter`}
+                className="group inline-flex items-center gap-1.5 rounded-full border bg-muted/40 py-1 pl-2.5 pr-1.5
+                           text-xs text-foreground transition-colors hover:bg-muted"
+              >
+                <span className="text-muted-foreground">{f.label}</span>
+                <span className="font-medium">{chipTextFor(f)}</span>
+                <X className="h-3 w-3 text-muted-foreground group-hover:text-foreground" />
+              </button>
+            ))}
+            <button type="button" onClick={clearAll}
+                    className="ml-1 text-xs text-muted-foreground underline-offset-2 hover:underline">
+              Clear all
             </button>
-          ))}
-          <button type="button" onClick={clearAll}
-                  className="ml-1 text-xs text-muted-foreground underline-offset-2 hover:underline">
-            Clear all
-          </button>
-        </div>
-      )}
+          </>
+        )}
+      </div>
     </div>
   )
 }
