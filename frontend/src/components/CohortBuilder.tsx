@@ -44,6 +44,7 @@ import { SortableHeader } from '@/components/SortableHeader'
 import { useSlideDetails } from '@/components/SlideDetailsContext'
 import { useSortable } from '@/hooks/useSortable'
 import { useStainTypes } from '@/hooks/useStainTypes'
+import { SlideFilterBar, type FilterDef } from '@/components/SlideFilterBar'
 import { SearchableSelect } from '@/components/ui/searchable-select'
 import { Textarea } from '@/components/ui/textarea'
 import { CopyButton } from '@/components/ui/CopyButton'
@@ -1217,6 +1218,43 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
 
   const years = ['2024', '2023', '2022', '2021', '2020']
 
+  const searchFilters: FilterDef[] = [
+    {
+      key: 'year', label: 'Year', value: yearFilter, inactiveValue: 'all', onChange: setYearFilter,
+      options: [{ value: 'all', label: 'All years' }, ...years.map(y => ({ value: y, label: y }))],
+    },
+    {
+      key: 'stain', label: 'Stain', value: stainFilter, inactiveValue: 'all',
+      onChange: setStainFilter, searchable: true,
+      options: [{ value: 'all', label: 'All stains' }, ...stainTypes.map(st => ({ value: st, label: st }))],
+    },
+    {
+      key: 'analysis', label: 'Analysis', value: analysisFilter, inactiveValue: 'all',
+      onChange: setAnalysisFilter, searchable: true,
+      options: [{ value: 'all', label: 'All analyses' },
+                ...availableAnalyses.map(a => ({ value: a, label: a }))],
+    },
+    {
+      key: 'tag', label: 'Tag', value: tagFilter, inactiveValue: 'all', onChange: setTagFilter,
+      options: [
+        { value: 'all', label: 'All tags' },
+        { value: '__untagged__', label: 'No tags' },
+        ...availableTags.filter(t => (t.slide_count ?? 0) > 0)
+          .map(t => ({ value: t.name, label: t.name, color: t.color })),
+      ],
+    },
+    {
+      // This panel defaults to showing externals, so 'include' is the quiet state here.
+      key: 'source', label: 'Slide source', value: externalFilter, inactiveValue: 'include',
+      onChange: v => setExternalFilter(v as 'exclude' | 'include' | 'only'),
+      options: [
+        { value: 'include', label: 'Clinical + external' },
+        { value: 'exclude', label: 'Clinical only' },
+        { value: 'only', label: 'External only' },
+      ],
+    },
+  ]
+
   // ── Guards ───────────────────────────────────────────────────────────
   // Only show the full-screen loader on the FIRST load (no cohort yet).
   // Background refetches (e.g. after a placeholder move/create) keep the view
@@ -2339,82 +2377,17 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
               </div>
 
               {/* Search controls */}
-              <div className="p-3 space-y-2 border-b border-gray-300 shrink-0">
-                <div className="flex gap-2">
-                  <div className="relative flex-1">
-                    <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-                    <Input
-                      placeholder="Search accession..."
-                      value={searchTerm}
-                      onChange={e => setSearchTerm(e.target.value)}
-                      onKeyDown={e => e.key === 'Enter' && handleSearch()}
-                      className="pl-10"
-                    />
-                  </div>
-                  <Button onClick={handleSearch} disabled={searchLoading} size="default">
-                    {searchLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Search'}
-                  </Button>
-                </div>
-                <div className="flex flex-wrap gap-1.5">
-                  <Select value={yearFilter} onValueChange={setYearFilter}>
-                    <SelectTrigger className="w-28 h-8 text-xs">
-                      <SelectValue placeholder="Year" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="all">All Years</SelectItem>
-                      {years.map(y => <SelectItem key={y} value={y}>{y}</SelectItem>)}
-                    </SelectContent>
-                  </Select>
-                  <SearchableSelect
-                    className="w-32 h-8 text-xs px-2"
-                    value={stainFilter}
-                    onChange={setStainFilter}
-                    searchPlaceholder="Search stains..."
-                    emptyText="No stains in the library"
-                    options={[
-                      { value: 'all', label: 'All Stains' },
-                      ...stainTypes.map(st => ({ value: st, label: st })),
-                    ]}
-                  />
-                  <SearchableSelect
-                    className="w-36 h-8 text-xs px-2"
-                    value={analysisFilter}
-                    onChange={setAnalysisFilter}
-                    searchPlaceholder="Search analyses..."
-                    emptyText="No analyses registered"
-                    options={[
-                      { value: 'all', label: 'All Analyses' },
-                      ...availableAnalyses.map(a => ({ value: a, label: a })),
-                    ]}
-                  />
-                  <Select value={tagFilter} onValueChange={setTagFilter}>
-                    <SelectTrigger className="w-28 h-8 text-xs">
-                      <SelectValue placeholder="Tag" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="all">All Tags</SelectItem>
-                      <SelectItem value="__untagged__">No tags</SelectItem>
-                      {availableTags.filter(t => (t.slide_count ?? 0) > 0).map(tag => (
-                        <SelectItem key={tag.id} value={tag.name}>
-                          <div className="flex items-center gap-2">
-                            {tag.color && <span className="w-2 h-2 rounded-[2px]" style={{ backgroundColor: tag.color }} />}
-                            {tag.name}
-                          </div>
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                  <Select value={externalFilter} onValueChange={(v) => setExternalFilter(v as 'exclude' | 'include' | 'only')}>
-                    <SelectTrigger className="w-36 h-8 text-xs">
-                      <SelectValue placeholder="Slide type" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="include">Clinical + external</SelectItem>
-                      <SelectItem value="exclude">Clinical only</SelectItem>
-                      <SelectItem value="only">External only</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
+              <div className="p-3 border-b border-gray-300 shrink-0">
+                <SlideFilterBar
+                  size="compact"
+                  searchTerm={searchTerm}
+                  onSearchTermChange={setSearchTerm}
+                  onSearch={handleSearch}
+                  loading={searchLoading}
+                  searchPlaceholder="Search accession..."
+                  filters={searchFilters}
+                  onFilterChange={handleSearch}
+                />
               </div>
 
               {/* Bulk add bar */}

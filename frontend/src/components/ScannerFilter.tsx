@@ -108,18 +108,16 @@ export function ScannerFilter({ value, onChange, summary, className }: Props) {
  * read. It is header-only (no pixel decode, no label image), which is O(1) in
  * slide size — but it is still one network file open per slide, so it runs in
  * bounded batches and reports what is left rather than blocking on the library.
+ *
+ * Headless: the caller decides whether this is a button, a menu item, or a row.
  */
-export function ScannerDetectButton({ summary, onDone }: {
-  summary: ScannerSummary | null
-  onDone: () => void
-}) {
+export function useScannerDetect(summary: ScannerSummary | null, onDone: () => void) {
   const [running, setRunning] = useState(false)
   const [left, setLeft] = useState<number | null>(null)
   const [error, setError] = useState<string | null>(null)
 
-  if (!summary || summary.unread === 0) return null
-
   const run = async () => {
+    if (!summary || running) return
     setRunning(true)
     setError(null)
     try {
@@ -151,16 +149,17 @@ export function ScannerDetectButton({ summary, onDone }: {
     }
   }
 
-  return (
-    <button type="button" onClick={run} disabled={running}
-            title="Open each slide's header and record which scanner made it"
-            className="rounded border px-2 py-1 text-xs text-muted-foreground
-                       hover:bg-accent disabled:opacity-60">
-      {running
-        ? `Reading headers… ${left ?? summary.unread} left`
-        : error
-          ? `Retry (${error})`
-          : `Read scanners (${summary.unread})`}
-    </button>
-  )
+  return { running, left, error, run }
+}
+
+/** What a scanner filter value reads as in an active-filter chip. */
+export function scannerFilterLabel(value: ScannerFilterValue, summary: ScannerSummary | null): string {
+  if (!value || value === 'all') return ''
+  if (value === 'unknown') return 'Scanner not read'
+  const sep = value.indexOf(':')
+  if (sep < 0) return ''
+  const kind = value.slice(0, sep)
+  const id = value.slice(sep + 1)
+  const label = summary?.scanners.find(s => s.scanner === id)?.label || id
+  return kind === 'x' ? `Not ${label}` : label
 }

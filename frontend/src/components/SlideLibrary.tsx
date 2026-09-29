@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { Search, Filter, Tag as TagIcon, Eye, Tags, X, Plus, Settings, Trash2, ChevronDown, FileDown, Upload, Pencil, Check, FileText, Download, Loader2, Layers, ScatterChart, Users, FolderPlus, ListChecks } from 'lucide-react'
+import { Search, Filter, Tag as TagIcon, Eye, Tags, X, Plus, Settings, Trash2, ChevronDown, FileDown, Upload, Pencil, Check, FileText, Download, Loader2, Layers, ScatterChart, Users, FolderPlus, ListChecks, ScanLine } from 'lucide-react'
 import { ScatterViewerOverlay } from '@/components/ScatterViewerOverlay'
 import type { AnalysisKind } from '@/types/slide'
 import { Button } from '@/components/ui/button'
@@ -42,7 +42,9 @@ import { SortableHeader } from '@/components/SortableHeader'
 import { useSortable } from '@/hooks/useSortable'
 import { useStainTypes } from '@/hooks/useStainTypes'
 import { SearchableSelect } from '@/components/ui/searchable-select'
-import { ScannerFilter, ScannerDetectButton, applyScannerParams, useScanners } from '@/components/ScannerFilter'
+import { ScannerFilter, applyScannerParams, useScanners, useScannerDetect, scannerFilterLabel } from '@/components/ScannerFilter'
+import { SlideFilterBar, type FilterDef } from '@/components/SlideFilterBar'
+import { DropdownMenuItem, DropdownMenuSeparator } from '@/components/ui/dropdown-menu'
 
 import { getApiBase, normalizeAccession, isDemo } from '@/api'
 import { displaySlide, displaySlideShort } from '@/lib/display'
@@ -921,6 +923,60 @@ export function SlideLibrary() {
   const years = ['2024', '2023', '2022', '2021', '2020']
   const { stainTypes } = useStainTypes()
 
+  const scannerDetect = useScannerDetect(scannerSummary, reloadScanners)
+  const hasScanners = !!scannerSummary && (scannerSummary.scanners.length > 0 || scannerSummary.unread > 0)
+
+  const filters: FilterDef[] = [
+    {
+      key: 'stain', label: 'Stain', value: stainFilter, inactiveValue: 'all',
+      onChange: setStainFilter, searchable: true,
+      options: [{ value: 'all', label: 'All stains' }, ...stainTypes.map(st => ({ value: st, label: st }))],
+    },
+    {
+      key: 'year', label: 'Year', value: yearFilter, inactiveValue: 'all', onChange: setYearFilter,
+      options: [{ value: 'all', label: 'All years' }, ...years.map(y => ({ value: y, label: y }))],
+    },
+    {
+      key: 'status', label: 'Status', value: statusFilter, inactiveValue: 'all', onChange: setStatusFilter,
+      options: [
+        { value: 'all', label: 'Any status' },
+        { value: 'available', label: 'Available' },
+        { value: 'in-analysis', label: 'In analysis' },
+        { value: 'archived', label: 'Archived' },
+      ],
+    },
+    {
+      key: 'tag', label: 'Tag', value: tagFilter, inactiveValue: 'all', onChange: setTagFilter,
+      options: [
+        { value: 'all', label: 'All tags' },
+        { value: '__untagged__', label: 'No tags' },
+        ...availableTags.map(t => ({
+          value: t.name, label: t.name, color: t.color,
+          hint: `(${t.slide_count ?? 0})`,
+        })),
+      ],
+    },
+    {
+      key: 'source', label: 'Slide source', value: externalFilter, inactiveValue: 'exclude',
+      onChange: v => setExternalFilter(v as 'exclude' | 'include' | 'only'),
+      options: [
+        { value: 'exclude', label: 'Clinical only' },
+        { value: 'include', label: 'Clinical + external' },
+        { value: 'only', label: 'External only' },
+      ],
+    },
+    // Only once something is known about scanners — an empty library shouldn't
+    // show a label with nothing under it.
+    ...(hasScanners ? [{
+      key: 'scanner', label: 'Scanner', value: scannerFilter, inactiveValue: 'all',
+      onChange: setScannerFilter,
+      chipLabel: (v: string) => scannerFilterLabel(v, scannerSummary),
+      control: ({ className, onChange }: { className: string; onChange: (v: string) => void }) => (
+        <ScannerFilter className={className} value={scannerFilter} onChange={onChange} summary={scannerSummary} />
+      ),
+    }] : []),
+  ]
+
   return (
     <div className="h-full flex flex-col gap-6 min-h-0">
       <div>
@@ -931,128 +987,46 @@ export function SlideLibrary() {
         </p>
       </div>
 
-      <div className="flex flex-col gap-4 xl:flex-row">
-        <div className="relative w-full xl:flex-1 xl:min-w-[240px]">
-          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            placeholder="Search by accession number, slide ID, patient ID..."
-            value={searchTerm}
-            onChange={(e) => setSearchTerm(e.target.value)}
-            onKeyDown={handleKeyDown}
-            className="pl-10"
-          />
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <SearchableSelect
-            className="w-35 h-10"
-            value={stainFilter}
-            onChange={setStainFilter}
-            searchPlaceholder="Search stains..."
-            emptyText="No stains in the library"
-            options={[
-              { value: 'all', label: 'All Stains' },
-              ...stainTypes.map(st => ({ value: st, label: st })),
-            ]}
-          />
-
-          <Select value={yearFilter} onValueChange={setYearFilter}>
-            <SelectTrigger className="w-30">
-              <SelectValue placeholder="Year" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">All Years</SelectItem>
-              {years.map((year) => (
-                <SelectItem key={year} value={year}>
-                  {year}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-
-          <Select value={statusFilter} onValueChange={setStatusFilter}>
-            <SelectTrigger className="w-32.5">
-              <SelectValue placeholder="Status" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">All Status</SelectItem>
-              <SelectItem value="available">Available</SelectItem>
-              <SelectItem value="in-analysis">In Analysis</SelectItem>
-              <SelectItem value="archived">Archived</SelectItem>
-            </SelectContent>
-          </Select>
-
-          <Select
-            value={tagFilter}
-            onValueChange={(value) => {
-              if (value === '__manage__') {
-                setIsTagManagementOpen(true)
-              } else {
-                setTagFilter(value)
-              }
-            }}
-            onOpenChange={(open) => { if (open) fetchAvailableTags() }}
-          >
-            <SelectTrigger className="w-36">
-              <TagIcon className="mr-2 h-4 w-4" />
-              <SelectValue placeholder="Tag" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">All Tags</SelectItem>
-              <SelectItem value="__untagged__">No tags</SelectItem>
-              {availableTags.map((tag) => (
-                <SelectItem key={tag.id} value={tag.name}>
-                  <div className="flex items-center gap-2">
-                    {tag.color && (
-                      <span
-                        className="w-2 h-2 rounded-full"
-                        style={{ backgroundColor: tag.color }}
-                      />
-                    )}
-                    {tag.name}
-                    <span className="text-muted-foreground text-xs">({tag.slide_count ?? 0})</span>
-                  </div>
-                </SelectItem>
-              ))}
-              <div className="border-t my-1" />
-              <SelectItem value="__manage__">
-                <div className="flex items-center gap-2">
-                  <Settings className="h-3 w-3" />
-                  Manage Tags...
-                </div>
-              </SelectItem>
-            </SelectContent>
-          </Select>
-
-          <Select value={externalFilter} onValueChange={(v) => setExternalFilter(v as 'exclude' | 'include' | 'only')}>
-            <SelectTrigger className="w-40">
-              <SelectValue placeholder="External" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="exclude">Clinical only</SelectItem>
-              <SelectItem value="include">Clinical + external</SelectItem>
-              <SelectItem value="only">External only</SelectItem>
-            </SelectContent>
-          </Select>
-
-          <ScannerFilter value={scannerFilter} onChange={setScannerFilter} summary={scannerSummary} />
-
-          <ScannerDetectButton summary={scannerSummary} onDone={reloadScanners} />
-
-          <Button onClick={handleSearch} disabled={loading}>
-            {loading ? 'Searching...' : 'Search'}
-          </Button>
-
-          <Button variant="outline" onClick={() => setIsBulkLookupOpen(true)}>
-            <ListChecks className="mr-2 h-4 w-4" />
-            Bulk lookup
-          </Button>
-
-          <Button variant="outline" onClick={() => setIsExternalDialogOpen(true)}>
-            <Upload className="mr-2 h-4 w-4" />
-            External slides
-          </Button>
-        </div>
-      </div>
+      <SlideFilterBar
+        searchTerm={searchTerm}
+        onSearchTermChange={setSearchTerm}
+        onSearch={handleSearch}
+        loading={loading}
+        searchPlaceholder="Search by accession number, slide ID, patient ID..."
+        filters={filters}
+        onFilterChange={handleSearch}
+        onFiltersOpen={fetchAvailableTags}
+        actions={
+          <>
+            <DropdownMenuItem onSelect={() => setIsBulkLookupOpen(true)}>
+              <ListChecks className="mr-2 h-4 w-4" />
+              Bulk lookup
+            </DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => setIsExternalDialogOpen(true)}>
+              <Upload className="mr-2 h-4 w-4" />
+              External slides
+            </DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => setIsTagManagementOpen(true)}>
+              <Settings className="mr-2 h-4 w-4" />
+              Manage tags
+            </DropdownMenuItem>
+            {(scannerSummary?.unread ?? 0) > 0 && (
+              <>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  disabled={scannerDetect.running}
+                  onSelect={e => { e.preventDefault(); scannerDetect.run() }}
+                >
+                  <ScanLine className="mr-2 h-4 w-4" />
+                  {scannerDetect.running
+                    ? `Reading headers... ${scannerDetect.left ?? scannerSummary?.unread} left`
+                    : `Read scanner headers (${scannerSummary?.unread.toLocaleString()})`}
+                </DropdownMenuItem>
+              </>
+            )}
+          </>
+        }
+      />
 
       <div className="flex items-center justify-between">
         <div className="text-sm text-muted-foreground">
