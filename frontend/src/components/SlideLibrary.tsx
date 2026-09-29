@@ -42,6 +42,7 @@ import { SortableHeader } from '@/components/SortableHeader'
 import { useSortable } from '@/hooks/useSortable'
 import { useStainTypes } from '@/hooks/useStainTypes'
 import { SearchableSelect } from '@/components/ui/searchable-select'
+import { ScannerFilter, ScannerDetectButton, applyScannerParams, useScanners } from '@/components/ScannerFilter'
 
 import { getApiBase, normalizeAccession, isDemo } from '@/api'
 import { displaySlide, displaySlideShort } from '@/lib/display'
@@ -110,6 +111,8 @@ export function SlideLibrary() {
   const [colorPickerForTag, setColorPickerForTag] = useState<number | null>(null)
   // External (non-clinical) slides: exclude (default) | include | only
   const [externalFilter, setExternalFilter] = useState<'exclude' | 'include' | 'only'>('exclude')
+  const [scannerFilter, setScannerFilter] = useState<string>('all')
+  const { summary: scannerSummary, reload: reloadScanners } = useScanners()
   const [isExternalDialogOpen, setIsExternalDialogOpen] = useState(false)
   // Slides whose QC verdict is 'fail' (manual or auto) — shown as a small marker.
   const [qcFailHashes, setQcFailHashes] = useState<Set<string>>(new Set())
@@ -305,6 +308,7 @@ export function SlideLibrary() {
         if (stainFilter !== 'all') params.append('stain', stainFilter)
         if (tagFilter !== 'all') params.append('tag', tagFilter)
         params.append('external', externalFilter)
+        applyScannerParams(params, scannerFilter)
 
         const response = await fetch(`${getApiBase()}/search?${params.toString()}`)
         if (response.ok) {
@@ -324,6 +328,7 @@ export function SlideLibrary() {
           if (stainFilter !== 'all') params.append('stain', stainFilter)
           if (tagFilter !== 'all') params.append('tag', tagFilter)
           params.append('external', externalFilter)
+          applyScannerParams(params, scannerFilter)
 
           const response = await fetch(`${getApiBase()}/search?${params.toString()}`)
           if (response.ok) {
@@ -1025,6 +1030,10 @@ export function SlideLibrary() {
               <SelectItem value="only">External only</SelectItem>
             </SelectContent>
           </Select>
+
+          <ScannerFilter value={scannerFilter} onChange={setScannerFilter} summary={scannerSummary} />
+
+          <ScannerDetectButton summary={scannerSummary} onDone={reloadScanners} />
 
           <Button onClick={handleSearch} disabled={loading}>
             {loading ? 'Searching...' : 'Search'}

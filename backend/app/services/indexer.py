@@ -8,13 +8,17 @@ import time
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional, Callable
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from .filename_parser import FilenameParser
 from .hasher import SlideHasher
 import re
 from ..db.models import Case, Slide, JobSlide, AnalysisJob, Patient, Tag, generate_slidecap_id
+
+
+# Filter value meaning "header never read, or read and it said nothing".
+UNKNOWN_SCANNER = "unknown"
 
 
 class SlideIndexer:
@@ -525,6 +529,8 @@ class SlideIndexer:
         stain_type: Optional[str] = None,
         tags: Optional[list[str]] = None,
         limit: int = 100,
+        scanner: Optional[str] = None,
+        exclude_scanner: Optional[str] = None,
     ) -> Optional[list[dict]]:
         """
         Search by SlideCap ID (SL, CS, or PT prefix).
@@ -548,7 +554,7 @@ class SlideIndexer:
             ).limit(limit).all()
             if not slides:
                 return None
-            return [self._slide_to_result(s) for s in slides if self._slide_passes_filters(s, year, stain_type, tags)]
+            return [self._slide_to_result(s) for s in slides if self._slide_passes_filters(s, year, stain_type, tags, scanner, exclude_scanner)]
 
         elif prefix == "CS":
             # Find all slides belonging to matching cases
@@ -567,7 +573,7 @@ class SlideIndexer:
             ).filter(
                 Slide.case_id.in_(case_ids)
             ).limit(limit).all()
-            return [self._slide_to_result(s) for s in slides if self._slide_passes_filters(s, year, stain_type, tags)]
+            return [self._slide_to_result(s) for s in slides if self._slide_passes_filters(s, year, stain_type, tags, scanner, exclude_scanner)]
 
         elif prefix == "PT":
             # Find all slides belonging to matching patients
@@ -590,7 +596,7 @@ class SlideIndexer:
             ).filter(
                 Slide.case_id.in_(case_ids)
             ).limit(limit).all()
-            return [self._slide_to_result(s) for s in slides if self._slide_passes_filters(s, year, stain_type, tags)]
+            return [self._slide_to_result(s) for s in slides if self._slide_passes_filters(s, year, stain_type, tags, scanner, exclude_scanner)]
 
         elif prefix == "JB":
             # Find all slides that were part of matching jobs
@@ -615,7 +621,7 @@ class SlideIndexer:
             ).filter(
                 Slide.id.in_(slide_ids)
             ).limit(limit).all()
-            return [self._slide_to_result(s) for s in slides if self._slide_passes_filters(s, year, stain_type, tags)]
+            return [self._slide_to_result(s) for s in slides if self._slide_passes_filters(s, year, stain_type, tags, scanner, exclude_scanner)]
 
         return None
 
@@ -644,6 +650,7 @@ class SlideIndexer:
             'case_tags': [t.name for t in slide.case.tags] if slide.case else [],
             'projects': [p.name for p in slide.case.projects] if slide.case else [],
             'file_size_bytes': slide.file_size_bytes,
+            'scanner': slide.scanner,
             'completed_analyses': list(set(
                 js.job.model_name for js in slide.job_slides
                 if js.status == "completed" and js.job
@@ -652,9 +659,20 @@ class SlideIndexer:
 
     def _slide_passes_filters(
         self, slide: Slide,
-        year: Optional[int], stain_type: Optional[str], tags: Optional[list[str]]
+        year: Optional[int], stain_type: Optional[str], tags: Optional[list[str]],
+        scanner: Optional[str] = None, exclude_scanner: Optional[str] = None,
     ) -> bool:
-        """Check if a slide passes year/stain/tag filters."""
+        """Check if a slide passes year/stain/tag/scanner filters."""
+        if scanner:
+            if scanner.lower() == UNKNOWN_SCANNER:
+                if slide.scanner:
+                    return False
+            elif slide.scanner != scanner:
+                return False
+        if exclude_scanner and slide.scanner == exclude_scanner:
+            # Slides whose header was never read (scanner is null) are KEPT: an
+            # exclusion must not silently drop everything that hasn't been probed.
+            return False
         if year and slide.case and slide.case.year != year:
             return False
         if stain_type:
@@ -681,7 +699,9 @@ class SlideIndexer:
         year: Optional[int] = None,
         stain_type: Optional[str] = None,
         tags: Optional[list[str]] = None,
-        limit: int = 100
+        limit: int = 100,
+        scanner: Optional[str] = None,
+        exclude_scanner: Optional[str] = None,
     ) -> list[dict]:
         """
         Search for slides by accession number (partial match supported).
@@ -696,6 +716,8 @@ class SlideIndexer:
             stain_type: Optional stain type filter (e.g., "HE")
             tags: Optional list of tag names to filter by
             limit: Maximum results to return
+            scanner: Only slides from this scanner ("unknown" = header not read)
+            exclude_scanner: Drop slides from this scanner, KEEPING un-probed ones
 
         Returns:
             List of slide info dicts
@@ -707,7 +729,8 @@ class SlideIndexer:
         # Step 0: Check if query is a SlideCap ID (SL00001, CS00001, PT00001, JB00001)
         sid_match = re.match(r'^(SL|CS|PT|JB)\d+$', query_upper)
         if sid_match:
-            sid_results = self._search_by_slidecap_id(db, query_upper, year, stain_type, tags, limit)
+            sid_results = self._search_by_slidecap_id(db, query_upper, year, stain_type, tags, limit,
+                                                      scanner, exclude_scanner)
             if sid_results is not None:
                 return sid_results
 
@@ -732,13 +755,35 @@ class SlideIndexer:
                     for s in c.slides:
                         tag_candidate_hashes.add(s.slide_hash)
 
+        # Scanner filter: same story as tags. Scanner lives in the DB, not in the
+        # filename, so it can only be applied after Step 2 — by which point the
+        # limit*2 early-break has already truncated the candidate list. Resolve
+        # the matching hashes up front instead.
+        scanner_candidate_hashes: Optional[set] = None
+        if scanner or exclude_scanner:
+            q = db.query(Slide.slide_hash)
+            if scanner:
+                q = (q.filter(Slide.scanner.is_(None))
+                     if scanner.lower() == UNKNOWN_SCANNER
+                     else q.filter(Slide.scanner == scanner))
+            if exclude_scanner:
+                # Null-safe: `!= value` alone would drop every un-probed slide,
+                # since NULL != 'x' is NULL in SQL, not true.
+                q = q.filter(or_(Slide.scanner.is_(None), Slide.scanner != exclude_scanner))
+            scanner_candidate_hashes = {h for (h,) in q.all()}
+
+        candidate_hashes: Optional[set] = tag_candidate_hashes
+        if scanner_candidate_hashes is not None:
+            candidate_hashes = (scanner_candidate_hashes if candidate_hashes is None
+                                else candidate_hashes & scanner_candidate_hashes)
+
         # Step 1: Filter in-memory cache (fast)
         t0 = time.time()
         matching = []
-        if tag_candidate_hashes is not None:
+        if candidate_hashes is not None:
             scan_items = (
                 (h, self.slide_hash_to_path[h])
-                for h in tag_candidate_hashes
+                for h in candidate_hashes
                 if h in self.slide_hash_to_path
             )
         else:
@@ -778,7 +823,7 @@ class SlideIndexer:
             # Fetch a bit more than limit to allow for tag filtering. Skip this
             # cap when scanning tag candidates — that set is already bounded by
             # the tag, and capping it would drop valid matches.
-            if tag_candidate_hashes is None and len(matching) >= limit * 2:
+            if candidate_hashes is None and len(matching) >= limit * 2:
                 break
 
         print(f"  [SEARCH TIMING] Step 1 - Filter cache ({len(matching)} matches): {time.time()-t0:.3f}s")
@@ -837,6 +882,7 @@ class SlideIndexer:
                 'case_tags': [t.name for t in slide.case.tags],
                 'projects': [p.name for p in slide.case.projects],
                 'file_size_bytes': slide.file_size_bytes,
+                'scanner': slide.scanner,
                 'completed_analyses': list(set(
                     js.job.model_name for js in slide.job_slides
                     if js.status == "completed" and js.job

@@ -287,6 +287,19 @@ class Slide(Base):
     display_name = Column(String(200))  # operator-given name (accession-equivalent)
     slide_number = Column(String(20))   # stored for externals; parsed for clinical
 
+    # ── Scanner provenance ──
+    # Read from the slide header on demand, never during indexing (indexing is
+    # filename-only by design and must not open hundreds of files over SMB).
+    # scanner holds the raw identifier -- 'SS12340' for the lab's Aperio,
+    # 'Grundium Ocus' for the Grundium, or an openslide vendor string when the
+    # file carries no ScanScope ID. NOTE Grundium writes Aperio-compatible SVS,
+    # so openslide's vendor is 'aperio' for both makes; the ScanScope ID is the
+    # only field that separates them.
+    # scanner_checked_at distinguishes "never looked" (null) from "looked and the
+    # header said nothing" (set, scanner null), so backfills don't re-probe.
+    scanner = Column(String(100), index=True)
+    scanner_checked_at = Column(DateTime)
+
     # Metadata
     indexed_at = Column(DateTime, default=datetime.utcnow)
     file_exists = Column(Integer, default=1)  # 1 = exists, 0 = missing
@@ -1406,6 +1419,8 @@ def _migrate_analysis_jobs(engine):
                 'is_external': "ALTER TABLE slides ADD COLUMN is_external BOOLEAN DEFAULT 0",
                 'display_name': "ALTER TABLE slides ADD COLUMN display_name VARCHAR(200)",
                 'slide_number': "ALTER TABLE slides ADD COLUMN slide_number VARCHAR(20)",
+                'scanner': "ALTER TABLE slides ADD COLUMN scanner VARCHAR(100)",
+                'scanner_checked_at': "ALTER TABLE slides ADD COLUMN scanner_checked_at DATETIME",
             }
             with engine.connect() as conn:
                 for col_name, ddl in slide_migrations.items():

@@ -23,6 +23,8 @@ export interface Slide {
   case_tags?: string[]
   projects?: string[]
   file_size_bytes?: number
+  /** Scanner id from the slide header; null when it has never been read. */
+  scanner?: string | null
   file_path?: string
   status?: 'available' | 'in-analysis' | 'archived'
   completed_analyses?: string[]

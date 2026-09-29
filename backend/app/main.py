@@ -771,6 +771,8 @@ def search_slides(
     stain: Optional[str] = Query(None, description="Filter by stain type: HE (exact), IHC (prefix match), Special (not HE or IHC)"),
     tag: Optional[str] = Query(None, description="Filter by tag name"),
     external: str = Query("exclude", description="exclude | include | only — whether to include external (non-clinical) slides"),
+    scanner: Optional[str] = Query(None, description="Filter by scanner id (e.g. SS12340, 'Grundium Ocus'); 'unknown' = header not read yet"),
+    exclude_scanner: Optional[str] = Query(None, description="Drop slides from this scanner; slides whose header was never read are kept"),
     limit: int = Query(500, le=500, description="Maximum results")
 ):
     """
@@ -794,7 +796,9 @@ def search_slides(
         year=year,
         stain_type=stain,
         tags=[tag] if tag else None,
-        limit=limit
+        limit=limit,
+        scanner=scanner,
+        exclude_scanner=exclude_scanner,
     )
 
     # External (non-clinical) slides come from the DB (no parseable filename).
@@ -2197,6 +2201,16 @@ def run_qc_endpoint(data: QCRunRequest, db: Session = Depends(get_db)):
             errors.append(f"QC failed for {slide_hash[:12]}: {e}")
             continue
 
+        # QC has just paid to open this file; the scanner id is one more header
+        # field away, so fill it in here rather than making the user run a
+        # separate pass over slides they have already checked.
+        if slide.scanner_checked_at is None:
+            from .services.scanner import read_scanner
+            sc, sc_err = read_scanner(filepath)
+            if not sc_err:
+                slide.scanner = sc
+                slide.scanner_checked_at = datetime.utcnow()
+
         row = existing or SlideQC(slide_id=slide.id, qc_kind="universal")
         row.auto_status = res["status"]
         row.metrics = json.dumps(res["metrics"])
@@ -2210,6 +2224,109 @@ def run_qc_endpoint(data: QCRunRequest, db: Session = Depends(get_db)):
 
     db.commit()
     return {"results": results, "errors": errors}
+
+
+class ScannerDetectRequest(BaseModel):
+    """Either an explicit slide list, or `unread=True` to work through the backlog."""
+    slide_hashes: Optional[List[str]] = None
+    unread: bool = False          # pick slides whose header has never been read
+    force: bool = False           # re-read even if already known
+    limit: int = 500              # bound the request; call again for the rest
+
+
+@app.get("/scanners")
+def list_scanners(db: Session = Depends(get_db)):
+    """
+    Scanner breakdown across the library, for filter options and a sanity check.
+
+    `unread` is slides whose header has never been opened — they are not "no
+    scanner", they are "not looked at yet", and every filter treats them that way.
+    """
+    from .services.scanner import label_for
+
+    rows = (
+        db.query(Slide.scanner, func.count(Slide.id))
+        .filter(Slide.scanner.isnot(None))
+        .group_by(Slide.scanner)
+        .all()
+    )
+    unread = db.query(func.count(Slide.id)).filter(Slide.scanner_checked_at.is_(None)).scalar() or 0
+    # Header read, but the file named no scanner (plain TIFF, stripped metadata).
+    no_info = (db.query(func.count(Slide.id))
+               .filter(Slide.scanner_checked_at.isnot(None), Slide.scanner.is_(None))
+               .scalar() or 0)
+    return {
+        "scanners": [
+            {"scanner": sc, "label": label_for(sc), "count": n}
+            for sc, n in sorted(rows, key=lambda r: -r[1])
+        ],
+        "unread": unread,
+        "no_info": no_info,
+    }
+
+
+@app.post("/scanners/detect")
+def detect_scanners(data: ScannerDetectRequest, db: Session = Depends(get_db)):
+    """
+    Read the scanner id out of slide headers and cache it on the slide rows.
+
+    Header-only: no pixel decode, no label image, no accession — O(1) in slide
+    size, so this is cheap even over SMB. Indexing deliberately does NOT do this
+    (it never opens slide files at all), which is why it lives behind its own call.
+    """
+    from .services.scanner import read_scanner
+
+    if not indexer:
+        raise HTTPException(status_code=503, detail="Indexer not initialized")
+
+    limit = max(1, min(data.limit, 2000))
+    if data.slide_hashes:
+        q = db.query(Slide).filter(Slide.slide_hash.in_(list(dict.fromkeys(data.slide_hashes))))
+        if not data.force:
+            q = q.filter(Slide.scanner_checked_at.is_(None))
+        slides = q.limit(limit).all()
+    elif data.unread:
+        slides = db.query(Slide).filter(Slide.scanner_checked_at.is_(None)).limit(limit).all()
+    else:
+        raise HTTPException(status_code=400, detail="Pass slide_hashes or unread=true")
+
+    # Resolve paths on the main thread (the indexer cache is shared state), then
+    # read headers in parallel with no DB session held — same shape as transfers.
+    targets = []
+    errors: list[str] = []
+    for sl in slides:
+        fp = indexer.get_filepath(sl.slide_hash)
+        if fp is None:
+            errors.append(f"No file for {sl.slide_hash[:12]}")
+            continue
+        targets.append((sl.id, fp))
+
+    found: dict[int, tuple[Optional[str], Optional[str]]] = {}
+    if targets:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for (sid, _fp), (scanner, err) in zip(
+                targets, pool.map(lambda t: read_scanner(t[1]), targets)
+            ):
+                found[sid] = (scanner, err)
+
+    now = datetime.utcnow()
+    updated = 0
+    for sl in slides:
+        if sl.id not in found:
+            continue
+        scanner, err = found[sl.id]
+        if err:
+            # Unreadable now (share dropped, file locked) — leave it unread so a
+            # later run retries instead of recording a false "no scanner".
+            errors.append(f"{sl.slide_hash[:12]}: {err}")
+            continue
+        sl.scanner = scanner
+        sl.scanner_checked_at = now
+        updated += 1
+    db.commit()
+
+    remaining = db.query(func.count(Slide.id)).filter(Slide.scanner_checked_at.is_(None)).scalar() or 0
+    return {"updated": updated, "errors": errors, "remaining": remaining}
 
 
 @app.post("/qc/manual")
