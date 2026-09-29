@@ -48,10 +48,24 @@ SLIDE_CHILD_TABLES = [
 ]
 
 
-def files_in_folder(root: Path, folder: str) -> list[tuple[str, str]]:
-    """[(relative_path, slide_hash)] for the slide files under external/<folder>/."""
+def files_in_folder(folder: str) -> list[tuple[str, list[str]]]:
+    """
+    [(relative_path, [candidate slide_hashes])] for slide files under external/<folder>/.
+
+    external/ lives at NETWORK_ROOT/slides/external -- the indexer is rooted at
+    settings.slides_path, not at NETWORK_ROOT -- and the hash key is taken
+    relative to that external dir, so both come from settings rather than being
+    rebuilt from NETWORK_ROOT.
+
+    Two hashes per file, not one. Files in a subfolder are keyed on the
+    folder-qualified stem ("MEK/mek_1") today, but before folders were supported
+    they were keyed on the bare stem ("mek_1") -- and _scan_external_paths still
+    aliases the old hash to the same file. A slide registered back then is stored
+    under the bare-stem hash, so matching only the modern one would quietly leave
+    those rows behind for a re-import to duplicate.
+    """
     hasher = SlideHasher(settings.salt_path)
-    external_dir = root / "external"
+    external_dir = settings.external_path
     target = external_dir / folder
     if not target.is_dir():
         raise SystemExit(f"No such folder: {target}")
@@ -61,8 +75,17 @@ def files_in_folder(root: Path, folder: str) -> list[tuple[str, str]]:
         if not fp.is_file() or fp.suffix.lower() not in SlideIndexer.EXTERNAL_EXTS:
             continue
         rel = fp.relative_to(external_dir)
-        out.append((rel.as_posix(), hasher.hash_slide_stem(SlideIndexer.external_key(rel))))
+        key = SlideIndexer.external_key(rel)
+        hashes = [hasher.hash_slide_stem(key)]
+        if key != rel.stem:
+            hashes.append(hasher.hash_slide_stem(rel.stem))
+        out.append((rel.as_posix(), hashes))
     return out
+
+
+def chunked(seq: list, size: int = 400) -> list[list]:
+    """SQLite caps bound parameters (999 on older builds), so IN () lists go in batches."""
+    return [seq[i:i + size] for i in range(0, len(seq), size)]
 
 
 def main() -> int:
@@ -74,15 +97,15 @@ def main() -> int:
                     help="Actually delete. Without it, nothing is written.")
     args = ap.parse_args()
 
-    root = Path(settings.NETWORK_ROOT)
-    if not root.is_dir():
-        raise SystemExit(f"Network root not reachable: {root}\nMount the share and try again.")
+    if not settings.slides_path.is_dir():
+        raise SystemExit(f"Slides folder not reachable: {settings.slides_path}\n"
+                         "Mount the share (or set NETWORK_ROOT) and try again.")
 
     db_path = settings.db_path
     print(f"database : {db_path}")
-    print(f"external : {root / 'external' / args.folder}\n")
+    print(f"external : {settings.external_path / args.folder}\n")
 
-    on_disk = files_in_folder(root, args.folder)
+    on_disk = files_in_folder(args.folder)
     print(f"{len(on_disk)} slide file(s) in the folder")
     if not on_disk:
         return 0
@@ -91,8 +114,10 @@ def main() -> int:
     init_db(db_path)
     db = get_session()
 
-    by_hash = {h: rel for rel, h in on_disk}
-    slides = db.query(Slide).filter(Slide.slide_hash.in_(list(by_hash))).all()
+    candidates = [h for _rel, hashes in on_disk for h in hashes]
+    slides = []
+    for batch in chunked(candidates):
+        slides += db.query(Slide).filter(Slide.slide_hash.in_(batch)).all()
     registered = [s for s in slides if s.is_external]
     non_external = [s for s in slides if not s.is_external]
 
@@ -109,12 +134,19 @@ def main() -> int:
     # What is attached to them. The caller said 'nothing yet'; verify rather
     # than trust it, because this is the irreversible part.
     slide_ids = [s.id for s in registered]
-    marks = ", ".join(f":i{n}" for n in range(len(slide_ids)))
-    params = {f"i{n}": sid for n, sid in enumerate(slide_ids)}
+    batches = chunked(slide_ids)
+
+    def each_batch(sql: str):
+        """Run `sql` once per id batch; the {marks} placeholder is filled in."""
+        for batch in batches:
+            marks = ", ".join(f":i{n}" for n in range(len(batch)))
+            params = {f"i{n}": sid for n, sid in enumerate(batch)}
+            yield db.execute(text(sql.format(marks=marks)), params)
+
     attachments = {}
     for table in SLIDE_CHILD_TABLES:
-        n = db.execute(text(f"SELECT COUNT(*) FROM {table} WHERE slide_id IN ({marks})"),
-                       params).scalar() or 0
+        n = sum(r.scalar() or 0 for r in
+                each_batch(f"SELECT COUNT(*) FROM {table} WHERE slide_id IN ({{marks}})"))
         if n:
             attachments[table] = n
 
@@ -126,13 +158,16 @@ def main() -> int:
         print("\nNothing else references these slides.")
 
     # Synthetic cases that exist only to hold these slides.
+    # One grouped count instead of a query per case, so this stays quick on a
+    # large folder and doesn't build an ever-growing NOT IN list.
+    doomed = set(slide_ids)
     case_ids = {s.case_id for s in registered}
-    orphan_cases = []
-    for cid in case_ids:
-        remaining = db.query(Slide).filter(Slide.case_id == cid,
-                                           ~Slide.id.in_(slide_ids)).count()
-        if remaining == 0:
-            orphan_cases.append(cid)
+    survivors: dict[int, int] = {cid: 0 for cid in case_ids}
+    for batch in chunked(sorted(case_ids)):
+        for cid, sid in db.query(Slide.case_id, Slide.id).filter(Slide.case_id.in_(batch)):
+            if sid not in doomed:
+                survivors[cid] += 1
+    orphan_cases = [cid for cid, n in survivors.items() if n == 0]
     print(f"\n{len(case_ids)} case(s) involved; {len(orphan_cases)} would be left empty and removed")
 
     if not args.apply:
@@ -144,10 +179,11 @@ def main() -> int:
     print(f"\nbackup   : {backup}")
 
     for table in SLIDE_CHILD_TABLES:
-        db.execute(text(f"DELETE FROM {table} WHERE slide_id IN ({marks})"), params)
-    db.query(Slide).filter(Slide.id.in_(slide_ids)).delete(synchronize_session=False)
-    if orphan_cases:
-        db.query(Case).filter(Case.id.in_(orphan_cases)).delete(synchronize_session=False)
+        list(each_batch(f"DELETE FROM {table} WHERE slide_id IN ({{marks}})"))
+    for batch in batches:
+        db.query(Slide).filter(Slide.id.in_(batch)).delete(synchronize_session=False)
+    for batch in chunked(orphan_cases):
+        db.query(Case).filter(Case.id.in_(batch)).delete(synchronize_session=False)
     db.commit()
 
     print(f"removed  : {len(registered)} slide(s), {len(orphan_cases)} case(s)")
