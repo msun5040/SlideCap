@@ -27,7 +27,7 @@ from .config import settings
 from .db import init_db, get_db, get_session, Case, Slide, Tag, Project, Cohort, CohortFlag, CohortGroupScheme, CohortGroup, CohortProjection, ProjectionClustering, ProjectionOverlay, CohortPatient, CohortPatientCase, CohortPlaceholder, Analysis, AnalysisJob, JobSlide, SlideQC, RequestSheet, RequestRow, RequestStatus, Study, StudyGroup, init_lock, get_lock, Patient, ExternalMapping, generate_slidecap_id
 from .services import SlideHasher, SlideIndexer, ClusterService, JobStatusPoller
 from .services import tiff_pyramid
-from .auth import AuthMiddleware, create_challenge, verify_challenge, create_token, verify_token, cleanup_expired_challenges
+from .auth import AuthMiddleware, create_challenge, verify_challenge, create_token, verify_token, cleanup_expired_challenges, demo_auth_bypassed
 from .auth import create_server_log_token, verify_server_log_token, SERVER_LOG_TOKEN_HOURS
 from . import demo as demo_mod
 from .services import server_log
@@ -189,6 +189,7 @@ async def lifespan(app: FastAPI):
     # Demo mode: auto-register CellViT so the demo flow works without manual setup
     if _is_demo():
         print(f"[Demo] APP_MODE=demo — seeding demo analyses, mock cluster active")
+        print(f"[Demo] Network-drive authentication is BYPASSED in demo mode.")
         try:
             demo_mod.seed_demo_analyses()
         except Exception as e:
@@ -279,6 +280,11 @@ def auth_verify(body: VerifyRequest):
 @app.get("/auth/status")
 def auth_status(request: Request):
     """Check if current token is valid."""
+    # Demo mode has no share to prove access to — report authenticated so the
+    # frontend goes straight to the app instead of asking for a code nobody can
+    # produce. See demo_auth_bypassed().
+    if demo_auth_bypassed():
+        return {"authenticated": True, "demo": True}
     auth_header = request.headers.get("Authorization", "")
     token = auth_header.replace("Bearer ", "") if auth_header.startswith("Bearer ") else ""
     return {"authenticated": verify_token(token) if token else False}

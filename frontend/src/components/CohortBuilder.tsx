@@ -45,6 +45,7 @@ import { useSlideDetails } from '@/components/SlideDetailsContext'
 import { useSortable } from '@/hooks/useSortable'
 import { useStainTypes } from '@/hooks/useStainTypes'
 import { SlideFilterBar, type FilterDef } from '@/components/SlideFilterBar'
+import { ScannerFilter, applyScannerParams, useScanners, scannerFilterLabel } from '@/components/ScannerFilter'
 import { SearchableSelect } from '@/components/ui/searchable-select'
 import { Textarea } from '@/components/ui/textarea'
 import { CopyButton } from '@/components/ui/CopyButton'
@@ -137,6 +138,8 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
   // Include external (non-clinical) slides by default so they can be added to
   // cohorts too. exclude = clinical only, only = external only.
   const [externalFilter, setExternalFilter] = useState<'exclude' | 'include' | 'only'>('include')
+  const [scannerFilter, setScannerFilter] = useState<string>('all')
+  const { summary: scannerSummary } = useScanners()
   const [availableTags, setAvailableTags] = useState<{ id: number; name: string; color?: string; slide_count?: number }[]>([])
   const [resultsTruncated, setResultsTruncated] = useState(false)
   const [selectedHashes, setSelectedHashes] = useState<Set<string>>(new Set())
@@ -800,6 +803,7 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
       if (tagFilter === '__untagged__') params.append('untagged', 'true')
       else if (tagFilter !== 'all') params.append('tag', tagFilter)
       params.append('external', externalFilter)
+      applyScannerParams(params, scannerFilter)
       const res = await fetch(`${getApiBase()}/search?${params}`)
       if (res.ok) {
         const data = await res.json()
@@ -1218,6 +1222,8 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
 
   const years = ['2024', '2023', '2022', '2021', '2020']
 
+  const hasScanners = !!scannerSummary && (scannerSummary.scanners.length > 0 || scannerSummary.unread > 0)
+
   const searchFilters: FilterDef[] = [
     {
       key: 'year', label: 'Year', value: yearFilter, inactiveValue: 'all', onChange: setYearFilter,
@@ -1253,6 +1259,18 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
         { value: 'only', label: 'External only' },
       ],
     },
+    // Only once something is known about scanners — an empty library shouldn't
+    // show a label with nothing under it. Scanner is a batch variable, so being
+    // able to drop one make while assembling a cohort keeps it out of whatever
+    // gets run on that cohort later.
+    ...(hasScanners ? [{
+      key: 'scanner', label: 'Scanner', value: scannerFilter, inactiveValue: 'all',
+      onChange: setScannerFilter,
+      chipLabel: (v: string) => scannerFilterLabel(v, scannerSummary),
+      control: ({ className, onChange }: { className: string; onChange: (v: string) => void }) => (
+        <ScannerFilter className={className} value={scannerFilter} onChange={onChange} summary={scannerSummary} />
+      ),
+    }] : []),
   ]
 
   // ── Guards ───────────────────────────────────────────────────────────

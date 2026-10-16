@@ -173,6 +173,22 @@ def verify_server_log_token(token: str) -> bool:
 
 # ── Middleware ──────────────────────────────────────────────────
 
+def demo_auth_bypassed() -> bool:
+    """
+    Demo mode skips the network-drive challenge entirely.
+
+    The challenge exists to prove the caller can read the lab share -- drive
+    access IS the credential. A demo instance deliberately has no share: it runs
+    against a generated library in the operator's home directory, so there is
+    nothing to prove access to, and making a presenter alt-tab to a text file
+    mid-demo buys nothing. The instance holds no PHI, its database is isolated,
+    and its cluster is a mock.
+
+    Strictly APP_MODE=demo. Prod is untouched.
+    """
+    return settings.APP_MODE == "demo"
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
     """Reject unauthenticated requests to protected endpoints."""
 
@@ -183,6 +199,9 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         # Allow public paths
         if request.url.path in PUBLIC_PATHS:
+            return await call_next(request)
+
+        if demo_auth_bypassed():
             return await call_next(request)
 
         # Check token

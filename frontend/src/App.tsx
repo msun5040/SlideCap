@@ -107,19 +107,18 @@ export default function App() {
   // Check auth status after launch
   useEffect(() => {
     if (!launched) return
+    // Ask even without a token: a demo backend has no network share to prove
+    // access to and answers `authenticated: true`, so short-circuiting here
+    // would strand the demo on a login screen with no code to enter. With no
+    // token against a prod backend the answer is false, exactly as before.
     const token = getAuthToken()
-    if (!token) {
-      setAuthenticated(false)
-      setCheckingAuth(false)
-      return
-    }
     fetch(`${getApiBase()}/auth/status`, {
-      headers: { 'Authorization': `Bearer ${token}` },
+      headers: token ? { 'Authorization': `Bearer ${token}` } : {},
     })
       .then(res => res.json())
       .then(data => {
         setAuthenticated(data.authenticated)
-        if (!data.authenticated) clearAuthToken()
+        if (!data.authenticated && token) clearAuthToken()
       })
       .catch(() => {
         setAuthenticated(false)
