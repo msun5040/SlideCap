@@ -1199,11 +1199,22 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
     setSelectedHashes(next)
   }
 
+  // Slides among the current results that aren't in the cohort yet — what a
+  // "select all" can usefully act on. Acts on the FILTERED set, since selecting
+  // slides the analysis filter is currently hiding would be a nasty surprise on
+  // the next Add.
+  const addableHashes = useMemo(
+    () => filteredSearchResults.filter(s => !cohortHashSet.has(s.slide_hash)).map(s => s.slide_hash),
+    [filteredSearchResults, cohortHashSet],
+  )
+  const allAddableSelected = addableHashes.length > 0
+    && addableHashes.every(h => selectedHashes.has(h))
+
   const toggleSelectAllSearch = () => {
-    // Acts on the filtered set — selecting slides the analysis filter is
-    // currently hiding would be a nasty surprise on the next Add.
-    if (selectedHashes.size === filteredSearchResults.length) setSelectedHashes(new Set())
-    else setSelectedHashes(new Set(filteredSearchResults.map(s => s.slide_hash)))
+    // Skip the ones already in the cohort: including them produced a selection
+    // count that didn't match the number the Add button would actually add.
+    if (allAddableSelected) setSelectedHashes(new Set())
+    else setSelectedHashes(new Set(addableHashes))
   }
 
   // ── Helpers ──────────────────────────────────────────────────────────
@@ -2429,12 +2440,25 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
 
               {/* Results info */}
               {searchResults.length > 0 && (
-                <div className="px-3 py-1.5 text-xs text-muted-foreground border-b border-gray-300 shrink-0">
-                  {filteredSearchResults.length} result{filteredSearchResults.length !== 1 ? 's' : ''}
-                  {analysisFilter !== 'all' && filteredSearchResults.length !== searchResults.length && (
-                    <span className="ml-1">of {searchResults.length}</span>
+                <div className="flex items-center gap-2 px-3 py-1.5 text-xs text-muted-foreground border-b border-gray-300 shrink-0">
+                  <span>
+                    {filteredSearchResults.length} result{filteredSearchResults.length !== 1 ? 's' : ''}
+                    {analysisFilter !== 'all' && filteredSearchResults.length !== searchResults.length && (
+                      <span className="ml-1">of {searchResults.length}</span>
+                    )}
+                    {resultsTruncated && <span className="text-orange-600 ml-1">(limit reached)</span>}
+                  </span>
+                  {addableHashes.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={toggleSelectAllSearch}
+                      className="ml-auto underline-offset-2 hover:underline"
+                    >
+                      {allAddableSelected
+                        ? 'Clear selection'
+                        : `Select all ${addableHashes.length} not yet added`}
+                    </button>
                   )}
-                  {resultsTruncated && <span className="text-orange-600 ml-1">(limit reached)</span>}
                 </div>
               )}
 
@@ -2445,7 +2469,11 @@ export function CohortBuilder({ cohortId, onBack }: CohortBuilderProps) {
                     <TableRow>
                       <TableHead className="w-10">
                         <Checkbox
-                          checked={filteredSearchResults.length > 0 && selectedHashes.size === filteredSearchResults.length}
+                          aria-label="Select all results"
+                          checked={allAddableSelected
+                            ? true
+                            : selectedHashes.size > 0 ? 'indeterminate' : false}
+                          disabled={addableHashes.length === 0}
                           onCheckedChange={toggleSelectAllSearch}
                         />
                       </TableHead>
