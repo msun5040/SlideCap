@@ -1,11 +1,12 @@
-import { useEffect, useState } from 'react'
-import { ChevronDown, ChevronRight, Eye, FileText, Layers, Loader2, ScatterChart } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
+import { ChevronDown, ChevronRight, Download, Eye, FileText, Layers, Loader2, ScatterChart, Trash2, Upload } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
@@ -13,8 +14,10 @@ import { CopyableText } from '@/components/CopyableText'
 import { SlideViewerOSD } from '@/components/SlideViewerOSD'
 import { ScatterViewerOverlay } from '@/components/ScatterViewerOverlay'
 import { AnalysisFileTree } from '@/components/AnalysisFileTree'
+import { SlideClusterComposition } from '@/components/SlideClusterComposition'
 import type { Slide, AnalysisKind } from '@/types/slide'
 import { getApiBase, isDemo } from '@/api'
+import { saveBlob } from '@/lib/download'
 import { displaySlide } from '@/lib/display'
 
 interface AnnotationFile {
@@ -51,6 +54,72 @@ interface Props {
  * tag management) stay in Slide Library to avoid duplicating that surface.
  */
 export function SlideDetailsDialog({ slideHash, seed, onClose }: Props) {
+  // Annotation upload/delete and analysis downloads used to live only in the
+  // Slide Library's own copy of this dialog. They moved here when the two were
+  // merged, so every place a slide is opened offers the same actions.
+  const annInputRef = useRef<HTMLInputElement>(null)
+  const [uploadingAnn, setUploadingAnn] = useState(false)
+  const [deletingAnn, setDeletingAnn] = useState<string | null>(null)
+  // Deleting an annotation removes the file from the network drive, so it
+  // keeps the confirmation step the Slide Library's dialog always had.
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
+  const [downloadingJob, setDownloadingJob] = useState<number | null>(null)
+
+  const reloadAnnotations = async () => {
+    if (!slideHash) return
+    try {
+      const r = await fetch(`${getApiBase()}/slides/${slideHash}/annotations`)
+      setAnnotations(r.ok ? await r.json() : [])
+    } catch { /* leave the list as it is */ }
+  }
+
+  const uploadAnnotation = async (file: File) => {
+    if (!slideHash) return
+    setUploadingAnn(true)
+    try {
+      const form = new FormData()
+      form.append('file', file)
+      const r = await fetch(`${getApiBase()}/slides/${slideHash}/annotations`,
+                            { method: 'POST', body: form })
+      if (r.ok) await reloadAnnotations()
+      else setError((await r.json().catch(() => ({}))).detail || 'Upload failed')
+    } catch {
+      setError('Upload failed')
+    } finally {
+      setUploadingAnn(false)
+    }
+  }
+
+  const deleteAnnotation = async (name: string) => {
+    if (!slideHash) return
+    setDeletingAnn(name)
+    try {
+      const r = await fetch(
+        `${getApiBase()}/slides/${slideHash}/annotations/${encodeURIComponent(name)}`,
+        { method: 'DELETE' })
+      if (r.ok) setAnnotations(prev => prev.filter(a => a.name !== name))
+      else setError('Delete failed')
+    } catch {
+      setError('Delete failed')
+    } finally {
+      setDeletingAnn(null)
+    }
+  }
+
+  const downloadAnalysisZip = async (jobId: number) => {
+    setDownloadingJob(jobId)
+    try {
+      const r = await fetch(`${getApiBase()}/jobs/${jobId}/download-zip`)
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      saveBlob(await r.blob(), `job_${jobId}_results.zip`)
+    } catch {
+      setError('Download failed')
+    } finally {
+      setDownloadingJob(null)
+    }
+  }
+
+
   const [slide, setSlide] = useState<Slide | null>(seed && seed.slide_hash ? { ...(seed as Slide) } : null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -247,6 +316,8 @@ export function SlideDetailsDialog({ slideHash, seed, onClose }: Props) {
                 </div>
               )}
 
+              {slideHash && <SlideClusterComposition slideHash={slideHash} />}
+
               {results.length > 0 && (
                 <div className="col-span-2 border-t pt-3">
                   <label className="text-sm text-muted-foreground">Completed Analyses</label>
@@ -302,6 +373,22 @@ export function SlideDetailsDialog({ slideHash, seed, onClose }: Props) {
                                 {rd.name}
                               </Button>
                             ))}
+                            {/* Moved here from the Slide Library's copy of this
+                                dialog, so results are downloadable wherever a
+                                slide is opened. */}
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="h-7 text-xs"
+                              disabled={downloadingJob === r.job_id}
+                              onClick={() => downloadAnalysisZip(r.job_id)}
+                              title="Download this job's output files as a ZIP"
+                            >
+                              {downloadingJob === r.job_id
+                                ? <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                                : <Download className="h-3 w-3 mr-1" />}
+                              ZIP
+                            </Button>
                           </div>
                           {isOpen && (
                             <div className="border-t px-2">
@@ -316,7 +403,23 @@ export function SlideDetailsDialog({ slideHash, seed, onClose }: Props) {
               )}
 
               <div className="col-span-2 border-t pt-3">
-                <label className="text-sm text-muted-foreground">Annotations</label>
+                <div className="flex items-center justify-between">
+                  <label className="text-sm text-muted-foreground">Annotations</label>
+                  <input ref={annInputRef} type="file" className="hidden"
+                         accept=".geojson,.json,.xml,.gz,.snappy"
+                         onChange={e => {
+                           const f = e.target.files?.[0]
+                           if (f) uploadAnnotation(f)
+                           e.target.value = ''
+                         }} />
+                  <Button size="sm" variant="outline" disabled={uploadingAnn}
+                          onClick={() => annInputRef.current?.click()}>
+                    {uploadingAnn
+                      ? <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
+                      : <Upload className="mr-2 h-3.5 w-3.5" />}
+                    Upload
+                  </Button>
+                </div>
                 {annLoading ? (
                   <p className="text-xs text-muted-foreground mt-1">Loading…</p>
                 ) : annotations.length === 0 ? (
@@ -334,13 +437,20 @@ export function SlideDetailsDialog({ slideHash, seed, onClose }: Props) {
                               ? `${(a.size / 1024).toFixed(1)} KB`
                               : `${(a.size / (1024 * 1024)).toFixed(1)} MB`}
                         </span>
+                        <button type="button" title="Delete annotation"
+                                disabled={deletingAnn === a.name}
+                                onClick={() => setConfirmDelete(a.name)}
+                                className="shrink-0 rounded p-1 text-muted-foreground
+                                           hover:bg-destructive/10 hover:text-destructive
+                                           disabled:opacity-50">
+                          {deletingAnn === a.name
+                            ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            : <Trash2 className="h-3.5 w-3.5" />}
+                        </button>
                       </li>
                     ))}
                   </ul>
                 )}
-                <p className="text-[11px] text-muted-foreground mt-1">
-                  Upload / delete annotations from Slide Library.
-                </p>
               </div>
 
               <div className="col-span-2 pt-3 border-t flex gap-2">
@@ -376,6 +486,26 @@ export function SlideDetailsDialog({ slideHash, seed, onClose }: Props) {
           onClose={() => setViewerOpen(false)}
         />
       )}
+
+      <Dialog open={!!confirmDelete} onOpenChange={open => !open && setConfirmDelete(null)}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Delete Annotation</DialogTitle>
+            <DialogDescription>
+              Are you sure you want to permanently delete{' '}
+              <span className="font-medium text-foreground">{confirmDelete}</span>?
+              This will remove the file from the network drive.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirmDelete(null)}>Cancel</Button>
+            <Button variant="destructive"
+                    onClick={() => { const n = confirmDelete; setConfirmDelete(null); if (n) deleteAnnotation(n) }}>
+              Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* Renderer view (e.g. UMAP scatter linked to this slide's WSI).
           Pops above the dialog when a renderer button is clicked. */}

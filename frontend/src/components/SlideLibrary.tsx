@@ -42,6 +42,7 @@ import { SortableHeader } from '@/components/SortableHeader'
 import { useSortable } from '@/hooks/useSortable'
 import { useStainTypes } from '@/hooks/useStainTypes'
 import { SearchableSelect } from '@/components/ui/searchable-select'
+import { SlideDetailsDialog } from '@/components/SlideDetailsDialog'
 import { ScannerFilter, applyScannerParams, useScanners, useScannerDetect, scannerFilterLabel } from '@/components/ScannerFilter'
 import { SlideFilterBar, type FilterDef } from '@/components/SlideFilterBar'
 import { DropdownMenuItem, DropdownMenuSeparator } from '@/components/ui/dropdown-menu'
@@ -149,7 +150,6 @@ export function SlideLibrary() {
   })
 
   // Slide results (cell stats) state for detail dialog
-  const [slideResults, setSlideResults] = useState<{ job_id: number; analysis_name: string; version: string; status: string; analysis_kind?: string | null; cell_stats?: Record<string, number> | null }[]>([])
   // Kind registry — loaded once, used to surface renderer buttons (UMAP/PCA/…)
   // next to a completed-analysis row when the analysis's kind plugin declares any.
   const [kinds, setKinds] = useState<AnalysisKind[]>([])
@@ -157,12 +157,8 @@ export function SlideLibrary() {
   const [scatterViewer, setScatterViewer] = useState<{
     jobId: number; slideHash: string; slideName: string; rendererId: string; rendererName: string
   } | null>(null)
-  const [loadingResults, setLoadingResults] = useState(false)
   // Per-job output files & download state inside the Completed Analyses block
   type OutputGroup = { slide_hash: string; label: string; files: string[]; annotation_count: number; is_local: boolean }
-  const [analysisOutputs, setAnalysisOutputs] = useState<Record<number, OutputGroup[] | undefined>>({})
-  const [loadingOutputJob, setLoadingOutputJob] = useState<number | null>(null)
-  const [downloadingJob, setDownloadingJob] = useState<number | null>(null)
 
   // Overlay viewer state — opens OSD viewer with a chosen analysis output as overlay
   const [overlayViewer, setOverlayViewer] = useState<{
@@ -172,10 +168,6 @@ export function SlideLibrary() {
   } | null>(null)
 
   // Annotation state for detail dialog
-  const [annotations, setAnnotations] = useState<{ name: string; size: number }[]>([])
-  const [loadingAnnotations, setLoadingAnnotations] = useState(false)
-  const [uploadingAnnotation, setUploadingAnnotation] = useState(false)
-  const annotationInputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
     fetchStats()
@@ -518,122 +510,6 @@ export function SlideLibrary() {
     })
   }
 
-  // --- Annotation helpers ---
-
-  const fetchAnnotations = useCallback(async (slideHash: string) => {
-    setLoadingAnnotations(true)
-    try {
-      const res = await fetch(`${getApiBase()}/slides/${slideHash}/annotations`)
-      if (res.ok) setAnnotations(await res.json())
-      else setAnnotations([])
-    } catch {
-      setAnnotations([])
-    } finally {
-      setLoadingAnnotations(false)
-    }
-  }, [])
-
-  const fetchAnalysisOutputs = useCallback(async (jobId: number, slideHash: string) => {
-    setLoadingOutputJob(jobId)
-    try {
-      const res = await fetch(`${getApiBase()}/jobs/${jobId}/output-filenames?slide_hashes=${encodeURIComponent(slideHash)}`)
-      if (res.ok) {
-        const data: OutputGroup[] = await res.json()
-        setAnalysisOutputs((prev) => ({ ...prev, [jobId]: data }))
-      }
-    } catch (e) { console.error('Failed to load output files:', e) }
-    finally { setLoadingOutputJob(null) }
-  }, [])
-
-  const isOverlayFile = (name: string) => {
-    const lower = name.toLowerCase()
-    return lower.endsWith('.geojson')
-      || lower.endsWith('.geojson.snappy')
-      || lower.endsWith('.json.gz')
-      || lower.endsWith('.geojson.gz')
-  }
-
-  const openOverlayFile = useCallback((jobId: number, slideHash: string, slideName: string, filePath: string) => {
-    const encoded = filePath.split('/').map(encodeURIComponent).join('/')
-    const url = `${getApiBase()}/results/${jobId}/file/${encoded}?slide_hash=${encodeURIComponent(slideHash)}&apply_transforms=true`
-    const fileName = filePath.split('/').pop() || filePath
-    setOverlayViewer({
-      slideHash,
-      slideName,
-      overlays: [{ id: `${jobId}-${slideHash}-${filePath}`, name: fileName, type: 'geojson', url }],
-    })
-  }, [])
-
-  const downloadAnalysisZip = useCallback(async (jobId: number) => {
-    setDownloadingJob(jobId)
-    try {
-      const res = await fetch(`${getApiBase()}/jobs/${jobId}/download-zip`)
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      saveBlob(await res.blob(), `job_${jobId}_results.zip`)
-    } catch (e) { console.error('Download failed:', e) }
-    finally { setDownloadingJob(null) }
-  }, [])
-
-  const uploadAnnotation = async (slideHash: string, file: File) => {
-    setUploadingAnnotation(true)
-    try {
-      const form = new FormData()
-      form.append('file', file)
-      const res = await fetch(`${getApiBase()}/slides/${slideHash}/annotations`, {
-        method: 'POST',
-        body: form,
-      })
-      if (res.ok) {
-        await fetchAnnotations(slideHash)
-      } else {
-        const err = await res.json().catch(() => ({ detail: 'Upload failed' }))
-        alert(err.detail || 'Upload failed')
-      }
-    } catch {
-      alert('Upload failed')
-    } finally {
-      setUploadingAnnotation(false)
-    }
-  }
-
-  const [deleteAnnotationConfirm, setDeleteAnnotationConfirm] = useState<{
-    open: boolean; slideHash: string; filename: string
-  }>({ open: false, slideHash: '', filename: '' })
-
-  const confirmDeleteAnnotation = (slideHash: string, filename: string) => {
-    setDeleteAnnotationConfirm({ open: true, slideHash, filename })
-  }
-
-  const doDeleteAnnotation = async () => {
-    const { slideHash, filename } = deleteAnnotationConfirm
-    try {
-      const res = await fetch(
-        `${getApiBase()}/slides/${slideHash}/annotations/${encodeURIComponent(filename)}`,
-        { method: 'DELETE' }
-      )
-      if (res.ok) {
-        setAnnotations((prev) => prev.filter((a) => a.name !== filename))
-      }
-    } catch {
-      alert('Delete failed')
-    }
-    setDeleteAnnotationConfirm({ open: false, slideHash: '', filename: '' })
-  }
-
-  // Load annotations and results when detail dialog opens
-  useEffect(() => {
-    if (isDetailsDialogOpen && selectedSlide) {
-      fetchAnnotations(selectedSlide.slide_hash)
-      // Fetch cell stats
-      setLoadingResults(true)
-      fetch(`${getApiBase()}/slides/${selectedSlide.slide_hash}/results`)
-        .then((res) => (res.ok ? res.json() : []))
-        .then((data) => setSlideResults(data))
-        .catch(() => setSlideResults([]))
-        .finally(() => setLoadingResults(false))
-      setAnalysisOutputs({})
-    }
-  }, [isDetailsDialogOpen, selectedSlide, fetchAnnotations])
 
   const handleBulkAddTag = async (tagName?: string, tagColor?: string) => {
     const name = tagName || bulkTagInput.trim()
@@ -1295,320 +1171,13 @@ export function SlideLibrary() {
       </Dialog>
 
       {/* Slide Details Dialog */}
-      <Dialog open={isDetailsDialogOpen} onOpenChange={setIsDetailsDialogOpen}>
-        <DialogContent className="max-w-2xl">
-          <DialogHeader>
-            <DialogTitle>Slide Details</DialogTitle>
-            <DialogDescription>
-              {selectedSlide && displaySlide(selectedSlide)}
-            </DialogDescription>
-          </DialogHeader>
-          {selectedSlide && (
-            <div className="grid grid-cols-2 gap-4 py-4">
-              <div>
-                <label className="block text-sm text-muted-foreground">{isDemo() ? 'Slide ID:' : 'Accession #:'}</label>
-                <CopyableText
-                  className="font-medium text-sm"
-                  text={isDemo() ? (selectedSlide.slide_id || selectedSlide.slide_hash.slice(0, 12)) : selectedSlide.accession_number}
-                />
-              </div>
-              <div>
-                <label className="block text-sm text-muted-foreground">Slide Hash:</label>
-                <CopyableText className="text-sm" text={`${selectedSlide.slide_hash.substring(0, 16)}...`} copyValue={selectedSlide.slide_hash} />
-              </div>
-              <div>
-                <label className="text-sm text-muted-foreground">Slide #</label>
-                <p className="font-medium">{selectedSlide.slide_number}</p>
-              </div>
-              <div>
-                <label className="text-sm text-muted-foreground">Block</label>
-                <p className="font-medium">{selectedSlide.block_id}</p>
-              </div>
-              <div>
-                <label className="text-sm text-muted-foreground">Stain Type</label>
-                <p className="font-medium">{selectedSlide.stain_type}</p>
-              </div>
-              {selectedSlide.year && (
-                <div>
-                  <label className="text-sm text-muted-foreground">Year</label>
-                  <p className="font-medium">{selectedSlide.year}</p>
-                </div>
-              )}
-              {selectedSlide.random_id && (
-                <div>
-                  <label className="text-sm text-muted-foreground">Random ID</label>
-                  <p className="font-medium font-mono">{selectedSlide.random_id}</p>
-                </div>
-              )}
-              {selectedSlide.file_path && (
-                <div className="col-span-2">
-                  <label className="text-sm text-muted-foreground">File Path</label>
-                  <CopyableText className="text-sm break-all" text={selectedSlide.file_path} />
-                </div>
-              )}
-              {/* SlideCap IDs */}
-              {(selectedSlide.slide_id || selectedSlide.case_id || selectedSlide.patient_id) && (
-                <div className="col-span-2 border-t pt-3">
-                  <label className="text-sm text-muted-foreground">SlideCap IDs</label>
-                  <div className="flex flex-wrap gap-3 mt-1">
-                    {selectedSlide.slide_id && (
-                      <CopyableText className="text-xs font-mono px-2 py-1 bg-muted rounded" text={selectedSlide.slide_id} />
-                    )}
-                    {selectedSlide.case_id && (
-                      <CopyableText className="text-xs font-mono px-2 py-1 bg-muted rounded" text={selectedSlide.case_id} />
-                    )}
-                    {selectedSlide.patient_id && (
-                      <CopyableText className="text-xs font-mono px-2 py-1 bg-blue-50 dark:bg-blue-950 rounded text-blue-700 dark:text-blue-300" text={selectedSlide.patient_id} />
-                    )}
-                  </div>
-                </div>
-              )}
-              {selectedSlide.request_sheets && selectedSlide.request_sheets.length > 0 && (
-                <div className="col-span-2 border-t pt-3">
-                  <label className="text-sm text-muted-foreground">Request Sheets</label>
-                  <div className="flex flex-wrap gap-2 mt-1">
-                    {selectedSlide.request_sheets.map((rs) => (
-                      <span key={rs.sheet_id} className="inline-flex items-center gap-1.5 rounded-sm px-2 py-1 text-xs font-medium border border-violet-200 bg-violet-50 text-violet-700 dark:border-violet-800 dark:bg-violet-950 dark:text-violet-300">
-                        {rs.sheet_name || `Sheet #${rs.sheet_id}`}
-                        <span className="text-[10px] opacity-70">({rs.case_status || 'Not Started'})</span>
-                      </span>
-                    ))}
-                  </div>
-                </div>
-              )}
-              {selectedSlide.slide_tags && selectedSlide.slide_tags.length > 0 && (
-                <div className="col-span-2">
-                  <label className="text-sm text-muted-foreground">Tags</label>
-                  <div className="flex flex-wrap gap-2 mt-1">
-                    {selectedSlide.slide_tags.map((tag: string) => {
-                      const tagInfo = availableTags.find(t => t.name === tag)
-                      return <TagChip key={tag} name={tag} color={tagInfo?.color} />
-                    })}
-                  </div>
-                </div>
-              )}
-              {selectedSlide.completed_analyses && selectedSlide.completed_analyses.length > 0 && (
-                <div className="col-span-2">
-                  <label className="text-sm text-muted-foreground">Completed Analyses</label>
-                  <div className="space-y-2 mt-1">
-                    {loadingResults ? (
-                      <p className="text-xs text-muted-foreground">Loading results...</p>
-                    ) : slideResults.length > 0 ? (
-                      slideResults.map((r) => {
-                        const files = analysisOutputs[r.job_id]
-                        return (
-                          <div key={`${r.job_id}-${r.analysis_name}`} className="rounded border p-2 space-y-2">
-                            <div className="flex items-center gap-2">
-                              <Badge
-                                variant="secondary"
-                                style={{
-                                  backgroundColor: '#3B82F620',
-                                  color: '#3B82F6',
-                                  borderColor: '#3B82F6',
-                                }}
-                              >
-                                {r.analysis_name} v{r.version}
-                              </Badge>
-                              <span className="text-xs text-muted-foreground">Job #{r.job_id}</span>
-                              <div className="ml-auto flex items-center gap-1">
-                                {/* Renderer buttons (UMAP / PCA / …) for kinds
-                                    that declare them. Opens ScatterViewerOverlay
-                                    pinned to this slide + job. */}
-                                {(() => {
-                                  const kind = kinds.find(k => k.id === r.analysis_kind)
-                                  return (kind?.renderers || []).map(rd => (
-                                    <Button
-                                      key={rd.id}
-                                      variant="outline"
-                                      size="sm"
-                                      className="h-7 text-xs"
-                                      title={rd.description}
-                                      onClick={() => selectedSlide && setScatterViewer({
-                                        jobId: r.job_id,
-                                        slideHash: selectedSlide.slide_hash,
-                                        slideName: `${displaySlide(selectedSlide)} - ${selectedSlide.block_id}-${selectedSlide.slide_number}`,
-                                        rendererId: rd.id,
-                                        rendererName: rd.name,
-                                      })}
-                                    >
-                                      <ScatterChart className="h-3 w-3 mr-1" />
-                                      {rd.name}
-                                    </Button>
-                                  ))
-                                })()}
-                                <Button
-                                  variant="outline"
-                                  size="sm"
-                                  className="h-7 text-xs"
-                                  disabled={loadingOutputJob === r.job_id}
-                                  onClick={() => {
-                                    if (files) {
-                                      setAnalysisOutputs((prev) => ({ ...prev, [r.job_id]: undefined }))
-                                    } else if (selectedSlide) {
-                                      fetchAnalysisOutputs(r.job_id, selectedSlide.slide_hash)
-                                    }
-                                  }}
-                                >
-                                  {loadingOutputJob === r.job_id ? (
-                                    <Loader2 className="h-3 w-3 animate-spin mr-1" />
-                                  ) : (
-                                    <FileText className="h-3 w-3 mr-1" />
-                                  )}
-                                  {files ? 'Hide' : 'Files'}
-                                </Button>
-                                <Button
-                                  variant="outline"
-                                  size="sm"
-                                  className="h-7 text-xs"
-                                  disabled={downloadingJob === r.job_id}
-                                  onClick={() => downloadAnalysisZip(r.job_id)}
-                                >
-                                  {downloadingJob === r.job_id ? (
-                                    <Loader2 className="h-3 w-3 animate-spin mr-1" />
-                                  ) : (
-                                    <Download className="h-3 w-3 mr-1" />
-                                  )}
-                                  Download
-                                </Button>
-                              </div>
-                            </div>
-                            {r.cell_stats && (
-                              <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-muted-foreground">
-                                {Object.entries(r.cell_stats).map(([name, count]) => (
-                                  <span key={name}>
-                                    <span className="font-medium text-foreground/70">{name}:</span>{' '}
-                                    {count.toLocaleString()}
-                                  </span>
-                                ))}
-                              </div>
-                            )}
-                            {files && (
-                              files.length === 0 ? (
-                                <p className="text-xs text-muted-foreground">No output files found.</p>
-                              ) : (
-                                <ul className="space-y-0.5 pl-1 pt-1 border-t">
-                                  {files.flatMap((g) => g.files).map((f) => {
-                                    const overlayable = isOverlayFile(f)
-                                    return (
-                                      <li key={f} className="flex items-center gap-2 text-[11px] font-mono text-muted-foreground">
-                                        <FileText className="h-3 w-3 shrink-0" />
-                                        <span className="truncate flex-1" title={f}>{f}</span>
-                                        {overlayable && selectedSlide && (
-                                          <button
-                                            className="shrink-0 inline-flex items-center gap-1 text-[10px] text-primary hover:underline"
-                                            onClick={() => openOverlayFile(
-                                              r.job_id,
-                                              selectedSlide.slide_hash,
-                                              `${displaySlide(selectedSlide)} - ${selectedSlide.block_id}-${selectedSlide.slide_number}`,
-                                              f,
-                                            )}
-                                            title="Overlay on slide"
-                                          >
-                                            <Layers className="h-3 w-3" />Overlay
-                                          </button>
-                                        )}
-                                      </li>
-                                    )
-                                  })}
-                                </ul>
-                              )
-                            )}
-                          </div>
-                        )
-                      })
-                    ) : (
-                      <div className="flex flex-wrap gap-2">
-                        {selectedSlide.completed_analyses.map((name: string) => (
-                          <Badge
-                            key={name}
-                            variant="secondary"
-                            style={{
-                              backgroundColor: '#3B82F620',
-                              color: '#3B82F6',
-                              borderColor: '#3B82F6',
-                            }}
-                          >
-                            {name}
-                          </Badge>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )}
-              {/* Annotations section */}
-              <div className="col-span-2 pt-4 border-t">
-                <div className="flex items-center justify-between mb-2">
-                  <label className="text-sm font-medium">Imported Annotations</label>
-                  <div>
-                    <input
-                      ref={annotationInputRef}
-                      type="file"
-                      accept=".geojson,.json"
-                      multiple
-                      className="hidden"
-                      onChange={(e) => {
-                        const files = e.target.files
-                        if (!files || !selectedSlide) return
-                        for (const file of Array.from(files)) {
-                          uploadAnnotation(selectedSlide.slide_hash, file)
-                        }
-                        e.target.value = ''
-                      }}
-                    />
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="h-7 text-xs"
-                      disabled={uploadingAnnotation}
-                      onClick={() => annotationInputRef.current?.click()}
-                    >
-                      <Upload className="mr-1 h-3.5 w-3.5" />
-                      {uploadingAnnotation ? 'Uploading...' : 'Upload'}
-                    </Button>
-                  </div>
-                </div>
-
-                {loadingAnnotations ? (
-                  <p className="text-xs text-muted-foreground">Loading...</p>
-                ) : annotations.length === 0 ? (
-                  <p className="text-xs text-muted-foreground">No annotations uploaded yet.</p>
-                ) : (
-                  <div className="space-y-1">
-                    {annotations.map((ann) => (
-                      <div key={ann.name} className="flex items-center justify-between text-sm py-1 px-2 rounded hover:bg-muted/50">
-                        <div className="flex items-center gap-2 min-w-0">
-                          <FileDown className="h-3.5 w-3.5 text-orange-500 shrink-0" />
-                          <span className="font-mono text-xs truncate" title={ann.name}>{ann.name}</span>
-                          <span className="text-xs text-muted-foreground shrink-0">
-                            {ann.size < 1024 ? `${ann.size} B` : ann.size < 1024 * 1024 ? `${(ann.size / 1024).toFixed(1)} KB` : `${(ann.size / (1024 * 1024)).toFixed(1)} MB`}
-                          </span>
-                        </div>
-                        <button
-                          className="p-1 rounded hover:bg-destructive/10 text-muted-foreground hover:text-destructive transition-colors shrink-0"
-                          onClick={() => selectedSlide && confirmDeleteAnnotation(selectedSlide.slide_hash, ann.name)}
-                        >
-                          <Trash2 className="h-3 w-3" />
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-
-              <div className="col-span-2 pt-4 border-t">
-                <Button
-                  onClick={() => setIsViewerOpen(true)}
-                  className="w-full"
-                >
-                  <Eye className="mr-2 h-4 w-4" />
-                  View Slide
-                </Button>
-              </div>
-            </div>
-          )}
-        </DialogContent>
-      </Dialog>
+      {/* The one slide-details dialog. It used to be duplicated inline here, so a
+          section added in one copy was silently missing from the other. */}
+      <SlideDetailsDialog
+        slideHash={isDetailsDialogOpen && selectedSlide ? selectedSlide.slide_hash : null}
+        seed={selectedSlide}
+        onClose={() => setIsDetailsDialogOpen(false)}
+      />
 
       {/* Add to a cohort — bulk selection, or one case from a row */}
       <AddToCohortDialog
@@ -2049,33 +1618,6 @@ export function SlideLibrary() {
         jobId={bundleModal.jobId}
       />
 
-      {/* Annotation delete confirmation */}
-      <Dialog
-        open={deleteAnnotationConfirm.open}
-        onOpenChange={(open) => setDeleteAnnotationConfirm((prev) => ({ ...prev, open }))}
-      >
-        <DialogContent className="sm:max-w-md">
-          <DialogHeader>
-            <DialogTitle>Delete Annotation</DialogTitle>
-            <DialogDescription>
-              Are you sure you want to permanently delete{' '}
-              <span className="font-medium text-foreground">{deleteAnnotationConfirm.filename}</span>?
-              This will remove the file from the network drive.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => setDeleteAnnotationConfirm((prev) => ({ ...prev, open: false }))}
-            >
-              Cancel
-            </Button>
-            <Button variant="destructive" onClick={doDeleteAnnotation}>
-              Delete
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
 
       <ExternalSlideDialog
         open={isExternalDialogOpen}

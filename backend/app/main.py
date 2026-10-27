@@ -6322,6 +6322,128 @@ def get_projection_clustering_labels(clustering_id: int, db: Session = Depends(g
                         headers={"Cache-Control": "private, max-age=86400"})
 
 
+@app.get("/slides/{slide_hash}/cluster-composition")
+def slide_cluster_composition(slide_hash: str, db: Session = Depends(get_db)):
+    """
+    This slide's cluster mix, under every saved clustering that covers it.
+
+    The inverse of /clusterings/{id}/composition: that one asks "how is this
+    clustering spread across slides", this asks "what is in this slide". Used by
+    the slide details dialog, so opening a slide anywhere in the app answers the
+    composition question without going to the workspace first.
+
+    Only the slide's own label slice is read -- the artifact header records where
+    each slide's points begin, so this is a seek, not a scan of the cohort.
+    """
+    from .services import projection_overlay as po
+
+    slide = db.query(Slide).filter_by(slide_hash=slide_hash).first()
+    if not slide:
+        raise HTTPException(status_code=404, detail="Slide not found")
+
+    rows = []
+    clusterings = (db.query(ProjectionClustering)
+                   .filter(ProjectionClustering.status == "completed",
+                           ProjectionClustering.labels_path.isnot(None))
+                   .all())
+    for cl in clusterings:
+        pr = cl.projection
+        if pr is None or not pr.artifact_path:
+            continue
+        art_path = settings.local_data_path / pr.artifact_path
+        lab_path = settings.local_data_path / cl.labels_path
+        if not art_path.exists() or not lab_path.exists():
+            continue
+        try:
+            art = po.read_artifact(art_path)
+        except Exception:
+            continue
+
+        entry = next((s for s in art.header["slides"] if s["slide_hash"] == slide_hash), None)
+        if entry is None:
+            continue   # this projection doesn't cover the slide
+
+        start, n = int(entry["start"]), int(entry["n_patches"])
+        if n <= 0:
+            continue
+        with open(lab_path, "rb") as fh:
+            fh.seek(start * 2)
+            lab = np.frombuffer(fh.read(n * 2), dtype="<i2")
+        k = int(cl.n_clusters or 0)
+        noise = int((lab < 0).sum())
+        counts = np.bincount(lab[lab >= 0], minlength=k)[:k].astype(int)
+        classified = int(counts.sum())
+
+        cohort = pr.cohort
+        rows.append({
+            "clustering_id": cl.id,
+            "projection_id": pr.id,
+            "cohort_id": pr.cohort_id,
+            "cohort_name": cohort.name if cohort else None,
+            "method": pr.method,
+            "algorithm": cl.algorithm,
+            "label": (cl.get_params() or {}).get("label") or "",
+            "n_clusters": k,
+            "n_patches": n,
+            "n_noise": noise,
+            "counts": counts.tolist(),
+            "pct": [float(round(100.0 * c / classified, 2)) if classified else 0.0
+                    for c in counts],
+        })
+
+    rows.sort(key=lambda r: -r["clustering_id"])   # newest first
+    return {"slide_hash": slide_hash, "clusterings": rows}
+
+
+@app.get("/clusterings/{clustering_id}/composition")
+def clustering_composition(clustering_id: int, db: Session = Depends(get_db)):
+    """
+    What share of each slide is each cluster.
+
+    One row per slide: patch counts per cluster plus the same as percentages.
+    Noise (-1, from HDBSCAN) is reported separately rather than folded into a
+    cluster, so the percentages of real clusters still sum to 100 of the
+    classified patches and a mostly-unclassified slide is visibly that.
+
+    Cheap -- a bincount over the label file grouped by the artifact's slide
+    runs -- so it needs no caching.
+    """
+    from .services import projection_overlay as po
+
+    cl = db.query(ProjectionClustering).filter_by(id=clustering_id).first()
+    if not cl:
+        raise HTTPException(status_code=404, detail="Clustering not found")
+    if cl.status != "completed" or not cl.labels_path:
+        raise HTTPException(status_code=409,
+                            detail=f"Clustering is {cl.status}; composition needs a completed run.")
+    pr = cl.projection
+    art = po.read_artifact(settings.local_data_path / pr.artifact_path)
+    labels = np.fromfile(settings.local_data_path / cl.labels_path, dtype="<i2")
+
+    k = int(cl.n_clusters or 0)
+    rows = []
+    for s in art.header["slides"]:
+        start, n = int(s["start"]), int(s["n_patches"])
+        lab = labels[start:start + n]
+        noise = int((lab < 0).sum())
+        counts = np.bincount(lab[lab >= 0], minlength=k)[:k].astype(int)
+        classified = int(counts.sum())
+        rows.append({
+            "slide_hash": s["slide_hash"],
+            "display_name": s.get("display_name") or "",
+            "n_patches": n,
+            "n_noise": noise,
+            "counts": counts.tolist(),
+            # Percent of CLASSIFIED patches, so the bars of one slide always fill.
+            # float(), not numpy's — numpy scalars don't serialise cleanly.
+            "pct": [float(round(100.0 * c / classified, 2)) if classified else 0.0
+                    for c in counts],
+        })
+
+    return {"clustering_id": clustering_id, "n_clusters": k,
+            "algorithm": cl.algorithm, "slides": rows}
+
+
 @app.get("/clusterings/{clustering_id}/tiles")
 def clustering_tiles(clustering_id: int, cluster: int, n: int = Query(10, ge=1, le=100),
                      db: Session = Depends(get_db)):

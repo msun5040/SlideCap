@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { BarChart3, Eye, EyeOff, Layers, List, Loader2, Play, SquareStack, Trash2, X } from 'lucide-react'
+import { BarChart3, Eye, EyeOff, Layers, List, Loader2, Percent, Play, SquareStack, Trash2, X } from 'lucide-react'
 import { getApiBase } from '@/api'
 import { SlideViewerOSD } from '@/components/SlideViewerOSD'
 import { CohortScatter, type PointSet, type ScatterColors } from '@/components/CohortScatter'
 import type { PatchMask } from '@/components/PatchClusterOverlay'
 import { CompositionPanel } from '@/components/CompositionPanel'
+import { ClusterComposition } from '@/components/ClusterComposition'
+import { CLUSTER_COLORS, clusterColor } from '@/lib/clusterColors'
 import { ClusterGallery } from '@/components/ClusterGallery'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { parseProjection, pointAtSlideXY, pointPatch, type ProjectionData } from '@/lib/projection'
@@ -92,17 +94,9 @@ interface Props {
   onClose: () => void
 }
 
-// Fallback palette for groups saved without an explicit colour.
-const FALLBACK_COLORS = [
-  '#ef4444', '#3b82f6', '#22c55e', '#eab308', '#8b5cf6',
-  '#ec4899', '#14b8a6', '#f97316', '#6366f1', '#84cc16',
-]
-
-/** Distinct colours past the first ten: golden-angle hue steps. */
-function clusterColor(i: number): string {
-  if (i < FALLBACK_COLORS.length) return FALLBACK_COLORS[i]
-  return `hsl(${Math.round((i * 137.508) % 360)} 65% 55%)`
-}
+// Shared with the slide dialog's composition bars — see lib/clusterColors.
+// Also the fallback for groups saved without an explicit colour.
+const FALLBACK_COLORS = CLUSTER_COLORS
 
 const DIMMED = '#3f3f46'
 const NOISE_COLOR = '#52525b'
@@ -193,6 +187,7 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
   const [overlayRunError, setOverlayRunError] = useState('')
   const [compositionOpen, setCompositionOpen] = useState(false)
   const [galleryOpen, setGalleryOpen] = useState(false)
+  const [mixOpen, setMixOpen] = useState(false)
 
   const [selectedIdx, setSelectedIdx] = useState<number | null>(null)
   const [selectedSet, setSelectedSet] = useState<PointSet>('base')
@@ -701,10 +696,12 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
   const patchOpenRef = useRef(false)
   const compositionOpenRef = useRef(false)
   const galleryOpenRef = useRef(false)
+  const mixOpenRef = useRef(false)
   const escConsumedAt = useRef(0)
   useEffect(() => { patchOpenRef.current = patchOpen }, [patchOpen])
   useEffect(() => { compositionOpenRef.current = compositionOpen }, [compositionOpen])
   useEffect(() => { galleryOpenRef.current = galleryOpen }, [galleryOpen])
+  useEffect(() => { mixOpenRef.current = mixOpen }, [mixOpen])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -714,6 +711,10 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
         patchOpenRef.current = false
         escConsumedAt.current = Date.now()
         setPatchOpen(false)
+      } else if (mixOpenRef.current) {
+        mixOpenRef.current = false
+        e.stopPropagation()
+        setMixOpen(false)
       } else if (galleryOpenRef.current) {
         galleryOpenRef.current = false
         escConsumedAt.current = Date.now()
@@ -735,7 +736,8 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
    *  viewer's own Escape listener can run before ours, so check what's open
    *  directly as well as whether we just consumed the press. */
   const viewerClose = useCallback(() => {
-    if (patchOpenRef.current || compositionOpenRef.current || galleryOpenRef.current) return
+    if (patchOpenRef.current || compositionOpenRef.current || galleryOpenRef.current
+        || mixOpenRef.current) return
     if (Date.now() - escConsumedAt.current > 100) onClose()
   }, [onClose])
 
@@ -1098,6 +1100,14 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
                                         : 'Pick a clustering under “Colour by” first'}>
           <SquareStack className="h-3.5 w-3.5" /> Cluster patches
         </button>
+
+        <button onClick={() => setMixOpen(true)}
+                disabled={!activeClustering || !activeClustering.n_clusters}
+                className="inline-flex items-center gap-1.5 rounded border border-neutral-700 px-2 py-1 hover:bg-neutral-800 disabled:opacity-40"
+                title={activeClustering ? 'Share of each cluster in every slide'
+                                        : 'Pick a clustering under “Colour by” first'}>
+          <Percent className="h-3.5 w-3.5" /> Composition
+        </button>
         {activeClustering && (
           <span className="text-[11px] text-neutral-400">
             {activeClustering.silhouette != null && `silhouette ${activeClustering.silhouette.toFixed(2)}`}
@@ -1331,6 +1341,23 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
             if (si < 0) return
             const idx = pointAtSlideXY(data, si, t.x + t.size / 2, t.y + t.size / 2)
             if (idx >= 0) { setGalleryOpen(false); selectPoint(idx) }
+          }}
+        />
+      )}
+
+      {mixOpen && activeClustering && (
+        <ClusterComposition key={activeClustering.id}
+          clusteringId={activeClustering.id}
+          title={clusteringLabel(activeClustering)}
+          clusterColor={clusterColor}
+          onClose={() => setMixOpen(false)}
+          onPick={hash => {
+            // The header records where each slide's points begin, so this is a
+            // lookup rather than a scan over a million rows.
+            const s = data?.header.slides.find(x => x.slide_hash === hash)
+            if (!s || s.n_patches <= 0) return
+            setMixOpen(false)
+            selectPoint(s.start)
           }}
         />
       )}
