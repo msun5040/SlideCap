@@ -68,6 +68,15 @@ export function ClusterComposition({
 
   const k = rows?.[0]?.pct.length ?? 0
 
+  // Segment order within each bar. Sorting by a cluster ranks the ROWS by it;
+  // drawing it first lines every one of its segments up against the left edge,
+  // so the ranking reads as one wedge tapering down the column instead of a
+  // stripe you have to find in each bar. The rest keep cluster order behind it.
+  const segments = useMemo(() => {
+    const all = Array.from({ length: k }, (_, i) => i)
+    return typeof sortBy === 'number' ? [sortBy, ...all.filter(i => i !== sortBy)] : all
+  }, [k, sortBy])
+
   const download = () => {
     if (!rows) return
     // Counts as well as percentages: percentages are rounded for display, and
@@ -135,10 +144,12 @@ export function ClusterComposition({
       {/* Legend — the only key the bars need. */}
       {k > 0 && (
         <div className="flex shrink-0 flex-wrap items-center gap-3 border-b border-neutral-800 px-4 py-1.5">
-          {Array.from({ length: k }, (_, i) => (
-            <span key={i} className="flex items-center gap-1.5 text-[11px] text-neutral-400">
+          {segments.map(i => (
+            <span key={i} className={`flex items-center gap-1.5 text-[11px] ${
+              i === sortBy ? 'text-neutral-200' : 'text-neutral-400'}`}>
               <span className="h-2.5 w-2.5 rounded-sm" style={{ background: clusterColor(i) }} />
               Cluster {i + 1}
+              {i === sortBy && <span className="text-neutral-500">(first)</span>}
             </span>
           ))}
         </div>
@@ -164,9 +175,9 @@ export function ClusterComposition({
                 </span>
 
                 <span className="flex h-4 flex-1 overflow-hidden rounded-sm bg-neutral-900">
-                  {r.pct.map((p, i) => p > 0 && (
-                    <span key={i} style={{ width: `${p}%`, background: clusterColor(i) }}
-                          title={`Cluster ${i + 1}: ${p.toFixed(1)}% (${r.counts[i].toLocaleString()} patches)`} />
+                  {segments.map(i => (r.pct[i] ?? 0) > 0 && (
+                    <span key={i} style={{ width: `${r.pct[i]}%`, background: clusterColor(i) }}
+                          title={`Cluster ${i + 1}: ${r.pct[i].toFixed(1)}% (${r.counts[i].toLocaleString()} patches)`} />
                   ))}
                 </span>
 
