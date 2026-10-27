@@ -58,6 +58,7 @@ interface ClusteringRow {
   silhouette?: number | null
   approximate: boolean
   elapsed_seconds?: number | null
+  show_on_slides?: boolean
 }
 
 type Algorithm = 'kmeans' | 'hdbscan' | 'leiden' | 'agglomerative'
@@ -332,6 +333,28 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
     } finally {
       setStarting(false)
     }
+  }
+
+  /**
+   * Publish a clustering run to the slide details dialog.
+   *
+   * Opt-in per run: a projection collects several — a UMAP at k=60, a t-SNE at
+   * k=50, plus whatever was tried along the way — and the slide dialog opens
+   * everywhere in the app, so none of them reach it until chosen here.
+   */
+  const setShowOnSlides = async (id: number, next: boolean) => {
+    const res = await fetch(`${getApiBase()}/clusterings/${id}/slide-display`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ show_on_slides: next }),
+    })
+    if (!res.ok) {
+      const d = await res.json().catch(() => null)
+      setRunError(d?.detail || `Could not change slide display (${res.status})`)
+      return
+    }
+    const row: ClusteringRow = await res.json()
+    setClusterings(prev => prev.map(c => (c.id === row.id ? row : c)))
   }
 
   const deleteClustering = async (id: number) => {
@@ -931,6 +954,9 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
                               {c.n_noise ? `${c.n_noise.toLocaleString()} noise · ` : ''}
                               {c.approximate ? 'approximate · ' : ''}
                               {c.elapsed_seconds != null && `${Math.round(c.elapsed_seconds)}s`}
+                              {c.show_on_slides && (
+                                <span className="text-emerald-500/80">{' · on slides'}</span>
+                              )}
                             </>
                           )}
                           {(c.status === 'pending' || c.status === 'running') &&
@@ -938,6 +964,17 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
                           {c.status === 'failed' && <span className="text-red-400">{c.error_message || 'failed'}</span>}
                         </div>
                       </div>
+                      {c.status === 'completed' && (
+                        <button
+                          onClick={() => setShowOnSlides(c.id, !c.show_on_slides)}
+                          title={c.show_on_slides
+                            ? 'Shown under Cluster composition in slide details — click to stop showing it'
+                            : 'Show this run under Cluster composition when a slide is opened anywhere in the app'}
+                          className={`rounded p-0.5 hover:bg-neutral-800 ${
+                            c.show_on_slides ? 'text-emerald-400' : 'text-neutral-600 hover:text-neutral-300'}`}>
+                          {c.show_on_slides ? <Eye className="h-3.5 w-3.5" /> : <EyeOff className="h-3.5 w-3.5" />}
+                        </button>
+                      )}
                       {c.status !== 'pending' && c.status !== 'running' && (
                         <button onClick={() => deleteClustering(c.id)} title="Delete this clustering"
                                 className="rounded p-0.5 text-neutral-500 hover:bg-neutral-800 hover:text-red-400">
@@ -1348,6 +1385,8 @@ export function CohortProjectionWorkspace({ projectionId, cohortId, title, onClo
       {mixOpen && activeClustering && (
         <ClusterComposition key={activeClustering.id}
           clusteringId={activeClustering.id}
+          showOnSlides={!!activeClustering.show_on_slides}
+          onShowOnSlidesChange={next => setShowOnSlides(activeClustering.id, next)}
           title={clusteringLabel(activeClustering)}
           clusterColor={clusterColor}
           onClose={() => setMixOpen(false)}

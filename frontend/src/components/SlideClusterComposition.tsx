@@ -4,16 +4,20 @@ import { getApiBase } from '@/api'
 import { clusterColor } from '@/lib/clusterColors'
 
 /**
- * This slide's cluster mix, under every saved clustering that covers it.
+ * This slide's cluster mix, under the clusterings published to slide details.
  *
  * The slide-centric view of what the workspace shows cohort-wide: open a slide
  * anywhere in the app and see what is in it, without first finding the right
- * projection. One stacked bar per clustering, so a slide that appears in
+ * projection. One stacked bar per clustering, so a slide published under
  * several reads as several rows.
  *
- * Renders nothing at all when no saved clustering covers the slide — most
- * slides, most of the time — so it costs the dialog no space until it has
- * something to say.
+ * Shows only runs someone published from the workspace (the eye toggle on a
+ * run). A projection collects several — a UMAP at k=60, a t-SNE at k=50, plus
+ * whatever was tried along the way — and this dialog opens everywhere, so none
+ * of them appear here until they are chosen.
+ *
+ * Renders nothing at all when no published clustering covers the slide, so it
+ * costs the dialog no space until it has something to say.
  */
 
 interface Row {

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { ArrowDownUp, Download, Loader2, X } from 'lucide-react'
+import { ArrowDownUp, Download, Eye, EyeOff, Loader2, X } from 'lucide-react'
 import { getApiBase } from '@/api'
 import { saveBlob } from '@/lib/download'
 
@@ -33,9 +33,16 @@ interface Props {
   onClose: () => void
   /** Open this slide in the workspace viewer. */
   onPick?: (slideHash: string) => void
+  /** Whether this run is published to the slide details dialog. */
+  showOnSlides?: boolean
+  /** Publish or unpublish this run; the parent owns the request. */
+  onShowOnSlidesChange?: (next: boolean) => void
 }
 
-export function ClusterComposition({ clusteringId, title, clusterColor, onClose, onPick }: Props) {
+export function ClusterComposition({
+  clusteringId, title, clusterColor, onClose, onPick,
+  showOnSlides = false, onShowOnSlidesChange,
+}: Props) {
   const [rows, setRows] = useState<Row[] | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [sortBy, setSortBy] = useState<number | 'name'>('name')
@@ -99,6 +106,21 @@ export function ClusterComposition({ clusteringId, title, clusterColor, onClose,
               ))}
             </select>
           </label>
+          {onShowOnSlidesChange && (
+            <button
+              onClick={() => onShowOnSlidesChange(!showOnSlides)}
+              className={`flex items-center gap-1.5 rounded border px-2 py-1 text-[11px] ${
+                showOnSlides
+                  ? 'border-emerald-700 bg-emerald-950/60 text-emerald-300 hover:bg-emerald-900/60'
+                  : 'border-neutral-700 text-neutral-300 hover:bg-neutral-800'}`}
+              title={showOnSlides
+                ? 'This run appears under Cluster composition in slide details. Click to stop showing it.'
+                : 'Show this run under Cluster composition when a slide is opened anywhere in the app'}
+            >
+              {showOnSlides ? <Eye className="h-3 w-3" /> : <EyeOff className="h-3 w-3" />}
+              {showOnSlides ? 'on slides' : 'not on slides'}
+            </button>
+          )}
           <button onClick={download} disabled={!rows}
                   className="flex items-center gap-1.5 rounded border border-neutral-700 px-2 py-1
                              text-[11px] text-neutral-300 hover:bg-neutral-800 disabled:opacity-50">

@@ -2799,6 +2799,11 @@ class ProjectionClusteringCreate(BaseModel):
     params: Dict[str, Any] = {}
 
 
+class ProjectionClusteringDisplay(BaseModel):
+    """Which clustering runs reach the slide details dialog."""
+    show_on_slides: bool
+
+
 class CohortGroupSlides(BaseModel):
     add_slide_hashes: List[str] = []
     remove_slide_hashes: List[str] = []
@@ -6146,6 +6151,7 @@ def _serialize_clustering(c: ProjectionClustering) -> dict:
         "silhouette": c.silhouette,
         "approximate": bool(c.approximate),
         "elapsed_seconds": c.elapsed_seconds,
+        "show_on_slides": bool(c.show_on_slides),
         "created_at": c.created_at.isoformat() if c.created_at else None,
         "completed_at": c.completed_at.isoformat() if c.completed_at else None,
     }
@@ -6307,6 +6313,30 @@ def get_projection_clustering(clustering_id: int, db: Session = Depends(get_db))
     return _serialize_clustering(cl)
 
 
+@app.patch("/clusterings/{clustering_id}/slide-display")
+def set_clustering_slide_display(clustering_id: int, data: ProjectionClusteringDisplay,
+                                 db: Session = Depends(get_db)):
+    """
+    Choose whether this clustering run shows up in slide details.
+
+    Opt-in per run, because a projection collects several — a UMAP at k=60, a
+    t-SNE at k=50, plus whatever was tried along the way — and the slide dialog
+    is seen everywhere. Publishing is the explicit statement "this is the
+    clustering that counts"; everything else stays in the workspace.
+    """
+    cl = db.query(ProjectionClustering).filter_by(id=clustering_id).first()
+    if not cl:
+        raise HTTPException(status_code=404, detail="Clustering not found")
+    if data.show_on_slides and cl.status != "completed":
+        raise HTTPException(status_code=409,
+                            detail=f"Clustering is {cl.status}; only a completed run can be shown on slides.")
+    with get_lock().write_lock():
+        cl.show_on_slides = bool(data.show_on_slides)
+        db.commit()
+        db.refresh(cl)
+    return _serialize_clustering(cl)
+
+
 @app.get("/clusterings/{clustering_id}/labels")
 def get_projection_clustering_labels(clustering_id: int, db: Session = Depends(get_db)):
     """Raw little-endian int16 per point, row-aligned with the projection artifact; -1 = noise."""
@@ -6325,12 +6355,17 @@ def get_projection_clustering_labels(clustering_id: int, db: Session = Depends(g
 @app.get("/slides/{slide_hash}/cluster-composition")
 def slide_cluster_composition(slide_hash: str, db: Session = Depends(get_db)):
     """
-    This slide's cluster mix, under every saved clustering that covers it.
+    This slide's cluster mix, under the clusterings published to slide details.
 
     The inverse of /clusterings/{id}/composition: that one asks "how is this
     clustering spread across slides", this asks "what is in this slide". Used by
     the slide details dialog, so opening a slide anywhere in the app answers the
     composition question without going to the workspace first.
+
+    Only runs published with show_on_slides are reported -- a projection
+    accumulates exploratory and superseded runs, and this dialog opens
+    everywhere, so it shows what someone chose to publish rather than everything
+    on disk.
 
     Only the slide's own label slice is read -- the artifact header records where
     each slide's points begin, so this is a seek, not a scan of the cohort.
@@ -6344,6 +6379,7 @@ def slide_cluster_composition(slide_hash: str, db: Session = Depends(get_db)):
     rows = []
     clusterings = (db.query(ProjectionClustering)
                    .filter(ProjectionClustering.status == "completed",
+                           ProjectionClustering.show_on_slides.is_(True),
                            ProjectionClustering.labels_path.isnot(None))
                    .all())
     for cl in clusterings:

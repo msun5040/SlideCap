@@ -701,6 +701,11 @@ class ProjectionClustering(Base):
     approximate = Column(Boolean, default=False)
     elapsed_seconds = Column(Float)
 
+    # Opt-in publication to the slide details dialog. Off by default: a projection
+    # accumulates exploratory and superseded runs, and none of them should turn up
+    # on every slide in the app until someone says this is the one that counts.
+    show_on_slides = Column(Boolean, nullable=False, default=False)
+
     created_at = Column(DateTime, default=datetime.utcnow)
     started_at = Column(DateTime)
     completed_at = Column(DateTime)
@@ -1738,6 +1743,27 @@ def _migrate_cohort_projections(engine):
         print(f"[DB Migration] Skipping cohort_projections migration: {e}")
 
 
+def _migrate_projection_clusterings(engine):
+    """Add show_on_slides (which clustering runs reach the slide details dialog)."""
+    from sqlalchemy import text
+    try:
+        insp = inspect(engine)
+        if not insp.has_table('projection_clusterings'):
+            return
+        existing = {col['name'] for col in insp.get_columns('projection_clusterings')}
+        adds = {
+            'show_on_slides': "ALTER TABLE projection_clusterings ADD COLUMN show_on_slides BOOLEAN NOT NULL DEFAULT 0",
+        }
+        with engine.connect() as conn:
+            for col, ddl in adds.items():
+                if col not in existing:
+                    print(f"[DB Migration] Adding column: projection_clusterings.{col}")
+                    conn.execute(text(ddl))
+            conn.commit()
+    except Exception as e:
+        print(f"[DB Migration] Skipping projection_clusterings migration: {e}")
+
+
 def _seed_request_statuses(engine):
     """Populate request_statuses with defaults on first init (table empty)."""
     from sqlalchemy import text
@@ -1784,6 +1810,7 @@ def init_db(db_path: Path):
     _migrate_cohorts(_engine)          # Adds auto_add_cases to cohorts
     _migrate_cohort_placeholders(_engine)  # Adds patient_id/surgery_label to cohort_placeholders
     _migrate_cohort_projections(_engine)   # Adds reduced_path/reduced_dim to cohort_projections
+    _migrate_projection_clusterings(_engine)  # Adds show_on_slides to projection_clusterings
     _seed_request_statuses(_engine)    # Seeds default case statuses (request_statuses)
     _SessionLocal = sessionmaker(bind=_engine)
 
